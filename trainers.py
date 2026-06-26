@@ -9,7 +9,9 @@
 6. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
 7. MarginSurpriseReplayEWCTrainer
                             — ReplayEWC + loss/surprise + low-margin boundary replay。
-8. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
+8. HippocampalReplayEWCTrainer
+                            — SurpriseReplayEWC + episodic prototype memory at inference。
+9. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
                               重置「低效用、夠老」的死/低貢獻單元，其餘權重完全
                               不動——這是對話第一輪明確回答「不重置權重」的機制，
                               主打可塑性流失（失效 B），跟前兩者主打遺忘（失效 A）形成對照。
@@ -669,6 +671,189 @@ class MarginSurpriseReplayEWCTrainer(SurpriseReplayEWCTrainer):
         return rX, rY, rtasks
 
 
+class HippocampalReplayEWCTrainer(SurpriseReplayEWCTrainer):
+    """ReplayEWC with a small episodic-memory readout.
+
+    The MLP remains the slow parametric learner. The replay buffer also acts as a
+    hippocampal memory: at evaluation time we build class prototypes from stored
+    episodes in the current hidden representation and blend their prediction with
+    the MLP softmax. In multi-head Task-IL mode, memory is context-filtered by
+    task id; in single-head mode it defaults to a shared memory unless
+    memory_task_filter=True is explicitly requested.
+    """
+    name = "HippocampalReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, candidate_mult: int = 8,
+                 memory_alpha: float = 0.8, memory_temperature: float = 0.1,
+                 memory_min_examples: int = 4, memory_task_filter: bool = False,
+                 memory_gate: bool = True, sleep_steps: int = 0, sleep_batch: int = 32,
+                 sleep_lr_scale: float = 0.25):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            candidate_mult=candidate_mult,
+        )
+        self.memory_alpha = float(np.clip(memory_alpha, 0.0, 1.0))
+        self.memory_temperature = max(1e-6, float(memory_temperature))
+        self.memory_min_examples = max(1, int(memory_min_examples))
+        self.memory_task_filter = bool(memory_task_filter)
+        self.memory_gate = bool(memory_gate)
+        self.sleep_steps = max(0, int(sleep_steps))
+        self.sleep_batch = max(1, int(sleep_batch))
+        self.sleep_lr_scale = max(0.0, float(sleep_lr_scale))
+
+    @staticmethod
+    def _row_normalize(X):
+        return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+
+    def _memory_indices(self, task_idx):
+        if len(self.buf_X) == 0:
+            return []
+        use_context = self.model.multi_head or self.memory_task_filter
+        if not use_context:
+            return list(range(len(self.buf_X)))
+        if task_idx is None:
+            return []
+        return [i for i, t in enumerate(self.buf_task) if t == task_idx]
+
+    def _feature_cache(self, X, task_idx):
+        if self.model.multi_head:
+            return self.model.forward(X, task_idx)["a2"]
+        return self.model.forward(X)["a2"]
+
+    def _episodic_probs(self, X, task_idx, out_dim):
+        idx = self._memory_indices(task_idx)
+        if len(idx) < self.memory_min_examples:
+            return None
+
+        mem_X = np.stack([self.buf_X[i] for i in idx])
+        mem_Y = np.array([self.buf_Y[i] for i in idx], dtype=np.int64)
+        classes = np.array(sorted(set(int(y) for y in mem_Y)), dtype=np.int64)
+        if len(classes) == 0:
+            return None
+
+        z = self._row_normalize(self._feature_cache(X, task_idx))
+        mem_z = self._row_normalize(self._feature_cache(mem_X, task_idx))
+
+        prototypes = []
+        present_classes = []
+        for c in classes:
+            cls_z = mem_z[mem_Y == c]
+            if len(cls_z) == 0:
+                continue
+            prototypes.append(cls_z.mean(axis=0))
+            present_classes.append(c)
+        if not prototypes:
+            return None
+
+        proto = self._row_normalize(np.stack(prototypes))
+        logits = (z @ proto.T) / self.memory_temperature
+        present_probs = self.model_softmax(logits)
+
+        probs = np.full((X.shape[0], out_dim), 1e-8 / out_dim, dtype=np.float64)
+        for col, c in enumerate(present_classes):
+            if 0 <= c < out_dim:
+                probs[:, c] = present_probs[:, col]
+        probs /= probs.sum(axis=1, keepdims=True)
+        return probs
+
+    @staticmethod
+    def model_softmax(logits):
+        z = logits - logits.max(axis=1, keepdims=True)
+        e = np.exp(z)
+        return e / e.sum(axis=1, keepdims=True)
+
+    def loss_acc(self, X, Y, task_idx: int = None):
+        cache = self.model.forward(X, task_idx if self.model.multi_head else None)
+        probs = cache["probs"].astype(np.float64)
+        mem_probs = self._episodic_probs(X, task_idx, probs.shape[1])
+        if mem_probs is not None and self.memory_alpha > 0:
+            if self.memory_gate:
+                top2 = np.partition(probs, -2, axis=1)[:, -2:]
+                top2.sort(axis=1)
+                margins = top2[:, 1] - top2[:, 0]
+                alpha = (self.memory_alpha * (1.0 - margins))[:, None]
+            else:
+                alpha = self.memory_alpha
+            probs = (1.0 - alpha) * probs + alpha * mem_probs
+            probs /= probs.sum(axis=1, keepdims=True)
+
+        n = X.shape[0]
+        loss = float(-np.log(probs[np.arange(n), Y] + 1e-12).mean())
+        acc = float((probs.argmax(axis=1) == Y).mean())
+        return loss, acc
+
+    def _sleep_replay_step(self, rX, rY, rtasks):
+        lr = self.lr * self.sleep_lr_scale
+        if lr <= 0:
+            return
+
+        if self.model.multi_head:
+            shared = {
+                "W1": np.zeros_like(self.model.W1),
+                "b1": np.zeros_like(self.model.b1),
+                "W2": np.zeros_like(self.model.W2),
+                "b2": np.zeros_like(self.model.b2),
+            }
+            head_grads = {}
+            for t in sorted(set(rtasks)):
+                sub_idx = [i for i, val in enumerate(rtasks) if val == t]
+                sub_X = rX[sub_idx]
+                sub_Y = rY[sub_idx]
+                cache = self.model.forward(sub_X, t)
+                grads = self.model.backward(cache, sub_Y, t)
+                weight = len(sub_idx) / len(rtasks)
+                for k in shared:
+                    shared[k] += weight * grads[k]
+                head_grads[t] = {
+                    "W3": weight * grads["W3"],
+                    "b3": weight * grads["b3"],
+                }
+
+            ewc = self._ewc_grad(rtasks[0] if rtasks else 0)
+            for k in shared:
+                shared[k] += ewc.get(k, 0.0)
+            self.model.W1 -= lr * shared["W1"]
+            self.model.b1 -= lr * shared["b1"]
+            self.model.W2 -= lr * shared["W2"]
+            self.model.b2 -= lr * shared["b2"]
+            for t, grads in head_grads.items():
+                self.model.heads_W[t] -= lr * grads["W3"]
+                self.model.heads_b[t] -= lr * grads["b3"]
+            return
+
+        cache = self.model.forward(rX)
+        grads = self.model.backward(cache, rY)
+        ewc = self._ewc_grad(None)
+        self.model.sgd_step(grads, lr, extra_grads=ewc)
+
+    def on_task_end(self, task_X, task_Y, task_idx: int = None):
+        super().on_task_end(task_X, task_Y, task_idx)
+        if self.sleep_steps <= 0:
+            return
+
+        original_replay_batch = self.replay_batch
+        self.replay_batch = self.sleep_batch
+        try:
+            for _ in range(self.sleep_steps):
+                sample = self._sample_replay()
+                if sample is None:
+                    break
+                self._sleep_replay_step(*sample)
+        finally:
+            self.replay_batch = original_replay_batch
+
+
 class ContinualBackpropTrainer:
     """簡化版 continual backprop（Dohare et al.）：
     每個隱藏單元維護一個 utility（效用，貢獻度的指數移動平均）與 age（自上次重置後的步數）。
@@ -827,6 +1012,7 @@ TRAINER_REGISTRY = {
     "DarkReplayEWC": DarkReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
+    "HippocampalReplayEWC": HippocampalReplayEWCTrainer,
     "TaskBalancedReplay": TaskBalancedReplayTrainer,
     "ContinualBP": ContinualBackpropTrainer,
     "ReplayContinualBP": ReplayContinualBackpropTrainer,

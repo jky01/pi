@@ -26,6 +26,7 @@ DEFAULT_METHODS = [
     "Replay",
     "ReplayEWC",
     "SurpriseReplayEWC",
+    "HippocampalReplayEWC",
     "TaskBalancedReplay",
     "ContinualBP",
     "ReplayContinualBP",
@@ -42,6 +43,12 @@ def _build_trainer(model, method_name, lr, seed, trainer_kwargs=None):
         trainer_kwargs.setdefault("seed", seed)
     filtered = {k: v for k, v in trainer_kwargs.items() if k in sig.parameters}
     return Cls(model, **filtered), filtered
+
+
+def _eval_loss_acc(trainer, model, X, Y, task_idx):
+    if hasattr(trainer, "loss_acc"):
+        return trainer.loss_acc(X, Y, task_idx)
+    return model.loss_acc(X, Y, task_idx)
 
 
 def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
@@ -88,7 +95,7 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
         # 在所有看過的 task 測試集上評估，填 accuracy matrix 第 t 列
         for j in range(t + 1):
             Xt, Yt = test_sets[j]
-            _, acc_j = model.loss_acc(Xt, Yt, j)
+            _, acc_j = _eval_loss_acc(trainer, model, Xt, Yt, j)
             acc_matrix[t, j] = acc_j
 
         diag = model.diagnostics(X[:200], t)
@@ -173,6 +180,22 @@ def main():
                         help="Override candidate pool multiplier for SurpriseReplayEWC.")
     parser.add_argument("--margin-weight", type=float, default=None,
                         help="Override low-margin boundary priority for MarginSurpriseReplayEWC.")
+    parser.add_argument("--memory-alpha", type=float, default=None,
+                        help="Override episodic-memory interpolation weight for HippocampalReplayEWC.")
+    parser.add_argument("--memory-temperature", type=float, default=None,
+                        help="Override episodic prototype softmax temperature for HippocampalReplayEWC.")
+    parser.add_argument("--memory-min-examples", type=int, default=None,
+                        help="Override minimum memory examples before episodic readout is used.")
+    parser.add_argument("--memory-task-filter", action="store_true",
+                        help="Filter episodic memory by task id even for single-head mode.")
+    parser.add_argument("--memory-fixed-alpha", action="store_true",
+                        help="Use a fixed episodic-memory weight instead of uncertainty-gated memory.")
+    parser.add_argument("--sleep-steps", type=int, default=None,
+                        help="Run this many replay-only consolidation steps at the end of each task.")
+    parser.add_argument("--sleep-batch", type=int, default=None,
+                        help="Replay batch size used during sleep consolidation.")
+    parser.add_argument("--sleep-lr-scale", type=float, default=None,
+                        help="Learning-rate multiplier used during sleep consolidation.")
     parser.add_argument("--cbp-replacement-rate", type=float, default=None,
                         help="Override ContinualBP replacement rate.")
     parser.add_argument("--cbp-maturity-threshold", type=int, default=None,
@@ -212,6 +235,22 @@ def main():
         trainer_kwargs["candidate_mult"] = args.candidate_mult
     if args.margin_weight is not None:
         trainer_kwargs["margin_weight"] = args.margin_weight
+    if args.memory_alpha is not None:
+        trainer_kwargs["memory_alpha"] = args.memory_alpha
+    if args.memory_temperature is not None:
+        trainer_kwargs["memory_temperature"] = args.memory_temperature
+    if args.memory_min_examples is not None:
+        trainer_kwargs["memory_min_examples"] = args.memory_min_examples
+    if args.memory_task_filter:
+        trainer_kwargs["memory_task_filter"] = True
+    if args.memory_fixed_alpha:
+        trainer_kwargs["memory_gate"] = False
+    if args.sleep_steps is not None:
+        trainer_kwargs["sleep_steps"] = args.sleep_steps
+    if args.sleep_batch is not None:
+        trainer_kwargs["sleep_batch"] = args.sleep_batch
+    if args.sleep_lr_scale is not None:
+        trainer_kwargs["sleep_lr_scale"] = args.sleep_lr_scale
     if args.cbp_replacement_rate is not None:
         trainer_kwargs["replacement_rate"] = args.cbp_replacement_rate
     if args.cbp_maturity_threshold is not None:
