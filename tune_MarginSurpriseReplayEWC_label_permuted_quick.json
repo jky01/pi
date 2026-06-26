@@ -1,0 +1,243 @@
+{
+  "mode": "label_permuted",
+  "objective": "Maximize final_avg_acc, then retention_ratio.",
+  "total_seconds": 36.44002890586853,
+  "runs": [
+    {
+      "method": "MarginSurpriseReplayEWC",
+      "mode": "label_permuted",
+      "n_tasks": 30,
+      "steps_per_task": 1500,
+      "test_per_task": 150,
+      "seeds": [
+        0,
+        1
+      ],
+      "trainer_kwargs": {
+        "lam": 5.0,
+        "capacity": 2000,
+        "replay_batch": 16,
+        "candidate_mult": 8,
+        "margin_weight": 1.0
+      },
+      "final_avg_acc": {
+        "mean": 0.851,
+        "std": 0.015666666666666662
+      },
+      "bwt": {
+        "mean": 0.22114942528735634,
+        "std": 0.004367816091954024
+      },
+      "mean_forgetting": {
+        "mean": 0.06586206896551725,
+        "std": 0.012298850574712646
+      },
+      "retention_ratio": {
+        "mean": 1.3354730785177056,
+        "std": 0.0006009194267964091
+      },
+      "plasticity_slope": {
+        "mean": 0.013445309603262894,
+        "std": 0.0005050055617352644
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "bwt": 0.21678160919540232,
+          "final_avg_acc": 0.8353333333333334,
+          "learned_avg_acc": 0.6257777777777778,
+          "mean_forgetting": 0.07816091954022988,
+          "retention_ratio": 1.3348721590909092,
+          "plasticity_slope": 0.013950315164998159
+        },
+        {
+          "seed": 1,
+          "bwt": 0.22551724137931037,
+          "final_avg_acc": 0.8666666666666667,
+          "learned_avg_acc": 0.6486666666666665,
+          "mean_forgetting": 0.05356321839080459,
+          "retention_ratio": 1.336073997944502,
+          "plasticity_slope": 0.01294030404152763
+        }
+      ],
+      "seconds": 11.120275020599365
+    },
+    {
+      "method": "MarginSurpriseReplayEWC",
+      "mode": "label_permuted",
+      "n_tasks": 30,
+      "steps_per_task": 1500,
+      "test_per_task": 150,
+      "seeds": [
+        0,
+        1
+      ],
+      "trainer_kwargs": {
+        "lam": 5.0,
+        "capacity": 2000,
+        "replay_batch": 16,
+        "candidate_mult": 8,
+        "margin_weight": 0.5
+      },
+      "final_avg_acc": {
+        "mean": 0.8385555555555555,
+        "std": 0.025444444444444325
+      },
+      "bwt": {
+        "mean": 0.19517241379310343,
+        "std": 0.0027586206896551835
+      },
+      "mean_forgetting": {
+        "mean": 0.08137931034482758,
+        "std": 0.018620689655172412
+      },
+      "retention_ratio": {
+        "mean": 1.290519098489217,
+        "std": 0.006079058846006347
+      },
+      "plasticity_slope": {
+        "mean": 0.01366332962550983,
+        "std": 0.0006637004078605896
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "bwt": 0.19241379310344825,
+          "final_avg_acc": 0.8131111111111111,
+          "learned_avg_acc": 0.6271111111111111,
+          "mean_forgetting": 0.09999999999999999,
+          "retention_ratio": 1.2965981573352234,
+          "plasticity_slope": 0.01432703003337042
+        },
+        {
+          "seed": 1,
+          "bwt": 0.19793103448275862,
+          "final_avg_acc": 0.8639999999999998,
+          "learned_avg_acc": 0.6726666666666666,
+          "mean_forgetting": 0.06275862068965517,
+          "retention_ratio": 1.2844400396432107,
+          "plasticity_slope": 0.012999629217649241
+        }
+      ],
+      "seconds": 11.416221141815186
+    },
+    {
+      "method": "MarginSurpriseReplayEWC",
+      "mode": "label_permuted",
+      "n_tasks": 30,
+      "steps_per_task": 1500,
+      "test_per_task": 150,
+      "seeds": [
+        0,
+        1
+      ],
+      "trainer_kwargs": {
+        "lam": 5.0,
+        "capacity": 2000,
+        "replay_batch": 16,
+        "candidate_mult": 8,
+        "margin_weight": 0.25
+      },
+      "final_avg_acc": {
+        "mean": 0.8371111111111111,
+        "std": 0.029333333333333322
+      },
+      "bwt": {
+        "mean": 0.1840229885057471,
+        "std": 0.0012643678160919186
+      },
+      "mean_forgetting": {
+        "mean": 0.08413793103448278,
+        "std": 0.027816091954023004
+      },
+      "retention_ratio": {
+        "mean": 1.2702590014708361,
+        "std": 0.009670575993952935
+      },
+      "plasticity_slope": {
+        "mean": 0.012926214312198751,
+        "std": 0.0010300333704115682
+      },
+      "per_seed": [
+        {
+          "seed": 0,
+          "bwt": 0.1827586206896552,
+          "final_avg_acc": 0.8077777777777778,
+          "learned_avg_acc": 0.6311111111111111,
+          "mean_forgetting": 0.11195402298850578,
+          "retention_ratio": 1.279929577464789,
+          "plasticity_slope": 0.013956247682610319
+        },
+        {
+          "seed": 1,
+          "bwt": 0.18528735632183904,
+          "final_avg_acc": 0.8664444444444445,
+          "learned_avg_acc": 0.6873333333333335,
+          "mean_forgetting": 0.05632183908045977,
+          "retention_ratio": 1.260588425476883,
+          "plasticity_slope": 0.011896180941787182
+        }
+      ],
+      "seconds": 13.903485298156738
+    }
+  ],
+  "best": {
+    "method": "MarginSurpriseReplayEWC",
+    "mode": "label_permuted",
+    "n_tasks": 30,
+    "steps_per_task": 1500,
+    "test_per_task": 150,
+    "seeds": [
+      0,
+      1
+    ],
+    "trainer_kwargs": {
+      "lam": 5.0,
+      "capacity": 2000,
+      "replay_batch": 16,
+      "candidate_mult": 8,
+      "margin_weight": 1.0
+    },
+    "final_avg_acc": {
+      "mean": 0.851,
+      "std": 0.015666666666666662
+    },
+    "bwt": {
+      "mean": 0.22114942528735634,
+      "std": 0.004367816091954024
+    },
+    "mean_forgetting": {
+      "mean": 0.06586206896551725,
+      "std": 0.012298850574712646
+    },
+    "retention_ratio": {
+      "mean": 1.3354730785177056,
+      "std": 0.0006009194267964091
+    },
+    "plasticity_slope": {
+      "mean": 0.013445309603262894,
+      "std": 0.0005050055617352644
+    },
+    "per_seed": [
+      {
+        "seed": 0,
+        "bwt": 0.21678160919540232,
+        "final_avg_acc": 0.8353333333333334,
+        "learned_avg_acc": 0.6257777777777778,
+        "mean_forgetting": 0.07816091954022988,
+        "retention_ratio": 1.3348721590909092,
+        "plasticity_slope": 0.013950315164998159
+      },
+      {
+        "seed": 1,
+        "bwt": 0.22551724137931037,
+        "final_avg_acc": 0.8666666666666667,
+        "learned_avg_acc": 0.6486666666666665,
+        "mean_forgetting": 0.05356321839080459,
+        "retention_ratio": 1.336073997944502,
+        "plasticity_slope": 0.01294030404152763
+      }
+    ],
+    "seconds": 11.120275020599365
+  }
+}

@@ -171,6 +171,8 @@ def main():
                         help="Override replay/current gradient mixing weight for replay methods that support it.")
     parser.add_argument("--candidate-mult", type=int, default=None,
                         help="Override candidate pool multiplier for SurpriseReplayEWC.")
+    parser.add_argument("--margin-weight", type=float, default=None,
+                        help="Override low-margin boundary priority for MarginSurpriseReplayEWC.")
     parser.add_argument("--cbp-replacement-rate", type=float, default=None,
                         help="Override ContinualBP replacement rate.")
     parser.add_argument("--cbp-maturity-threshold", type=int, default=None,
@@ -208,6 +210,8 @@ def main():
         trainer_kwargs["replay_weight"] = args.replay_weight
     if args.candidate_mult is not None:
         trainer_kwargs["candidate_mult"] = args.candidate_mult
+    if args.margin_weight is not None:
+        trainer_kwargs["margin_weight"] = args.margin_weight
     if args.cbp_replacement_rate is not None:
         trainer_kwargs["replacement_rate"] = args.cbp_replacement_rate
     if args.cbp_maturity_threshold is not None:

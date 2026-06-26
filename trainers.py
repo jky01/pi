@@ -7,7 +7,9 @@
 4. ReplayEWCTrainer         — Replay + online EWC，結合樣本重播與參數保護。
 5. DarkReplayEWCTrainer     — ReplayEWC + logits consistency（DER/SER 系列方向）。
 6. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
-7. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
+7. MarginSurpriseReplayEWCTrainer
+                            — ReplayEWC + loss/surprise + low-margin boundary replay。
+8. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
                               重置「低效用、夠老」的死/低貢獻單元，其餘權重完全
                               不動——這是對話第一輪明確回答「不重置權重」的機制，
                               主打可塑性流失（失效 B），跟前兩者主打遺忘（失效 A）形成對照。
@@ -565,6 +567,32 @@ class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
         )
         self.candidate_mult = max(1, int(candidate_mult))
 
+    @staticmethod
+    def _loss_and_margin_from_probs(probs, y):
+        losses = -np.log(probs[np.arange(len(y)), y] + 1e-12)
+        top2 = np.partition(probs, -2, axis=1)[:, -2:]
+        top2.sort(axis=1)
+        margins = top2[:, 1] - top2[:, 0]
+        return losses, margins
+
+    def _score_candidates(self, cX, cY, ctasks):
+        n_candidates = len(cY)
+        losses = np.zeros(n_candidates, dtype=np.float64)
+        margins = np.zeros(n_candidates, dtype=np.float64)
+
+        if self.model.multi_head:
+            for t in sorted(set(ctasks)):
+                sub_pos = np.array([i for i, val in enumerate(ctasks) if val == t], dtype=np.int64)
+                cache = self.model.forward(cX[sub_pos], t)
+                sub_losses, sub_margins = self._loss_and_margin_from_probs(cache["probs"], cY[sub_pos])
+                losses[sub_pos] = sub_losses
+                margins[sub_pos] = sub_margins
+        else:
+            cache = self.model.forward(cX)
+            losses, margins = self._loss_and_margin_from_probs(cache["probs"], cY)
+
+        return losses, margins
+
     def _sample_replay(self):
         if len(self.buf_X) == 0:
             return None
@@ -574,21 +602,67 @@ class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
         cX = np.stack([self.buf_X[i] for i in candidate_idx])
         cY = np.array([self.buf_Y[i] for i in candidate_idx], dtype=np.int64)
         ctasks = [self.buf_task[i] for i in candidate_idx]
-        losses = np.zeros(n_candidates, dtype=np.float64)
-
-        if self.model.multi_head:
-            for t in sorted(set(ctasks)):
-                sub_pos = [i for i, val in enumerate(ctasks) if val == t]
-                cache = self.model.forward(cX[sub_pos], t)
-                probs = cache["probs"]
-                sub_y = cY[sub_pos]
-                losses[sub_pos] = -np.log(probs[np.arange(len(sub_y)), sub_y] + 1e-12)
-        else:
-            cache = self.model.forward(cX)
-            probs = cache["probs"]
-            losses = -np.log(probs[np.arange(n_candidates), cY] + 1e-12)
+        losses, _ = self._score_candidates(cX, cY, ctasks)
 
         top_pos = np.argsort(losses)[-n_replay:]
+        rX = cX[top_pos]
+        rY = cY[top_pos]
+        rtasks = [ctasks[i] for i in top_pos]
+        return rX, rY, rtasks
+
+
+class MarginSurpriseReplayEWCTrainer(SurpriseReplayEWCTrainer):
+    """ReplayEWC with surprise and decision-boundary replay priority.
+
+    High CE loss catches forgotten or misclassified examples; low top-2 margin
+    favors examples near old decision boundaries. The combined priority is a
+    small-memory analogue of episodic exemplar selection: replay the old samples
+    most likely to protect behavior that is currently fragile.
+    """
+    name = "MarginSurpriseReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, candidate_mult: int = 8,
+                 margin_weight: float = 0.5):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            candidate_mult=candidate_mult,
+        )
+        self.margin_weight = margin_weight
+
+    @staticmethod
+    def _minmax(values):
+        values = values.astype(np.float64)
+        span = float(values.max() - values.min())
+        if span < 1e-12:
+            return np.zeros_like(values)
+        return (values - values.min()) / span
+
+    def _sample_replay(self):
+        if len(self.buf_X) == 0:
+            return None
+        n_replay = min(self.replay_batch, len(self.buf_X))
+        n_candidates = min(len(self.buf_X), max(n_replay, n_replay * self.candidate_mult))
+        candidate_idx = self.rng.choice(len(self.buf_X), size=n_candidates, replace=False)
+        cX = np.stack([self.buf_X[i] for i in candidate_idx])
+        cY = np.array([self.buf_Y[i] for i in candidate_idx], dtype=np.int64)
+        ctasks = [self.buf_task[i] for i in candidate_idx]
+
+        losses, margins = self._score_candidates(cX, cY, ctasks)
+        boundary_scores = 1.0 - margins
+        priority = self._minmax(losses) + self.margin_weight * self._minmax(boundary_scores)
+
+        top_pos = np.argsort(priority)[-n_replay:]
         rX = cX[top_pos]
         rY = cY[top_pos]
         rtasks = [ctasks[i] for i in top_pos]
@@ -752,6 +826,7 @@ TRAINER_REGISTRY = {
     "ReplayEWC": ReplayEWCTrainer,
     "DarkReplayEWC": DarkReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
+    "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "TaskBalancedReplay": TaskBalancedReplayTrainer,
     "ContinualBP": ContinualBackpropTrainer,
     "ReplayContinualBP": ReplayContinualBackpropTrainer,

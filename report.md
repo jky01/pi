@@ -2,7 +2,19 @@
 
 ## 1. 目的
 
-延續設計的持續學習（continual learning, CL）測試框架（accuracy matrix + 對角線可塑性探針 + BWT 遺忘指標），用 pi 的十進位小數位構造一個決定性、可重現、近乎不重複的長串流資料來源，實測八種演算法在 80 個依序到來的 task 上的表現：Naive（無防護下界）、EWC、Experience Replay、ReplayEWC、SurpriseReplayEWC、TaskBalancedReplay、Continual Backprop、ReplayContinualBP。
+延續設計的持續學習（continual learning, CL）測試框架（accuracy matrix + 對角線可塑性探針 + BWT 遺忘指標），用 pi 的十進位小數位構造一個決定性、可重現、近乎不重複的長串流資料來源，實測八種主表演算法在 80 個依序到來的 task 上的表現：Naive（無防護下界）、EWC、Experience Replay、ReplayEWC、SurpriseReplayEWC、TaskBalancedReplay、Continual Backprop、ReplayContinualBP。
+
+### 1.1 持續學習的定義
+
+持續學習不是單純「一直訓練」模型，而是指模型在資料或任務依序到來時，能夠持續吸收新知識，同時盡量保留舊知識的能力。更精準地說，持續學習要求模型在不重新從零訓練、也不一次看到所有歷史資料的情況下，依序學習新任務，並維持舊任務表現。
+
+在本專案中，持續學習效果被拆成三個核心面向：
+
+1. **學得動**：新任務到來時，模型仍能快速學會，而不是因為訓練太久、表徵僵化而失去可塑性。
+2. **記得住**：學新任務後，不要把舊任務能力大幅覆蓋掉，也就是避免 catastrophic forgetting。
+3. **可累積**：模型不是只在任務之間切換，而是能讓過去學到的表示、規則或經驗幫助未來學習。
+
+因此，本報告不只看最後準確率，也同時觀察 `A[t,t]`（剛學完第 t 個任務時的準確率，代表可塑性）、`final_avg_acc`（全部任務學完後的平均保留能力）、`BWT`（學新任務對舊任務的影響）、`mean_forgetting`（歷史最佳表現到最後表現的退步量）與 `retention_ratio`（最後保留多少剛學會時的能力）。
 
 ---
 
@@ -22,13 +34,14 @@
 
 ## 3. 模型與演算法
 
-兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含九個 trainer，其中八個已納入兩個模式的 80-task 完整表格；`DarkReplayEWC` 是文獻啟發的實驗方法，短流 sweep 後未列入主表。
+兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含十個 trainer，其中八個已納入兩個模式的 80-task 完整表格；`DarkReplayEWC` 與 `MarginSurpriseReplayEWC` 是文獻啟發的實驗方法，暫不列入主表。
 
 - **Naive**：純線上 SGD，無任何保護機制，作為下界基準。
 - **EWC**：以 Fisher 資訊對角線錨定舊參數的二次懲罰項。方案 A 中二次懲罰主要應用於共享隱藏層參數。
 - **Replay**：reservoir buffer（容量 500）。在方案 A 中，Replay 採用的重播樣本會根據其原本的 `task_idx` 通過對應的輸出頭計算梯度，並針對各輸出頭分別進行權重更新。
 - **ReplayEWC**：在 Replay 的混合梯度上額外加入 online EWC 正則化。多頭模式下只保護共享隱藏層，讓 task head 保持可塑。調參後預設 buffer capacity 從 500 提升到 2000。
 - **SurpriseReplayEWC**：在 ReplayEWC 上加入 surprise-prioritized sampling；每步先從 buffer 抽候選池，再回放目前模型 cross-entropy loss 最高的舊樣本。
+- **MarginSurpriseReplayEWC**：在 SurpriseReplayEWC 上加入 top-2 margin 訊號；高 loss 捕捉已忘掉的舊樣本，低 margin 捕捉舊任務決策邊界附近的脆弱樣本，對應 episodic memory / adaptive replay 文獻中「保留最能保護舊行為的 exemplar」這條路線。
 - **DarkReplayEWC**：實驗性方法，在 ReplayEWC 上保存舊 logits 並做 logit consistency replay；短流 sweep 中沒有贏 ReplayEWC，因此不列入主結果表。
 - **TaskBalancedReplay**：改用每個 task 各自的 reservoir，總 buffer 容量不變，但 slot 與抽樣都盡量平均分配到已看過的 task，避免長串流後早期任務樣本被全域 reservoir 稀釋。
 - **Continual Backprop**：依效用（utility）選擇性重置低貢獻且夠老的隱藏單元，輸出端權重清零做函數保持式插入，其餘權重完全不動。多頭結構下，神經元重置時會對所有輸出頭的對應連線進行同步重置。
@@ -134,9 +147,14 @@
 
 - **ReplayEWC** 把 Experience Replay 與 online EWC 疊加，是目前表現最好的穩定性增強方法。
 - **SurpriseReplayEWC** 把 sample selection 加入 ReplayEWC，優先回放目前模型最意外、loss 最高的舊樣本，是目前最佳方法。
+- **MarginSurpriseReplayEWC** 延伸 SurpriseReplayEWC，額外偏好 top-2 margin 小的舊樣本，讓 replay 更聚焦於舊任務決策邊界。這是把 Google DeepMind episodic-memory 方向與 adaptive replay/prioritized replay 想法放進本專案的小型可跑版本。
 - **DarkReplayEWC** 實作 logits consistency replay，呼應 DER/SER/IDER 類文獻，但在本 benchmark 的短流 sweep 中沒有勝過 ReplayEWC，暫保留為實驗 baseline。
 - **TaskBalancedReplay** 修正全域 reservoir 在長任務流中的早期 task 稀釋問題。
 - **ReplayContinualBP** 把 replay 的穩定性與 ContinualBP 的可塑性維護接在一起，對應本研究一開始提出的核心假設：單一機制通常只能解遺忘或可塑性流失其中一側，複合機制才有機會真正提升持續學習。
+
+新增的 `MarginSurpriseReplayEWC` 已用 `margin_weight=1.0` 跑過完整 80-task 驗證。它在 `label_permuted` 模式得到 final average accuracy **84.0% ± 2.9%**、BWT **-4.0% ± 1.5%**、mean forgetting **9.8% ± 1.4%**，沒有超過目前最佳的 `SurpriseReplayEWC`（85.8% ± 3.0%）。在 `input_permuted` 模式則仍停在 **10.8% ± 0.2%**，表示低 margin replay 無法解決單頭 domain-IL 的根本瓶頸。因此它目前保留為「新論文方向的實驗候選」，暫不升級為主表預設方法。
+
+文獻對應：`SurpriseReplayEWC` 對應 SuRe 的 surprise-prioritized replay；`DarkReplayEWC` 對應 Dark Experience Replay 的 logits consistency；`MarginSurpriseReplayEWC` 對應 Google DeepMind episodic memory / retrieval 可補足 parametric learning 的方向；Google DeepMind 的 aligned model merging 則比較適合下一步做 task-end consolidation，而不是直接塞進目前的小型 MLP 主流程。
 
 後續調參發現兩個非常實用的結果：短流 sweep 裡調大 `replay_batch` 看似有效，但完整 80-task 驗證反而退步；真正有效的是把 ReplayEWC 的 buffer capacity 從 500 提升到 2000。再往後，加入 surprise-prioritized sampling 又把 final average accuracy 從 81.8% 推到 85.8%。這代表本 benchmark 的主要瓶頸先是舊任務樣本覆蓋不足，容量足夠後則轉為回放樣本選擇。
 
@@ -155,7 +173,7 @@
 - `pi_digits.py`：產生/快取 pi 小數位序列。
 - `benchmark.py`：Permuted-Pi-Digits 串流（支持多頭 `label_permuted` 和單頭 `input_permuted`）。
 - `model.py`：支持多頭選擇與可塑性診斷的 numpy MLP 實現。
-- `trainers.py`：適配多輸出頭、樣本重播分組、ReplayEWC、DarkReplayEWC、SurpriseReplayEWC、task-balanced replay 與神經元重置的九種 CL Trainer。
+- `trainers.py`：適配多輸出頭、樣本重播分組、ReplayEWC、DarkReplayEWC、SurpriseReplayEWC、MarginSurpriseReplayEWC、task-balanced replay 與神經元重置的十種 CL Trainer。
 - `run.py` / `run_one_combo.py`：主實驗腳本（支持命令行參數選擇模式、方法、seed、任務數與輸出路徑）。
 - `analyze.py`：彙整多 seed 實驗結果，輸出 JSON 與畫圖；缺 matplotlib 時仍會輸出 summary JSON。
 - `results_label_permuted.json` / `results_input_permuted.json`：實驗原始數據。
