@@ -181,9 +181,9 @@ def _save_pil_bar_chart(path, mode, summary, methods):
     final_means = [summary[m]["final_avg_mean"] for m in methods]
     final_stds = [summary[m]["final_avg_std"] for m in methods]
     _draw_bar_panel(draw, (90, 120, 595, 620), methods, bwt_means, bwt_stds,
-                    "Backward transfer", min(-0.45, min(bwt_means) - 0.05), 0.05)
+                    "BWT: higher / closer to 0 is better", min(-0.45, min(bwt_means) - 0.05), 0.05)
     _draw_bar_panel(draw, (720, 120, 1225, 620), methods, final_means, final_stds,
-                    "Final average accuracy", 0.0, max(0.2, max(final_means) + 0.1))
+                    "Final avg accuracy: higher is better", 0.0, max(0.2, max(final_means) + 0.1))
     _draw_legend(draw, methods, 90, 660, max_rows=4)
     img.save(path)
 
@@ -212,9 +212,9 @@ def _save_pil_dual_line_chart(path, mode, summary, methods, tasks):
     dead_series = {m: summary[m]["dead_h2_mean"] for m in methods}
     eff_series = {m: summary[m]["eff_h1_mean"] for m in methods}
     max_eff = max(max(vals) for vals in eff_series.values())
-    _draw_line_panel(draw, (90, 125, 680, 640), "Dead-unit fraction, h2", "Dead frac",
+    _draw_line_panel(draw, (90, 125, 680, 640), "Dead-unit fraction h2: lower is better", "Dead frac",
                      tasks, dead_series, methods, 0.0, 1.0)
-    _draw_line_panel(draw, (815, 125, 1405, 640), "Effective rank, h1", "Eff rank",
+    _draw_line_panel(draw, (815, 125, 1405, 640), "Effective rank h1: higher is better", "Eff rank",
                      tasks, eff_series, methods, 0.0, max(64.0, max_eff + 5.0))
     _draw_legend(draw, methods, 90, 680, max_rows=4)
     img.save(path)
@@ -224,8 +224,8 @@ def _save_pil_figures(summary, methods, tasks, mode):
     diag_series = {m: summary[m]["diag_mean"] for m in methods}
     _save_pil_line_chart(
         os.path.join(OUT_DIR, f"fig1_diagonal_accuracy_{mode}.png"),
-        f"Diagonal accuracy A[t,t] ({mode})",
-        "Accuracy",
+        f"Diagonal accuracy A[t,t] ({mode}) - higher is better",
+        "Accuracy (higher better)",
         tasks,
         diag_series,
         methods,
@@ -360,8 +360,8 @@ def main():
         ax.fill_between(tasks, mean - std, mean + std, color=color, alpha=0.15)
     ax.axhline(0.1, color="black", linestyle="--", linewidth=1, label="chance (10%)")
     ax.set_xlabel("Task index")
-    ax.set_ylabel("Accuracy on that task's own test set (diagonal of A)")
-    ax.set_title(f"Plasticity over a long task stream: diagonal accuracy A[t,t]\n({mode}, n_tasks=80, mean ± std over 3 seeds)")
+    ax.set_ylabel("Accuracy (higher is better)")
+    ax.set_title(f"Plasticity over a long task stream: diagonal accuracy A[t,t]\n(higher is better; {mode}, n_tasks=80, mean ± std over 3 seeds)")
     ax.legend()
     ax.set_ylim(0, 0.8)
     fig.tight_layout()
@@ -376,7 +376,7 @@ def main():
     axes[0].bar(x, bwt_means, yerr=bwt_stds, color=[COLORS.get(m, None) for m in methods], capsize=4)
     axes[0].set_xticks(x); axes[0].set_xticklabels(methods, rotation=20)
     axes[0].axhline(0, color="black", linewidth=0.8)
-    axes[0].set_title("Backward Transfer (BWT)\n(higher / less negative = less forgetting)")
+    axes[0].set_title("Backward Transfer (BWT)\n(higher / closer to 0 is better)")
     axes[0].set_ylabel("BWT")
 
     final_means = [summary[m]["final_avg_mean"] for m in methods]
@@ -384,8 +384,8 @@ def main():
     axes[1].bar(x, final_means, yerr=final_stds, color=[COLORS.get(m, None) for m in methods], capsize=4)
     axes[1].set_xticks(x); axes[1].set_xticklabels(methods, rotation=20)
     axes[1].axhline(0.1, color="black", linestyle="--", linewidth=1)
-    axes[1].set_title(f"Final average accuracy over all 80 tasks ({mode})\n(after training through the whole stream)")
-    axes[1].set_ylabel("accuracy")
+    axes[1].set_title(f"Final average accuracy over all 80 tasks ({mode})\n(higher is better)")
+    axes[1].set_ylabel("accuracy (higher is better)")
     fig.tight_layout()
     fig.savefig(os.path.join(OUT_DIR, f"fig2_bwt_finalacc_{mode}.png"), dpi=150)
     plt.close(fig)
@@ -396,11 +396,11 @@ def main():
         s = summary[method]
         axes[0].plot(tasks, s["dead_h2_mean"], label=method, color=COLORS.get(method, None), linewidth=2)
         axes[1].plot(tasks, s["eff_h1_mean"], label=method, color=COLORS.get(method, None), linewidth=2)
-    axes[0].set_title("Dead-unit fraction, hidden layer 2\n(ReLU units that never fire on a sample batch)")
-    axes[0].set_xlabel("Task index"); axes[0].set_ylabel("dead fraction")
+    axes[0].set_title("Dead-unit fraction, hidden layer 2\n(lower is better)")
+    axes[0].set_xlabel("Task index"); axes[0].set_ylabel("dead fraction (lower is better)")
     axes[0].legend()
-    axes[1].set_title("Effective rank, hidden layer 1\n(representation collapse indicator)")
-    axes[1].set_xlabel("Task index"); axes[1].set_ylabel("effective rank")
+    axes[1].set_title("Effective rank, hidden layer 1\n(higher is better; less representation collapse)")
+    axes[1].set_xlabel("Task index"); axes[1].set_ylabel("effective rank (higher is better)")
     axes[1].legend()
     fig.tight_layout()
     fig.savefig(os.path.join(OUT_DIR, f"fig3_plasticity_diagnostics_{mode}.png"), dpi=150)

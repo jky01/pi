@@ -91,9 +91,9 @@
 > **多頭結構的突破**：改用多輸出頭後，**SurpriseReplayEWC**、**ReplayEWC**、**Replay** 與 **EWC** 的全域平均準確率分別達到 **85.8%**、**81.8%**、**60.5%** 與 **57.7%**。這表明共享隱藏層成功維持了對 pi 數位求和的泛化表徵，且獨立的輸出頭能夠有效區分不同任務的排列標籤。SurpriseReplayEWC 在 final accuracy、BWT、mean forgetting 與 retention ratio 上都優於原始 ReplayEWC，是目前這個專案裡最穩的持續學習候選方法。
 
 #### 方案 A 實驗結果圖集
-![方案 A - 80-task 可塑性曲線](fig1_diagonal_accuracy_label_permuted.png)
-![方案 A - BWT 與最終平均準確率](fig2_bwt_finalacc_label_permuted.png)
-![方案 A - 可塑性流失診斷 (有效秩/死神經元)](fig3_plasticity_diagnostics_label_permuted.png)
+![方案 A - 80-task 可塑性曲線，準確率越高越好](fig1_diagonal_accuracy_label_permuted.png)
+![方案 A - BWT 與最終平均準確率，BWT 越接近 0 越好，最終準確率越高越好](fig2_bwt_finalacc_label_permuted.png)
+![方案 A - 可塑性流失診斷，dead unit 越低越好，有效秩越高越好](fig3_plasticity_diagnostics_label_permuted.png)
 
 ---
 
@@ -114,9 +114,9 @@
 > 在共享單輸出頭的前提下，輸入特徵維度的隨機排列使得模型難以跨越 80 個相異 domain。各演算法的最終平均準確率仍然大幅降至 **11% - 12%**（接近隨機猜測水準），遺忘依然十分嚴重。
 
 #### 方案 B 實驗結果圖集
-![方案 B - 80-task 可塑性曲線](fig1_diagonal_accuracy_input_permuted.png)
-![方案 B - BWT 與最終平均準確率](fig2_bwt_finalacc_input_permuted.png)
-![方案 B - 可塑性流失診斷 (有效秩/死神經元)](fig3_plasticity_diagnostics_input_permuted.png)
+![方案 B - 80-task 可塑性曲線，準確率越高越好](fig1_diagonal_accuracy_input_permuted.png)
+![方案 B - BWT 與最終平均準確率，BWT 越接近 0 越好，最終準確率越高越好](fig2_bwt_finalacc_input_permuted.png)
+![方案 B - 可塑性流失診斷，dead unit 越低越好，有效秩越高越好](fig3_plasticity_diagnostics_input_permuted.png)
 
 ---
 
