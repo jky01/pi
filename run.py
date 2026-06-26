@@ -25,6 +25,7 @@ DEFAULT_METHODS = [
     "EWC",
     "Replay",
     "ReplayEWC",
+    "SurpriseReplayEWC",
     "TaskBalancedReplay",
     "ContinualBP",
     "ReplayContinualBP",
@@ -164,6 +165,12 @@ def main():
                         help="Override online EWC Fisher decay.")
     parser.add_argument("--ewc-grad-clip", type=float, default=None,
                         help="Override EWC regularizer gradient clipping norm.")
+    parser.add_argument("--dark-alpha", type=float, default=None,
+                        help="Override logit-consistency strength for DarkReplayEWC.")
+    parser.add_argument("--replay-weight", type=float, default=None,
+                        help="Override replay/current gradient mixing weight for replay methods that support it.")
+    parser.add_argument("--candidate-mult", type=int, default=None,
+                        help="Override candidate pool multiplier for SurpriseReplayEWC.")
     parser.add_argument("--cbp-replacement-rate", type=float, default=None,
                         help="Override ContinualBP replacement rate.")
     parser.add_argument("--cbp-maturity-threshold", type=int, default=None,
@@ -195,6 +202,12 @@ def main():
         trainer_kwargs["fisher_decay"] = args.ewc_fisher_decay
     if args.ewc_grad_clip is not None:
         trainer_kwargs["grad_clip_norm"] = args.ewc_grad_clip
+    if args.dark_alpha is not None:
+        trainer_kwargs["dark_alpha"] = args.dark_alpha
+    if args.replay_weight is not None:
+        trainer_kwargs["replay_weight"] = args.replay_weight
+    if args.candidate_mult is not None:
+        trainer_kwargs["candidate_mult"] = args.candidate_mult
     if args.cbp_replacement_rate is not None:
         trainer_kwargs["replacement_rate"] = args.cbp_replacement_rate
     if args.cbp_maturity_threshold is not None:

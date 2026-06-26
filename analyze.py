@@ -22,12 +22,24 @@ except ModuleNotFoundError:
     Image = ImageDraw = ImageFont = None
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
-PREFERRED_METHODS = ["Naive", "EWC", "Replay", "ReplayEWC", "TaskBalancedReplay", "ContinualBP", "ReplayContinualBP"]
+PREFERRED_METHODS = [
+    "Naive",
+    "EWC",
+    "Replay",
+    "ReplayEWC",
+    "DarkReplayEWC",
+    "SurpriseReplayEWC",
+    "TaskBalancedReplay",
+    "ContinualBP",
+    "ReplayContinualBP",
+]
 COLORS = {
     "Naive": "#888888",
     "EWC": "#1f77b4",
     "Replay": "#2ca02c",
     "ReplayEWC": "#17becf",
+    "DarkReplayEWC": "#bcbd22",
+    "SurpriseReplayEWC": "#e377c2",
     "TaskBalancedReplay": "#9467bd",
     "ContinualBP": "#d62728",
     "ReplayContinualBP": "#ff7f0e",

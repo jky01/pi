@@ -108,14 +108,8 @@ class MLP:
         acc = float((preds == Y).mean())
         return loss, acc
 
-    def backward(self, cache: dict, Y: np.ndarray, task_idx: int = None) -> dict:
-        """回傳每個參數的梯度（mean over batch）。"""
-        n = Y.shape[0]
-        probs = cache["probs"]
-        dlogits = probs.copy()
-        dlogits[np.arange(n), Y] -= 1.0
-        dlogits /= n  # (n, out_dim)
-
+    def backward_from_logits_grad(self, cache: dict, dlogits: np.ndarray, task_idx: int = None) -> dict:
+        """從已給定的 logits 梯度往回傳，回傳每個參數的梯度。"""
         if self.multi_head:
             if task_idx is None:
                 raise ValueError("multi_head model requires task_idx for backward pass")
@@ -142,6 +136,15 @@ class MLP:
         gb1 = dz1.sum(axis=0)
 
         return dict(W1=gW1, b1=gb1, W2=gW2, b2=gb2, W3=gW3, b3=gb3)
+
+    def backward(self, cache: dict, Y: np.ndarray, task_idx: int = None) -> dict:
+        """回傳每個參數的 cross-entropy 梯度（mean over batch）。"""
+        n = Y.shape[0]
+        probs = cache["probs"]
+        dlogits = probs.copy()
+        dlogits[np.arange(n), Y] -= 1.0
+        dlogits /= n  # (n, out_dim)
+        return self.backward_from_logits_grad(cache, dlogits, task_idx)
 
     def sgd_step(self, grads: dict, lr: float, extra_grads: dict = None, task_idx: int = None):
         if extra_grads is not None:

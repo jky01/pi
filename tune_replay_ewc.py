@@ -1,5 +1,5 @@
 """
-Small hyperparameter sweep for ReplayEWC.
+Small hyperparameter sweep for ReplayEWC-family methods.
 
 This script runs compact validation experiments and stores concise summaries
 instead of full accuracy matrices. Use the best configuration here as a candidate
@@ -22,9 +22,11 @@ def _stats(values):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tune ReplayEWC on Permuted-Pi-Digits.")
+    parser = argparse.ArgumentParser(description="Tune replay/EWC methods on Permuted-Pi-Digits.")
     parser.add_argument("mode", nargs="?", default="label_permuted",
                         choices=["label_permuted", "input_permuted"])
+    parser.add_argument("--method", default="ReplayEWC",
+                        choices=["ReplayEWC", "SurpriseReplayEWC", "DarkReplayEWC"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1])
     parser.add_argument("--n-tasks", type=int, default=40)
     parser.add_argument("--steps-per-task", type=int, default=2000)
@@ -35,6 +37,8 @@ def main():
     parser.add_argument("--lams", nargs="+", type=float, default=[2.5, 5.0, 10.0])
     parser.add_argument("--capacities", nargs="+", type=int, default=[500])
     parser.add_argument("--replay-batches", nargs="+", type=int, default=[16, 32])
+    parser.add_argument("--candidate-mults", nargs="+", type=int, default=[8])
+    parser.add_argument("--dark-alphas", nargs="+", type=float, default=[0.1])
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
@@ -50,13 +54,18 @@ def main():
 
     runs = []
     t_start = time.time()
-    for lam, capacity, replay_batch in itertools.product(args.lams, args.capacities, args.replay_batches):
+    for lam, capacity, replay_batch, candidate_mult, dark_alpha in itertools.product(
+            args.lams, args.capacities, args.replay_batches, args.candidate_mults, args.dark_alphas):
         per_seed = []
         cfg = dict(lam=lam, capacity=capacity, replay_batch=replay_batch)
+        if args.method == "SurpriseReplayEWC":
+            cfg["candidate_mult"] = candidate_mult
+        if args.method == "DarkReplayEWC":
+            cfg["dark_alpha"] = dark_alpha
         combo_start = time.time()
         for seed in args.seeds:
             res = run_one(
-                "ReplayEWC",
+                args.method,
                 seed=seed,
                 stream_kwargs=stream_kwargs,
                 model_kwargs=model_kwargs,
@@ -68,7 +77,7 @@ def main():
             per_seed.append(dict(seed=seed, **{k: v for k, v in s.items() if k != "diag"}))
 
         rec = dict(
-            method="ReplayEWC",
+            method=args.method,
             mode=args.mode,
             n_tasks=args.n_tasks,
             steps_per_task=args.steps_per_task,
@@ -85,7 +94,8 @@ def main():
         )
         runs.append(rec)
         print(
-            f"lam={lam:g} capacity={capacity} replay_batch={replay_batch} "
+            f"method={args.method} lam={lam:g} capacity={capacity} replay_batch={replay_batch} "
+            f"candidate_mult={candidate_mult} dark_alpha={dark_alpha:g} "
             f"final={rec['final_avg_acc']['mean']:.3f}±{rec['final_avg_acc']['std']:.3f} "
             f"bwt={rec['bwt']['mean']:.3f} retention={rec['retention_ratio']['mean']:.3f} "
             f"forget={rec['mean_forgetting']['mean']:.3f} ({rec['seconds']:.1f}s)"
@@ -100,7 +110,7 @@ def main():
         best=runs[0] if runs else None,
     )
 
-    out_path = args.output or os.path.join(OUT_DIR, f"tune_replay_ewc_{args.mode}.json")
+    out_path = args.output or os.path.join(OUT_DIR, f"tune_{args.method}_{args.mode}.json")
     if not os.path.isabs(out_path):
         out_path = os.path.join(OUT_DIR, out_path)
     with open(out_path, "w") as f:

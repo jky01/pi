@@ -5,7 +5,9 @@
 2. EWCTrainer               — Elastic Weight Consolidation（正則化派代表）。
 3. ReplayTrainer            — Experience Replay，小型 reservoir buffer（重播派代表）。
 4. ReplayEWCTrainer         — Replay + online EWC，結合樣本重播與參數保護。
-5. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
+5. DarkReplayEWCTrainer     — ReplayEWC + logits consistency（DER/SER 系列方向）。
+6. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
+7. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
                               重置「低效用、夠老」的死/低貢獻單元，其餘權重完全
                               不動——這是對話第一輪明確回答「不重置權重」的機制，
                               主打可塑性流失（失效 B），跟前兩者主打遺忘（失效 A）形成對照。
@@ -399,6 +401,200 @@ class ReplayEWCTrainer(ReplayTrainer):
         self.anchor = {k: v.copy() for k, v in self._current_reg_params(task_idx).items()}
 
 
+class DarkReplayEWCTrainer(ReplayEWCTrainer):
+    """ReplayEWC plus logit consistency replay.
+
+    Inspired by dark/strong experience replay: each buffer item stores the logits
+    produced when it entered memory. During replay we train on both labels and a
+    small MSE consistency loss against those stored logits.
+    """
+    name = "DarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.1,
+                 replay_weight: float = 0.5):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+        )
+        self.dark_alpha = dark_alpha
+        self.replay_weight = replay_weight
+        self.buf_logits = []
+
+    @staticmethod
+    def _add_grads(a, b, scale=1.0):
+        return {k: a[k] + scale * b[k] for k in a}
+
+    def _reservoir_insert(self, X, Y, task_idx=None):
+        logits = self.model.forward(X, task_idx)["logits"]
+        for i in range(X.shape[0]):
+            self.seen += 1
+            item_x = X[i].copy()
+            item_y = int(Y[i])
+            item_logits = logits[i].copy()
+            if len(self.buf_X) < self.capacity:
+                self.buf_X.append(item_x)
+                self.buf_Y.append(item_y)
+                self.buf_task.append(task_idx)
+                self.buf_logits.append(item_logits)
+            else:
+                j = self.rng.randint(0, self.seen)
+                if j < self.capacity:
+                    self.buf_X[j] = item_x
+                    self.buf_Y[j] = item_y
+                    self.buf_task[j] = task_idx
+                    self.buf_logits[j] = item_logits
+
+    def _sample_replay(self):
+        if len(self.buf_X) == 0:
+            return None
+        idx = self.rng.randint(0, len(self.buf_X), size=min(self.replay_batch, len(self.buf_X)))
+        rX = np.stack([self.buf_X[i] for i in idx])
+        rY = np.array([self.buf_Y[i] for i in idx], dtype=np.int64)
+        rtasks = [self.buf_task[i] for i in idx]
+        rlogits = np.stack([self.buf_logits[i] for i in idx])
+        return rX, rY, rtasks, rlogits
+
+    def _dark_grads(self, cache, target_logits, task_idx):
+        n, out_dim = target_logits.shape
+        dlogits = 2.0 * (cache["logits"] - target_logits) / max(1, n * out_dim)
+        return self.model.backward_from_logits_grad(cache, dlogits, task_idx)
+
+    def _mix_dark_replay_grads(self, grads, rX, rY, rtasks, rlogits, task_idx):
+        replay_weight = self.replay_weight
+        current_weight = 1.0 - replay_weight
+
+        if self.model.multi_head:
+            rgrads_accum = {k: np.zeros_like(v) for k, v in grads.items()}
+            head_grads = {}
+
+            for t in sorted(set(rtasks)):
+                sub_idx = [i for i, val in enumerate(rtasks) if val == t]
+                sub_X = rX[sub_idx]
+                sub_Y = rY[sub_idx]
+                sub_logits = rlogits[sub_idx]
+
+                sub_cache = self.model.forward(sub_X, t)
+                ce_grads = self.model.backward(sub_cache, sub_Y, t)
+                dark_grads = self._dark_grads(sub_cache, sub_logits, t)
+                sub_grads = self._add_grads(ce_grads, dark_grads, self.dark_alpha)
+
+                weight = len(sub_idx) / len(rtasks)
+                for k in ["W1", "b1", "W2", "b2"]:
+                    rgrads_accum[k] += weight * sub_grads[k]
+
+                head_grads[t] = {
+                    "W3": weight * sub_grads["W3"],
+                    "b3": weight * sub_grads["b3"],
+                }
+
+            for k in ["W1", "b1", "W2", "b2"]:
+                grads[k] = current_weight * grads[k] + replay_weight * rgrads_accum[k]
+
+            grads["W3"] = current_weight * grads["W3"]
+            grads["b3"] = current_weight * grads["b3"]
+            if task_idx in head_grads:
+                grads["W3"] += replay_weight * head_grads[task_idx]["W3"]
+                grads["b3"] += replay_weight * head_grads[task_idx]["b3"]
+
+            for t, h_g in head_grads.items():
+                if t != task_idx:
+                    t_grads = {
+                        "W1": np.zeros_like(self.model.W1),
+                        "b1": np.zeros_like(self.model.b1),
+                        "W2": np.zeros_like(self.model.W2),
+                        "b2": np.zeros_like(self.model.b2),
+                        "W3": h_g["W3"],
+                        "b3": h_g["b3"],
+                    }
+                    self.model.sgd_step(t_grads, self.lr * replay_weight, task_idx=t)
+            return grads
+
+        rcache = self.model.forward(rX)
+        ce_grads = self.model.backward(rcache, rY)
+        dark_grads = self._dark_grads(rcache, rlogits, None)
+        rgrads = self._add_grads(ce_grads, dark_grads, self.dark_alpha)
+        return {k: current_weight * grads[k] + replay_weight * rgrads[k] for k in grads}
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = self.model.loss_acc(X, Y, task_idx)
+        cache = self.model.forward(X, task_idx)
+        grads = self.model.backward(cache, Y, task_idx)
+
+        sample = self._sample_replay()
+        if sample is not None:
+            grads = self._mix_dark_replay_grads(grads, *sample, task_idx)
+
+        ewc_grads = self._ewc_grad(task_idx)
+        self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
+        self._reservoir_insert(X, Y, task_idx)
+        return loss, acc
+
+
+class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
+    """ReplayEWC with surprise-prioritized replay sampling.
+
+    Instead of uniformly replaying directly from the buffer, draw a larger
+    candidate pool and replay the examples with the highest current CE loss.
+    """
+    name = "SurpriseReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, candidate_mult: int = 8):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+        )
+        self.candidate_mult = max(1, int(candidate_mult))
+
+    def _sample_replay(self):
+        if len(self.buf_X) == 0:
+            return None
+        n_replay = min(self.replay_batch, len(self.buf_X))
+        n_candidates = min(len(self.buf_X), max(n_replay, n_replay * self.candidate_mult))
+        candidate_idx = self.rng.choice(len(self.buf_X), size=n_candidates, replace=False)
+        cX = np.stack([self.buf_X[i] for i in candidate_idx])
+        cY = np.array([self.buf_Y[i] for i in candidate_idx], dtype=np.int64)
+        ctasks = [self.buf_task[i] for i in candidate_idx]
+        losses = np.zeros(n_candidates, dtype=np.float64)
+
+        if self.model.multi_head:
+            for t in sorted(set(ctasks)):
+                sub_pos = [i for i, val in enumerate(ctasks) if val == t]
+                cache = self.model.forward(cX[sub_pos], t)
+                probs = cache["probs"]
+                sub_y = cY[sub_pos]
+                losses[sub_pos] = -np.log(probs[np.arange(len(sub_y)), sub_y] + 1e-12)
+        else:
+            cache = self.model.forward(cX)
+            probs = cache["probs"]
+            losses = -np.log(probs[np.arange(n_candidates), cY] + 1e-12)
+
+        top_pos = np.argsort(losses)[-n_replay:]
+        rX = cX[top_pos]
+        rY = cY[top_pos]
+        rtasks = [ctasks[i] for i in top_pos]
+        return rX, rY, rtasks
+
+
 class ContinualBackpropTrainer:
     """簡化版 continual backprop（Dohare et al.）：
     每個隱藏單元維護一個 utility（效用，貢獻度的指數移動平均）與 age（自上次重置後的步數）。
@@ -554,6 +750,8 @@ TRAINER_REGISTRY = {
     "EWC": EWCTrainer,
     "Replay": ReplayTrainer,
     "ReplayEWC": ReplayEWCTrainer,
+    "DarkReplayEWC": DarkReplayEWCTrainer,
+    "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "TaskBalancedReplay": TaskBalancedReplayTrainer,
     "ContinualBP": ContinualBackpropTrainer,
     "ReplayContinualBP": ReplayContinualBackpropTrainer,

@@ -2,7 +2,7 @@
 
 ## 1. 目的
 
-延續設計的持續學習（continual learning, CL）測試框架（accuracy matrix + 對角線可塑性探針 + BWT 遺忘指標），用 pi 的十進位小數位構造一個決定性、可重現、近乎不重複的長串流資料來源，實測七種演算法在 80 個依序到來的 task 上的表現：Naive（無防護下界）、EWC、Experience Replay、ReplayEWC、TaskBalancedReplay、Continual Backprop、ReplayContinualBP。
+延續設計的持續學習（continual learning, CL）測試框架（accuracy matrix + 對角線可塑性探針 + BWT 遺忘指標），用 pi 的十進位小數位構造一個決定性、可重現、近乎不重複的長串流資料來源，實測八種演算法在 80 個依序到來的 task 上的表現：Naive（無防護下界）、EWC、Experience Replay、ReplayEWC、SurpriseReplayEWC、TaskBalancedReplay、Continual Backprop、ReplayContinualBP。
 
 ---
 
@@ -22,17 +22,19 @@
 
 ## 3. 模型與演算法
 
-兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含七個 trainer，兩個模式的 80-task 完整表格皆已納入新增策略。
+兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含九個 trainer，其中八個已納入兩個模式的 80-task 完整表格；`DarkReplayEWC` 是文獻啟發的實驗方法，短流 sweep 後未列入主表。
 
 - **Naive**：純線上 SGD，無任何保護機制，作為下界基準。
 - **EWC**：以 Fisher 資訊對角線錨定舊參數的二次懲罰項。方案 A 中二次懲罰主要應用於共享隱藏層參數。
 - **Replay**：reservoir buffer（容量 500）。在方案 A 中，Replay 採用的重播樣本會根據其原本的 `task_idx` 通過對應的輸出頭計算梯度，並針對各輸出頭分別進行權重更新。
 - **ReplayEWC**：在 Replay 的混合梯度上額外加入 online EWC 正則化。多頭模式下只保護共享隱藏層，讓 task head 保持可塑。調參後預設 buffer capacity 從 500 提升到 2000。
+- **SurpriseReplayEWC**：在 ReplayEWC 上加入 surprise-prioritized sampling；每步先從 buffer 抽候選池，再回放目前模型 cross-entropy loss 最高的舊樣本。
+- **DarkReplayEWC**：實驗性方法，在 ReplayEWC 上保存舊 logits 並做 logit consistency replay；短流 sweep 中沒有贏 ReplayEWC，因此不列入主結果表。
 - **TaskBalancedReplay**：改用每個 task 各自的 reservoir，總 buffer 容量不變，但 slot 與抽樣都盡量平均分配到已看過的 task，避免長串流後早期任務樣本被全域 reservoir 稀釋。
 - **Continual Backprop**：依效用（utility）選擇性重置低貢獻且夠老的隱藏單元，輸出端權重清零做函數保持式插入，其餘權重完全不動。多頭結構下，神經元重置時會對所有輸出頭的對應連線進行同步重置。
 - **ReplayContinualBP**：把 TaskBalancedReplay 與 Continual Backprop 疊加，讓 replay 負責穩定性、神經元回收負責可塑性，是目前專案中最直接測試「記得住 + 學得動」互補性的候選方法。
 
-實驗基本配置：lr=0.1、batch_size=10，7 個方法 × 3 個 seed（0/1/2），共計在 80 個任務（每個任務 4000 步）的長串流上跑滿。
+實驗基本配置：lr=0.1、batch_size=10，8 個主方法 × 3 個 seed（0/1/2），共計在 80 個任務（每個任務 4000 步）的長串流上跑滿。
 
 ---
 
@@ -67,12 +69,13 @@
 | EWC | 64.3% | 78.3% | -16.8% $\pm$ 2.1% | **57.7%** $\pm$ 1.6% | 0.30 $\to$ 0.58 | 43.4 $\to$ 33.2 |
 | Replay | 66.6% | 91.6% | -24.0% $\pm$ 1.2% | **60.5%** $\pm$ 1.1% | 0.08 $\to$ 0.39 | 47.7 $\to$ 34.6 |
 | ReplayEWC | 68.8% | 90.7% | -3.5% $\pm$ 2.4% | **81.8%** $\pm$ 3.7% | 0.12 $\to$ 0.37 | 45.7 $\to$ 34.9 |
+| SurpriseReplayEWC | 76.2% | 93.4% | -2.5% $\pm$ 2.5% | **85.8%** $\pm$ 3.0% | 0.15 $\to$ 0.30 | 44.3 $\to$ 38.2 |
 | TaskBalancedReplay | 68.8% | 87.4% | -29.5% $\pm$ 1.5% | **54.1%** $\pm$ 3.0% | 0.08 $\to$ 0.49 | 47.2 $\to$ 33.0 |
 | ContinualBP | 62.3% | 69.7% | -38.3% $\pm$ 2.5% | **31.1%** $\pm$ 5.4% | 0.16 $\to$ 0.08 | 42.1 $\to$ 22.8 |
 | ReplayContinualBP | 68.8% | 84.1% | -34.6% $\pm$ 2.5% | **48.1%** $\pm$ 2.3% | 0.01 $\to$ 0.00 | 47.5 $\to$ 34.8 |
 
 > [!IMPORTANT]
-> **多頭結構的突破**：改用多輸出頭後，**ReplayEWC**、**Replay** 與 **EWC** 的全域平均準確率分別達到 **81.8%**、**60.5%** 與 **57.7%**。這表明共享隱藏層成功維持了對 pi 數位求和的泛化表徵，且獨立的輸出頭能夠有效區分不同任務的排列標籤。ReplayEWC 在 final accuracy、BWT、mean forgetting 與 retention ratio 上都大幅優於原始 Replay，是目前這個專案裡最穩的持續學習候選方法。
+> **多頭結構的突破**：改用多輸出頭後，**SurpriseReplayEWC**、**ReplayEWC**、**Replay** 與 **EWC** 的全域平均準確率分別達到 **85.8%**、**81.8%**、**60.5%** 與 **57.7%**。這表明共享隱藏層成功維持了對 pi 數位求和的泛化表徵，且獨立的輸出頭能夠有效區分不同任務的排列標籤。SurpriseReplayEWC 在 final accuracy、BWT、mean forgetting 與 retention ratio 上都優於原始 ReplayEWC，是目前這個專案裡最穩的持續學習候選方法。
 
 #### 方案 A 實驗結果圖集
 ![方案 A - 80-task 可塑性曲線](fig1_diagonal_accuracy_label_permuted.png)
@@ -89,6 +92,7 @@
 | EWC | 48.7% | 30.9% | -27.6% $\pm$ 0.3% | **11.0%** $\pm$ 0.3% | 0.20 $\to$ 0.56 | 47.7 $\to$ 46.3 |
 | Replay | 29.1% | 22.0% | -11.5% $\pm$ 0.8% | **11.4%** $\pm$ 0.2% | 0.01 $\to$ 0.32 | 54.9 $\to$ 56.4 |
 | ReplayEWC | 30.2% | 17.4% | -11.6% $\pm$ 0.1% | **10.6%** $\pm$ 0.4% | 0.01 $\to$ 0.00 | 53.9 $\to$ 57.5 |
+| SurpriseReplayEWC | 20.7% | 17.0% | -5.9% $\pm$ 1.1% | **11.0%** $\pm$ 0.1% | 0.05 $\to$ 0.03 | 53.2 $\to$ 56.3 |
 | TaskBalancedReplay | 29.5% | 20.4% | -11.6% $\pm$ 1.0% | **11.4%** $\pm$ 0.5% | 0.01 $\to$ 0.29 | 54.7 $\to$ 56.3 |
 | ContinualBP | 52.4% | 40.8% | -36.7% $\pm$ 1.0% | **10.9%** $\pm$ 0.1% | 0.18 $\to$ 0.27 | 47.3 $\to$ 45.6 |
 | ReplayContinualBP | 29.6% | 18.0% | -11.9% $\pm$ 0.7% | **10.8%** $\pm$ 0.2% | 0.00 $\to$ 0.00 | 54.9 $\to$ 56.9 |
@@ -109,6 +113,7 @@
 *   **ContinualBP** 在保護可塑性方面展現出極強的表現：在多頭設置下，其 h2 死神經元比例在 80 個任務後不升反降，維持在 **8%** (Naive 則惡化至 90%)；其 Late Diag Acc 仍高達 69.7%。這證實了神經元重置（utility resetting）能成功防止可塑性崩潰。然而，ContinualBP 的最終平均準確率（31.1%）低於 Replay 與 EWC，這是因為重置神經元旨在提供新的適應能力，但並不能防止已被重置單元上存儲的舊任務權重被覆盖（即缺乏舊知識保護機制）。
 *   **Replay** 和 **EWC** 則專注於「穩定性」，通過回放或二次阻尼防止舊知識被篡改，在多頭 Task-IL 模式下分別取得了 60.5% 與 57.7% 的優異表現。
 *   **ReplayEWC** 是目前最好的折衷：final average accuracy 達 81.8%，BWT 從 Replay 的 -24.0% 改善到 -3.5%，mean forgetting 從 26.0% 降到 11.1%，retention ratio 從 0.719 提升到 0.959。這表示「足夠舊樣本覆蓋率 + shared-weight 保護」比單靠其中一者更接近持續學習的目標。
+*   **SurpriseReplayEWC** 進一步把 final average accuracy 提升到 85.8%，mean forgetting 降到 8.9%，retention ratio 提升到 0.971。這表示在 buffer 已經足夠大時，「回放哪些樣本」開始變得比單純增加容量更關鍵。
 *   **ReplayContinualBP** 把 h2 dead unit 壓到 0%，但 final average accuracy 只有 48.1%，低於原始 Replay。這代表「維持可塑性」本身不是免費午餐：如果局部重置與回放更新沒有更細緻地協調，仍會破壞部分長期記憶。
 
 ### 6.2 BWT 遺忘指標被可塑性流失污染
@@ -125,20 +130,22 @@
 2. **記得住**：final average accuracy、retention ratio（最後平均準確率 / 剛學完平均準確率）。
 3. **忘多少**：BWT 與 mean forgetting（每個舊 task 歷史最佳表現到最後表現的落差）。
 
-工程上新增兩個候選策略：
+最新文獻對應到三個可落地方向：DER/DER++ 與 SER 類方法強調 logits consistency；IDER 類方法把 replay consistency 做成可疊加框架；2024-2025 的 adaptive/scalable replay 工作則強調記憶容量、回放效率與樣本選擇。這次對應實作如下：
 
 - **ReplayEWC** 把 Experience Replay 與 online EWC 疊加，是目前表現最好的穩定性增強方法。
+- **SurpriseReplayEWC** 把 sample selection 加入 ReplayEWC，優先回放目前模型最意外、loss 最高的舊樣本，是目前最佳方法。
+- **DarkReplayEWC** 實作 logits consistency replay，呼應 DER/SER/IDER 類文獻，但在本 benchmark 的短流 sweep 中沒有勝過 ReplayEWC，暫保留為實驗 baseline。
 - **TaskBalancedReplay** 修正全域 reservoir 在長任務流中的早期 task 稀釋問題。
 - **ReplayContinualBP** 把 replay 的穩定性與 ContinualBP 的可塑性維護接在一起，對應本研究一開始提出的核心假設：單一機制通常只能解遺忘或可塑性流失其中一側，複合機制才有機會真正提升持續學習。
 
-後續調參發現一個非常實用的結果：短流 sweep 裡調大 `replay_batch` 看似有效，但完整 80-task 驗證反而退步；真正有效的是把 ReplayEWC 的 buffer capacity 從 500 提升到 2000。這代表本 benchmark 的主要瓶頸是舊任務樣本覆蓋不足，而不是每步回放批次太小。
+後續調參發現兩個非常實用的結果：短流 sweep 裡調大 `replay_batch` 看似有效，但完整 80-task 驗證反而退步；真正有效的是把 ReplayEWC 的 buffer capacity 從 500 提升到 2000。再往後，加入 surprise-prioritized sampling 又把 final average accuracy 從 81.8% 推到 85.8%。這代表本 benchmark 的主要瓶頸先是舊任務樣本覆蓋不足，容量足夠後則轉為回放樣本選擇。
 
 `analyze.py` 也改成會自動偵測結果檔裡的方法清單，並在沒有 matplotlib 的 Python 環境中仍可輸出 `summary_stats_*.json`，只跳過圖表產生。
 
 ## 8. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
-2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 ReplayEWC 已提升到 80% 以上。
+2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 SurpriseReplayEWC 已提升到 85% 以上。
 3.  **機制互補性**：ContinualBP 強於可塑性維護，EWC 與 Replay 強於舊記憶維持。ReplayEWC 顯示樣本級 replay 與 shared-weight EWC 可以互補；ReplayContinualBP 則提醒我們，神經元重置若沒有更細緻的保護機制，仍可能傷害長期記憶。
 
 ---
@@ -148,7 +155,7 @@
 - `pi_digits.py`：產生/快取 pi 小數位序列。
 - `benchmark.py`：Permuted-Pi-Digits 串流（支持多頭 `label_permuted` 和單頭 `input_permuted`）。
 - `model.py`：支持多頭選擇與可塑性診斷的 numpy MLP 實現。
-- `trainers.py`：適配多輸出頭、樣本重播分組、ReplayEWC、task-balanced replay 與神經元重置的七種 CL Trainer。
+- `trainers.py`：適配多輸出頭、樣本重播分組、ReplayEWC、DarkReplayEWC、SurpriseReplayEWC、task-balanced replay 與神經元重置的九種 CL Trainer。
 - `run.py` / `run_one_combo.py`：主實驗腳本（支持命令行參數選擇模式、方法、seed、任務數與輸出路徑）。
 - `analyze.py`：彙整多 seed 實驗結果，輸出 JSON 與畫圖；缺 matplotlib 時仍會輸出 summary JSON。
 - `results_label_permuted.json` / `results_input_permuted.json`：實驗原始數據。
