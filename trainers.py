@@ -329,7 +329,7 @@ class ReplayEWCTrainer(ReplayTrainer):
     """
     name = "ReplayEWC"
 
-    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 500,
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
                  replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
                  fisher_batches: int = 30, fisher_decay: float = 0.9,
                  grad_clip_norm: float = 50.0):

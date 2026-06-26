@@ -11,6 +11,7 @@
 import json
 import os
 import time
+import inspect
 
 import numpy as np
 
@@ -30,7 +31,20 @@ DEFAULT_METHODS = [
 ]
 
 
-def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10, diag_every_n_tasks=1):
+def _build_trainer(model, method_name, lr, seed, trainer_kwargs=None):
+    trainer_kwargs = dict(trainer_kwargs or {})
+    Cls = TRAINER_REGISTRY[method_name]
+    sig = inspect.signature(Cls.__init__)
+    if "lr" in sig.parameters:
+        trainer_kwargs.setdefault("lr", lr)
+    if "seed" in sig.parameters:
+        trainer_kwargs.setdefault("seed", seed)
+    filtered = {k: v for k, v in trainer_kwargs.items() if k in sig.parameters}
+    return Cls(model, **filtered), filtered
+
+
+def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
+            diag_every_n_tasks=1, trainer_kwargs=None):
     stream_kwargs = dict(stream_kwargs)
     digits_file = stream_kwargs.pop("digits_file")
     with open(os.path.join(OUT_DIR, digits_file)) as f:
@@ -46,13 +60,7 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10, d
     n_tasks = stream.n_tasks
 
     model = MLP(**model_kwargs, seed=seed)
-    Cls = TRAINER_REGISTRY[method_name]
-    if "Replay" in method_name:
-        trainer = Cls(model, lr=lr, seed=seed)
-    elif method_name == "ContinualBP":
-        trainer = Cls(model, lr=lr, seed=seed)
-    else:
-        trainer = Cls(model, lr=lr)
+    trainer, used_trainer_kwargs = _build_trainer(model, method_name, lr, seed, trainer_kwargs)
 
     n_tasks_arr = n_tasks
     acc_matrix = np.full((n_tasks_arr, n_tasks_arr), np.nan, dtype=np.float64)
@@ -93,6 +101,7 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10, d
         plasticity_first_batch_acc=plasticity_first_batch_acc,
         n_tasks=n_tasks,
         mode=mode,
+        trainer_kwargs=used_trainer_kwargs,
     )
 
 
@@ -143,6 +152,24 @@ def main():
     parser.add_argument("--K", type=int, default=8)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--replay-capacity", type=int, default=None,
+                        help="Override replay buffer capacity for replay-based methods.")
+    parser.add_argument("--replay-batch", type=int, default=None,
+                        help="Override replay mini-batch size for replay-based methods.")
+    parser.add_argument("--ewc-lam", type=float, default=None,
+                        help="Override EWC lambda for EWC and ReplayEWC.")
+    parser.add_argument("--ewc-fisher-batches", type=int, default=None,
+                        help="Override the number of batches used to estimate Fisher.")
+    parser.add_argument("--ewc-fisher-decay", type=float, default=None,
+                        help="Override online EWC Fisher decay.")
+    parser.add_argument("--ewc-grad-clip", type=float, default=None,
+                        help="Override EWC regularizer gradient clipping norm.")
+    parser.add_argument("--cbp-replacement-rate", type=float, default=None,
+                        help="Override ContinualBP replacement rate.")
+    parser.add_argument("--cbp-maturity-threshold", type=int, default=None,
+                        help="Override ContinualBP maturity threshold.")
+    parser.add_argument("--cbp-util-decay", type=float, default=None,
+                        help="Override ContinualBP utility EMA decay.")
     parser.add_argument("--output", default=None,
                         help="Output JSON path. Defaults to results_<mode>.json in the project folder.")
     args = parser.parse_args()
@@ -155,6 +182,25 @@ def main():
     seeds = args.seeds
     methods = args.methods
     lr = args.lr
+    trainer_kwargs = {}
+    if args.replay_capacity is not None:
+        trainer_kwargs["capacity"] = args.replay_capacity
+    if args.replay_batch is not None:
+        trainer_kwargs["replay_batch"] = args.replay_batch
+    if args.ewc_lam is not None:
+        trainer_kwargs["lam"] = args.ewc_lam
+    if args.ewc_fisher_batches is not None:
+        trainer_kwargs["fisher_batches"] = args.ewc_fisher_batches
+    if args.ewc_fisher_decay is not None:
+        trainer_kwargs["fisher_decay"] = args.ewc_fisher_decay
+    if args.ewc_grad_clip is not None:
+        trainer_kwargs["grad_clip_norm"] = args.ewc_grad_clip
+    if args.cbp_replacement_rate is not None:
+        trainer_kwargs["replacement_rate"] = args.cbp_replacement_rate
+    if args.cbp_maturity_threshold is not None:
+        trainer_kwargs["maturity_threshold"] = args.cbp_maturity_threshold
+    if args.cbp_util_decay is not None:
+        trainer_kwargs["util_decay"] = args.cbp_util_decay
 
     stream_kwargs_template = dict(
         digits_file="pi_digits_600000.txt",
@@ -170,7 +216,7 @@ def main():
         for seed in seeds:
             t0 = time.time()
             res = run_one(method, seed, dict(stream_kwargs_template), model_kwargs,
-                          lr=lr, batch_size=args.batch_size)
+                          lr=lr, batch_size=args.batch_size, trainer_kwargs=trainer_kwargs)
             summary = summarize(res)
             res["summary"] = summary
             all_results[method].append(res)
