@@ -50,6 +50,8 @@
 
 **(P) P6：on-manifold（全域）輸入生成器假設被推翻（負面結果）**（§16）。P5 把殘留缺口歸因於因子化輸入離流形。P6 改用全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform 數位＝on-manifold）+ scholar 標註（`ScholarGlobalGenerativeReplayEWC`）。3-seed 反而**全面更差**：conflicting 0.428 < scholar-class 0.474 < raw 0.486、label 0.769 < scholar-class 0.809，**儘管 forgetting 最低**（0.052）——瓶頸是可塑性（diag 0.54→0.45）。把 teacher 均勻蒸餾到整個輸入空間是過強的全域正則、稀釋類界訊號；per-class 集中回放比全域覆蓋更重要。修正歸因：殘留小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移），非輸入分布失配。
 
+**(Q) P7：把核心結論搬到標準 MNIST benchmark 做外部效度驗證**（§17）。純 numpy 載入真實 MNIST（`mnist_data.py` / `mnist_benchmark.py` / `run_mnist.py`，介面與 pi stream 一致、重用全部 trainers）。**Permuted-MNIST（多頭 Task-IL，20 tasks×3 seeds）：DER++ 函數錨定完整守住**——DarkReplayEWC **0.912** > ReplayEWC 0.896 > Naive 0.840，BWT→**-0.002**、retention **0.998**，幅度隨串流長度複利（與 pi 一致）。**Split-MNIST class-IL（5 tasks、10 類、無 task id）：NCM「降低遺忘」方向成立**（forgetting 最低 0.028、retention 最高 0.977），**但 pi 的「線性頭崩潰＋DER++ 反轉成有害＋NCM 唯一解」被推翻為 200 類特例**——標準 10 類下線性頭 ReplayEWC 0.926 不崩、DER++ **0.952** 反而最佳。教訓：**replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出是跨 benchmark 真知識；戲劇性數字與「某機制必然反轉」的強論斷則隨類別數/串流長度/buffer 比例而變，不可外推。** 同時驗證了停掉 P2.5–P2.10 自動 gating（在 pi 特性上精雕、外部效度低）的判斷。下一步現代化方向：frozen pretrained feature + CL 讀出（P8，需先接特徵抽取器）。
+
 ---
 
 ## 1. 目的
@@ -762,7 +764,61 @@ scholar-global 在兩個設定都**最差 final，卻有最低 forgetting**（co
 
 結論（修正 P5 的歸因）：**殘留缺口不是 on-manifold 與否的問題**。把輸入分布推向真實（全域 uniform）反而更差；per-class 集中回放訊號比全域覆蓋更重要。剩下對 raw replay 的小差距（scholar-class 0.474 vs raw 0.486）更像是**真實樣本不可取代的價值**——精確的 per-class 聯合結構帶來的正向後向遷移（raw 在 conflicting 有 +BWT，合成回放沒有），而非可被更好的因子化/全域輸入模型補上的東西。仍未試：per-class **autoregressive**（抓類內位置相關）是否能再逼近一點——但邊際空間已很小（scholar-class 距 raw 僅 1.6% final/Joint）。
 
-## 17. 結論
+## 17. 外部效度驗證：把核心結論搬到標準 MNIST benchmark（P7）
+
+**為什麼**：本專案所有結論都長在自製的 Permuted-Pi-Digits 上。這個 benchmark 的最大風險是「太友善」——多數任務骨子裡共享同一個 `sum→bucket` 函數，使「不遺忘」異常容易（retention→1.0）。在把任何結論當成「持續學習的知識」之前，必須在 CL 社群真正使用的標準 benchmark 上重測，看哪些是真知識、哪些只是 pi 數位的特例。
+
+**做法**：純 numpy 載入真實 MNIST（`mnist_data.py`，不依賴 torch/sklearn），建立與 `PermutedPiDigitsStream` 介面完全一致的 `MNISTStream`（`mnist_benchmark.py`），讓既有的 `MLP`、全部 trainers、`run.py` 訓練迴圈原封不動重用（`run_mnist.py`）。挑兩個最有代表性、且各自對應一條核心結論的標準設置，各跑 3 seeds：
+
+- **Permuted-MNIST（多頭 Task-IL，20 tasks × 6000 樣本）** → 驗證結論 9「DER++ logit 蒸餾的函數空間錨定」。
+- **Split-MNIST（Class-IL，5 tasks×2 類，單頭、推論無 task id，8000 樣本）** → 驗證結論 10「NCM 原型讀出修好線性頭 recency bias」。
+
+模型：`784→256→256→10` MLP，lr=0.1，batch=10，buffer 2000（與 pi 主實驗一致）。
+
+### 17.1 Permuted-MNIST：DER++ 函數錨定的結論**守住**
+
+| 方法 | final_avg_acc | BWT | mean_forgetting | retention |
+| :--- | :---: | :---: | :---: | :---: |
+| Naive | 0.840 ± 0.005 | -0.067 | 0.069 | 0.929 |
+| ReplayEWC | 0.896 ± 0.002 | -0.009 | 0.021 | 0.991 |
+| **DarkReplayEWC (DER++ α=0.5)** | **0.912 ± 0.001** | **-0.002** | **0.012** | **0.998** |
+
+DER++ 在標準 Permuted-MNIST 上**重現了 pi `label_permuted` 的完整特徵簽名**：勝過 ReplayEWC（0.912 vs 0.896，差距遠大於 seed std 0.001–0.002）、把 BWT 壓到 ≈0、mean_forgetting 最低、retention→1.0。幅度比 pi 小（20-task +1.6% vs pi 130-task +7.7%），但這**正好符合 pi 觀察到的「DER++ 優勢隨串流長度複利放大」**——20 tasks 是短流，優勢理應較小。**結論 9 通過外部驗證：對「函數（輸出 logits）」做錨定確實是跨 benchmark 可遷移的抗遺忘機制。**
+
+### 17.2 Split-MNIST Class-IL：NCM 方向**成立，但「DER++ 反轉」被推翻為 pi 特例**
+
+| 方法 | final_avg_acc | BWT | mean_forgetting | retention |
+| :--- | :---: | :---: | :---: | :---: |
+| Naive | 0.198 ± 0.000 | -0.993 | 0.993 | 0.199 |
+| ReplayEWC（線性頭） | 0.926 ± 0.011 | -0.075 | 0.075 | 0.939 |
+| **DarkReplayEWC (DER++)** | **0.952 ± 0.004** | -0.037 | 0.037 | 0.970 |
+| NCMReplayEWC | 0.941 ± 0.003 | **-0.028** | **0.028** | **0.977** |
+
+Naive 崩到 0.198（≈10 類 class-IL 的純亂猜上界），證明這是一個**貨真價實的硬 class-IL**。但與 pi 200 類 class-IL 對照，三件事不一樣：
+
+1. **線性頭沒有崩潰**：pi 線性頭塌到 0.31，這裡 ReplayEWC 線性頭有 **0.926**。原因是只有 10 個全域類別、buffer 2000 已足以讓線性頭保持類別平衡，recency bias 遠較輕微。
+2. **DER++ 沒有反轉成有害**：pi 裡 DER++ 在 class-IL 反轉（0.23 < 0.31），這裡 DER++ 反而是 final **最高的（0.952）**。
+3. **NCM 仍有效，但不再是唯一解**：NCM 的 mean_forgetting（0.028）與 retention（0.977）最佳，**「無偏原型降低遺忘」的方向成立**；但它在 final 上小輸 DER++，不再像 pi 那樣是把 0.31 救回 0.858 的唯一英雄。
+
+**修正後的知識**：recency-bias 崩潰的嚴重度**隨全域類別數放大**。pi 的「線性頭在 class-IL 災難性崩潰、DER++ 反轉成有害、只有 NCM 能救」是 **200 類 fine-grained 設置的 benchmark 特例**；在標準 10 類 Split-MNIST 上，replay+EWC 的線性頭本身就很強，DER++ 仍有益，NCM 退化成一個「降低遺忘」的小幅精修。可遷移的部分是**機制方向**（無偏原型讀出減少遺忘），不是 pi 上戲劇性的數字與「DER++ 必反轉」的論斷。
+
+### 17.3 驗證總結（哪些守住、哪些是 pi 特例）
+
+| pi 上的結論 | 標準 benchmark 驗證 | 判定 |
+| :--- | :--- | :--- |
+| **DER++ 函數空間錨定降低遺忘、retention→1.0、優勢隨串流複利**（結論 9） | Permuted-MNIST：0.912 > 0.896，BWT→0，retention 0.998；幅度隨長度放大 | **守住（可遷移）** |
+| **NCM 無偏原型讀出減少 class-IL 遺忘**（結論 10 的方向） | Split-MNIST：forgetting 最低 0.028、retention 最高 0.977 | **守住（方向）** |
+| **線性頭在 class-IL 災難性崩潰、DER++ 反轉成有害、NCM 是唯一解**（結論 10 的戲劇性版本） | Split-MNIST：線性頭 0.926 不崩、DER++ 0.952 反而最佳 | **推翻（200 類特例）** |
+
+**教訓**：核心機制（replay + Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出）是真知識、跨 benchmark 成立；但**具體數字的戲劇性與「某機制必然反轉」這類強論斷，會隨類別數/串流長度/buffer 比例而變**，不能直接外推。這正是先前在 pi 上做的 P2.5–P2.10 自動 gating 微調最大的隱憂——那條線是在 pi 數位的特性上精雕細琢，外部效度低，故依規劃停損。
+
+**限制**：純 numpy 無法載入 pretrained backbone，故「frozen pretrained feature + CL 讀出」（最現代、也最契合 NCM/函數蒸餾的 regime）尚未驗證；這需要先在環境裡接上特徵抽取器（torch 或預存特徵），列為後續 P8。
+
+**結果檔**：`results_mnist_permuted.json`、`results_mnist_split.json`。
+
+---
+
+## 18. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -785,6 +841,7 @@ scholar-global 在兩個設定都**最差 final，卻有最低 forgetting**（co
 19. **buffer-free 生成式回放在長流可超越 raw replay（§14，P4）**。`GenerativeReplayEWC` 完全不存原始樣本，改對每類別維護生成模型並回放合成樣本。保真度的關鍵是條件在「定義標籤的統計量」上（本 benchmark 是窗口和；sum-matched ablation 0.470→0.753）。label_permuted 出現交叉：短流 raw replay 較佳（buffer 餵得飽），但 **80-task buffer-free 0.916 反超 raw ReplayEWC 0.818 與 raw DER++ 0.868**——固定 buffer 在長流被稀釋、生成統計量卻不衰減。conflicting 下因 sum-matched 條件統計量與多變規則不符而落後（0.431 < 0.486）。教訓：**「不存原始樣本」可行且在長流甚至更強，但前提是生成模型抓得住定義標籤的統計量**——這是把 raw buffer 換成生成模型時真正的瓶頸，而非記憶機制本身。
 20. **rule-agnostic 生成回放：teacher 蒸餾補上 conflicting，自分類器則失敗（§15，P5）**。為讓條件自動對齊任務規則：`NBGenerativeReplayEWC`（從儲存 categorical 自建 NB 分類器 rejection）**失敗**（conflicting 0.418、label 退步到 0.521——因子化邊際做的分類器太弱）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher、對合成輸入做 soft-logit 蒸餾，generative DER++）**成功補上 conflicting 缺口**——0.474（final/Joint 0.628 vs raw 0.644，差 1.6%）且遺忘最低 0.082，因為 teacher 編碼每任務真實規則（含交互）能正確標註；label_permuted ≈ raw（0.809）但不及 sum-match 峰值。結論：**沒有單一 buffer-free 生成器全勝**（已知簡單統計量→sum-match；規則複雜/未知→scholar）。
 21. **on-manifold 輸入生成器假設被推翻；殘留缺口是真實樣本的不可取代價值（§16，P6，負面結果）**。P5 把缺口歸因於因子化輸入離流形。P6 改從全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform＝on-manifold）+ scholar 標註，但 3-seed **全面更差**（conflicting 0.428、label 0.769），儘管 forgetting 最低（0.052）——把 teacher 均勻蒸餾到整個輸入空間是過強全域正則、犧牲可塑性（diag 0.54→0.45），且稀釋類界訊號。**per-class 集中回放比全域 on-manifold 覆蓋更重要。** 修正 P5 歸因：scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw 在 conflicting 有 +BWT 而合成回放沒有），不是可被更好輸入模型補上的失配。整個 P4–P6 的總結論：**「不存原始樣本」可行且常常足夠（label_permuted 長流甚至贏 raw），但要完全追平 raw replay 仍有一道由真實樣本聯合結構撐起的小硬牆。**
+22. **外部效度驗證：核心機制守住、戲劇性數字是 pi 特例（§17，P7）**。把結論搬到 CL 社群的標準 benchmark：**Permuted-MNIST（多頭 Task-IL）上 DER++ 函數錨定完整守住**——0.912 > ReplayEWC 0.896、BWT→0、retention 0.998，且優勢隨串流長度複利（與 pi 一致）。**Split-MNIST class-IL 上 NCM「降低遺忘」的方向成立**（forgetting 最低 0.028、retention 最高 0.977），**但 pi 的「線性頭災難性崩潰、DER++ 反轉成有害、NCM 是唯一解」被推翻為 200 類特例**——標準 10 類下線性頭 0.926 不崩、DER++ 0.952 反而最佳。教訓：**replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出是跨 benchmark 的真知識；但具體數字的戲劇性與「某機制必然反轉」的強論斷會隨類別數/串流長度/buffer 比例而變，不能外推。** 這也驗證了停掉 P2.5–P2.10 自動 gating 微調的判斷（那條線在 pi 特性上精雕、外部效度低）。下一個現代化方向是 frozen pretrained feature + CL 讀出（P8，需先接特徵抽取器）。
 
 ---
 
@@ -814,6 +871,8 @@ scholar-global 在兩個設定都**最差 final，卻有最低 forgetting**（co
 - `results_genreplay_label_permuted.json`（80 tasks）/ `results_genreplay_longstream_label_permuted.json`（130 tasks）/ `results_genreplay_conflicting_40.json`（40 tasks）/ `results_genreplay_10task_label_permuted.json` / `results_genreplay_nomatch_ablation_10task.json`：§14 P4 buffer-free 生成式回放（GenerativeReplayEWC）對照與 sum-match ablation。
 - `results_p5_nb_{conflicting_40,label_permuted}.json` / `results_p5_scholar_{conflicting_40,label_permuted}.json`：§15 P5 rule-agnostic 生成回放——NB 自分類器（失敗）與 scholar teacher 蒸餾（補上 conflicting 缺口）。
 - `results_p6_scholar_global_{conflicting_40,label_permuted}.json`：§16 P6 全域 on-manifold 輸入生成器（負面結果——比 per-class scholar 更差）。
+- `mnist_data.py` / `mnist_benchmark.py` / `run_mnist.py`：§17 P7 標準 benchmark 外部效度驗證——純 numpy 載入真實 MNIST，建立與 pi stream 同介面的 `MNISTStream`（Permuted-MNIST 多頭 Task-IL、Split-MNIST class-IL），重用全部 trainers。
+- `results_mnist_permuted.json` / `results_mnist_split.json`：§17 驗證結果——DER++ 函數錨定守住（Permuted-MNIST），NCM 方向守住但「DER++ 反轉」被推翻為 200 類特例（Split-MNIST）。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

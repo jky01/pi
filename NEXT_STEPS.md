@@ -51,10 +51,14 @@
 - **P4 — Buffer-free / generative replay（已完成，§14）**：新增 `GenerativeReplayEWC`（完全不存原始樣本，per-(task,class) categorical 生成模型 + sum-matched conditional generation）。label_permuted 80-task buffer-free **0.916 反超** raw ReplayEWC 0.818 與 DER++ 0.868（長流 buffer 被稀釋、生成統計量不衰減）；conflicting 0.431 < raw 0.486（sum-matched 條件統計量對非 sum 規則不符）。
 - **P5 — rule-agnostic 生成回放（已完成，§15）**：試兩條路。`NBGenerativeReplayEWC`（從儲存 categorical 自建 NB 分類器 rejection）**失敗**（conflicting 0.418、label 退步到 0.521）。`ScholarGenerativeReplayEWC`（每任務凍結 teacher、對合成輸入 soft-logit 蒸餾，generative DER++）**成功補上 conflicting 缺口**：0.474（final/Joint 0.628 vs raw 0.644，差 1.6%≤2%）、遺忘最低 0.082；label_permuted ≈ raw（0.809）但不及 sum-match 峰值 0.916。沒有單一 buffer-free 生成器全勝；殘留缺口源自因子化輸入保真度 → P6。
 - **P6 — 更強的輸入生成器（已完成，§16，負面結果）**：`ScholarGlobalGenerativeReplayEWC`（全域 per-task 邊際抽 on-manifold 輸入 + scholar 標註）**推翻 P5 的 on-manifold 歸因**——3-seed 全面更差（conflicting 0.428 < scholar-class 0.474；label 0.769 < 0.809），儘管 forgetting 最低（0.052），瓶頸是可塑性（diag 0.54→0.45）。per-class 集中回放比全域覆蓋更重要；殘留小差距更像真實樣本不可取代的價值（精確 per-class 聯合結構→正向後向遷移），非輸入分布失配。
+- **P7 — 標準 benchmark 外部效度驗證（已完成，§17）**：純 numpy 載入真實 MNIST（`mnist_data.py`/`mnist_benchmark.py`/`run_mnist.py`，介面與 pi stream 一致、重用全部 trainers）。**Permuted-MNIST（多頭 Task-IL，20×3 seeds）：DER++ 函數錨定守住**——DarkReplayEWC **0.912** > ReplayEWC 0.896 > Naive 0.840、BWT→-0.002、retention 0.998、幅度隨串流複利。**Split-MNIST class-IL（5 tasks、10 類、無 task id）：NCM 降遺忘方向守住**（forget 最低 0.028、retention 最高 0.977）**但 pi 的「線性頭崩潰＋DER++ 反轉＋NCM 唯一解」被推翻為 200 類特例**（線性頭 0.926 不崩、DER++ 0.952 反而最佳）。教訓：核心機制跨 benchmark 成立，但戲劇性數字與「某機制必反轉」的強論斷隨類別數/串流長度/buffer 比例而變、不可外推。結果檔 `results_mnist_{permuted,split}.json`。
+
+**已停損（不再投入，理由見下）**
+- **P2.10 — persistent shadow-model bandit / regime prior（停損）**：P2.5→P2.9 共 5 輪自動 DER++ gating 全部報酬遞減/負面，且都是在 pi 數位的特性上精雕細琢。P7 外部驗證（§17）顯示「該不該開 DER++」的答案本就隨類別數/串流長度/buffer 比例而變，這條線外部效度低。實務穩健解已知：長共享流直接開 full DER++、短流/衝突用 ReplayEWC（P2.7 horizon oracle 已證明可切換 schedule 存在）。**停止再做自動 detector。**
+- **P6b — per-class autoregressive 生成器（停損）**：邊際空間僅 1.6% final/Joint，且 P6 已證明殘留缺口是「真實樣本不可取代的價值」而非輸入保真度，繼續投入價值低。**停損。**
 
 **下一個要做 / Todo**
-- **P2.10 — persistent shadow-model bandit / regime prior（接續 P2.9 的限制）**：P2.9 證明 local window rollout 不夠。下一步若要繼續找自動 DER++ policy，應讓 alpha=0 與 alpha=0.5 的 shadow learners 從真實時間早期開始並行經歷 stream，週期性用 held-out replay/current 評估長期 retention/plasticity，再更新主模型 policy；或加入明確的 horizon/budget/regime prior，再用 function-space 訊號校正。
-- **（可選）P6b — per-class autoregressive 生成器**：P6 證明「全域 on-manifold」方向錯；唯一還沒試的是 per-class **autoregressive**（抓類內位置相關）能否把 scholar-class 從 0.474 再推近 raw 0.486。但邊際空間極小（僅差 1.6% final/Joint），優先序低。
+- **P8 — frozen pretrained feature + CL 讀出（現代化方向）**：P7 已證明 NCM/函數蒸餾這類「對表徵/函數做事」的機制是跨 benchmark 真知識，而當代 CL 重心是 pretrained/foundation model 的持續學習。最契合本專案發現的設定是：用 frozen pretrained backbone 抽特徵，只在其上做 CL 讀出（NCM 原型、線性頭+DER++）。**阻塞點：純 numpy 環境無 torch，需先接特徵抽取器（裝 torch、或預先離線抽好特徵存成 .npz）。** 這是把「玩具流上的好結論」推進到「現代 CL 真正在意的 regime」的關鍵一步。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
 **結果**：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 Class-IL final 0.31→**0.858**、遺忘 0.50→**0.06**、retention>1.0（3 seeds, std 0.003）。診斷正確：病灶是線性頭的 recency/magnitude bias，換成無偏原型讀出即解。候選清單裡的 cosine/BiC/class-balanced replay 尚未試（NCM 已夠強，這些可作為進一步小幅優化或在更大規模時備用）。
@@ -202,10 +206,11 @@
 
 **結論**：殘留缺口不是 on-manifold 與否的問題。scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw conflicting 有 +BWT、合成回放沒有）。P4–P6 總結：不存原始樣本可行且常足夠（長流甚至贏 raw），完全追平 raw 仍有一道由真實樣本聯合結構撐起的小硬牆。唯一未試：per-class autoregressive（見上方 Todo P6b，優先序低）。
 
-## 3. 建議順序與理由（P1/P2/P2.5/P2.7/P2.8/P2.9/P3/P4/P5/P6 已完成；P2.6/P2.9 負面、P2.8 部分正面/負面）
+## 3. 建議順序與理由（P1–P7 已完成；P2.6/P2.9 負面、P2.8 部分正面/負面；P2.10/P6b 已停損）
 
-1. **P2.10（persistent shadow-model bandit / regime prior）** — P2.9 證明 local multi-step rollout 還是太短視；若要繼續找自動 DER++ policy，必須讓 shadow_on/off 跨真實時間累積差異，或加入顯式 horizon/budget/regime prior。
-2. **（可選）P6b（per-class autoregressive 生成器）** — 邊際空間極小（scholar-class 距 raw 僅 1.6%），優先序低。
+1. **P8（frozen pretrained feature + CL 讀出）** — 唯一在進行的方向。P7 外部驗證證明核心機制（replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出）跨 benchmark 成立，且正好是 pretrained regime 最有效的東西。阻塞點是環境無 torch，需先接特徵抽取器。
+2. ~~P2.10（自動 DER++ gating）~~ — **已停損**：5 輪報酬遞減、外部效度低。
+3. ~~P6b（per-class autoregressive 生成器）~~ — **已停損**：邊際 1.6%、殘留缺口是真實樣本價值而非輸入保真度。
 
 ## 4. 慣例
 

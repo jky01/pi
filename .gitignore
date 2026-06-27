@@ -1,3 +1,4 @@
 .DS_Store
 _bintest.bin
 __pycache__
+mnist.npz

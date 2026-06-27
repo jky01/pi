@@ -33,6 +33,12 @@ $PY -m unittest test_smoke
 # Run a single (method, seed, hyperparams) combo — used for tuning
 $PY run_one_combo.py
 $PY tune_replay_ewc.py
+
+# Standard-benchmark external-validity check on real MNIST (report §17 / P7).
+# Pure-numpy MNIST loader + a stream with the same interface as the pi stream, so it
+# reuses the MLP and every trainer. Validates which pi-digit findings transfer.
+$PY run_mnist.py permuted --methods Naive ReplayEWC DarkReplayEWC --seeds 0 1 2  # Permuted-MNIST Task-IL
+$PY run_mnist.py split --methods Naive ReplayEWC DarkReplayEWC NCMReplayEWC --seeds 0 1 2  # Split-MNIST class-IL
 ```
 
 ## Architecture
