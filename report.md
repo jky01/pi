@@ -34,7 +34,7 @@
 
 **(H) P2.5：reactive pressure 與 maturity gate 的邊界**（§12.3）。新增 `PressureDarkReplayEWC`（可靠 logits × label-loss forgetting pressure）與 `DarkReplayEWC --distill-start-task`。結果：20-task 下 Pressure 幾乎退回 ReplayEWC，避開固定 DER++ 傷害；130-task 下 Pressure **0.847**，高於 ReplayEWC **0.815**，但低於 full DER++ **0.892**。delayed DER++ start=40 得 **0.827**、start=80 得 **0.779**，都不如 full DER++。新教訓：**logit drift 不是可靠遺忘訊號，單純晚開蒸餾也太弱；full DER++ 的優勢是 proactive consolidation，不是等 label loss 壞掉才補救。**
 
-**(I) P2.6：Lookahead 與 RTP (Gradient-Cosine) 解決觀察者悖論**（§12.4）。新增 `LookaheadDarkReplayEWC` 與 `RtpDarkReplayEWC`。利用前 5 步累積的梯度與 Replay Buffer 歷史梯度進行餘弦相似度比對（RTP），能精準偵測特徵衝突。在衝突（`conflicting`）任務下動態降為 $\alpha=0.0$，避免 DER++ 帶來的損害，得 **0.358**（優於固定 DER++ 的 **0.347**）；在共享特徵（`label_permuted`）下檢測為 synergistic，可保持高保留率，得 **0.587**（顯著優於固定 DER++ 的 **0.532**）。
+**(I) P2.6：cos-RTP regime 偵測器 — 3-seed 驗收後判定失敗（負面結果）**（§12.4）。新增 `LookaheadDarkReplayEWC` 與 `RtpDarkReplayEWC`（task-onset 用前 5 步累積梯度與 buffer 歷史梯度做餘弦比對決定開不開 DER++）。初版 20-task×1 seed sanity 誤判成功；**正式 3-seed 驗收推翻**：130-task label_permuted RTP **0.818**，未達 ≥0.87 目標、反略低於 ReplayEWC **0.832**，遠不及 full DER++ **0.893**。診斷：RTP 的 `alpha_mean≈0.011`（全程僅 ~2% task 判 synergistic），等於**幾乎永遠關閉 DER++、退化成 ReplayEWC**；它只在「ReplayEWC≥DER++ 的短流/衝突」看起來贏（=關掉剛好對）。threshold 掃描證實**機制完好**（強制永遠開→0.898≈DER++），**病灶是訊號**：多頭標籤排列把不同反傳誤差旋進共享層，使 task-onset 梯度餘弦分不開「共享規則長流」與「真衝突」。**P2.6 目標（自動辨識何時值得 proactive consolidation）未達成，退回 backlog。**
 
 ---
 
@@ -492,23 +492,42 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
    - 與 Replay Buffer 中抽樣的過去任務平均梯度計算餘弦相似度 $\cos(\mathbf{g}_{curr}, \mathbf{g}_{past})$。
    - 若 $\cos \ge \text{threshold}$（預設為 -0.05），判定為 **Synergistic (共享特徵)**，將 $\alpha$ 設為 0.5；若為負值則判定為 **Conflicting (衝突特徵)**，將 $\alpha$ 降為 0.0，使算法在衝突時完全退回穩健的 `ReplayEWC` 行為，且在整段任務期間保持恆定。
 
-短流 sanity 評估結果（20 tasks × 1000 steps × 1 seed, seed=0）：
+初版只跑了短流 sanity（20 tasks × 1000 steps × 1 seed），當時誤判 cos-RTP 成功。**正式 3-seed 驗收推翻了這個結論**（見下）。
 
-| mode | 方法 | final | BWT | mean forgetting | 解讀 |
+#### 12.4.1 ⚠️ 正式 3-seed 驗收：cos-RTP 偵測器失敗（負面結果）
+
+依 NEXT_STEPS 的驗收標準（130-task label_permuted ≥0.87、conflicting 不低於 ReplayEWC、20/80-task 不輸 ReplayEWC），用 3 seeds 重跑（`dark_alpha=0.5`、`rtp_cos_threshold=-0.05`，4000 steps/task，lr 0.1）。結果檔：`results_rtp_longstream_label_permuted.json`、`results_rtp_conflicting_40.json`、`results_rtp_{20,80}_label_permuted.json`。
+
+| 設定 | 方法 | final | BWT | forget | 判讀 |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| conflicting | ReplayEWC | 0.376 | 0.072 | 0.031 | Baseline 無蒸餾上界 |
-| conflicting | DarkReplayEWC α=0.5 | 0.347 | 0.050 | 0.023 | 固定蒸餾受衝突規則損害 |
-| conflicting | LookaheadDarkReplayEWC (beta=500) | 0.327 | 0.043 | 0.017 | 單步 Lookahead 易受雜訊干擾，無法降為 0 |
-| conflicting | LookaheadDarkReplayEWC (beta=10000) | 0.342 | 0.047 | 0.022 | 增加 beta 後壓低 $\alpha$，準確度回升 |
-| conflicting | **RtpDarkReplayEWC (cos-RTP)** | **0.358** | **0.058** | **0.033** | 成功偵測到衝突，關閉蒸餾，大幅優於固定 DER++ |
-| label_permuted | ReplayEWC | 0.598 | 0.165 | 0.039 | Baseline 無蒸餾 |
-| label_permuted | DarkReplayEWC α=0.5 | 0.532 | 0.112 | 0.033 | 固定蒸餾在短流時限制可塑性 |
-| label_permuted | LookaheadDarkReplayEWC (beta=500) | 0.502 | 0.102 | 0.032 | 可塑性與保留受限 |
-| label_permuted | **RtpDarkReplayEWC (threshold=-0.05)** | **0.587** | **0.154** | **0.056** | 保持高可塑性與高保留率，顯著優於固定 DER++ |
+| **130-task label_permuted** | ReplayEWC | 0.832 ± 0.065 | -0.056 | 0.120 | baseline |
+| | **RtpDarkReplayEWC** | **0.818 ± 0.042** | -0.080 | 0.140 | ❌ 未達 0.87，反略低於 ReplayEWC |
+| | DarkReplayEWC (full DER++) | **0.893 ± 0.015** | +0.012 | 0.040 | 目標增益 |
+| 40-task conflicting | ReplayEWC | 0.486 (f/J 0.644) | -0.054 | 0.112 | baseline |
+| | RtpDarkReplayEWC | 0.487 (f/J 0.646) | -0.051 | 0.104 | ✅ 但只因退回 ReplayEWC |
+| 20-task label_permuted | ReplayEWC | 0.873 ± 0.013 | — | 0.038 | baseline |
+| | RtpDarkReplayEWC | 0.865 ± 0.018 | — | 0.041 | ✅ 但只因退回 ReplayEWC |
+| 80-task label_permuted | ReplayEWC | 0.818 ± 0.037 | -0.035 | 0.111 | baseline |
+| | RtpDarkReplayEWC | 0.816 ± 0.028 | -0.034 | 0.114 | ✅ 但只因退回 ReplayEWC |
 
-結論：
-1. **單步 Lookahead 的局限性**：由於單步梯度更新產生的 Loss 波動極度微弱且充滿優化雜訊，容易在正負之間劇烈跳動，導致 $\alpha$ 無法穩定在 $0$。
-2. **梯度餘弦是精準的 Regime 信號**：共享層的梯度方向直接代表特徵映射的旋轉與對齊度。利用 `cos-RTP` 在任務切換時進行一次性的累積判定，能安全地在衝突時降為無蒸餾的 ReplayEWC，同時在共享規則時保持高效。
+**關鍵診斷**：RTP 的 `adaptive_dark_alpha_mean ≈ 0.011`——130-task 全程僅約 2% 的 task 被判為 synergistic。也就是 cos-RTP **幾乎永遠判定 conflicting、永遠關閉 DER++**，因此在每個設定都退化成 ReplayEWC。它在「ReplayEWC ≥ DER++ 的情況（短流、衝突）」看起來贏，純粹是因為關掉 DER++ 剛好對；在「DER++ 才是英雄的長流」就輸——**它不是 regime detector，是個近乎常關的開關**。初版 20-task×1 seed 的 0.587「勝利」正是同一個「永遠關閉」行為的假象（那個短流下 DER++ 本就比 ReplayEWC 差）。
+
+#### 12.4.2 Threshold 掃描：機制完好，病灶在訊號
+
+在 130-task（seeds 0,1）掃 `rtp_cos_threshold`：
+
+| threshold | alpha_mean (synergistic 比例) | final |
+| :--- | :---: | :---: |
+| -0.05（預設） | 0.011 (~2%) | 0.818 |
+| -0.2 | 0.05 (~10%) | 0.810 |
+| **-1.0（強制永遠開 = always DER++）** | 0.495 (~99%) | **0.898** ≈ full DER++ 0.893 |
+
+強制 alpha 永遠開即還原 0.898 ≈ full DER++，證明 **DER++ 機制本身完好**；問題出在偵測訊號：label_permuted 共享規則長流的「當前 vs 過去共享層梯度餘弦」幾乎都 < -0.2。原因是**多頭的標籤排列會把不同的反傳誤差訊號旋進共享層**，使共享層梯度方向被當前 head 的隨機 init / 標籤排列主導，**梯度餘弦無法代表「底層規則相同」**。
+
+結論（修正版）：
+1. **Lookahead（單步反事實）**：單步梯度更新的 replay loss 波動極微弱且充滿優化雜訊，$\alpha$ 無法穩定，初版即放棄。
+2. **cos-RTP 不是有效的 regime 訊號（負面結果）**：task-onset 的共享層梯度餘弦在本 benchmark 分不開「共享規則長流」與「真衝突」——兩者都被判成 conflicting。它只能當「永遠退回 ReplayEWC 的安全閥」，無法在共享規則長流自動打開 DER++ 拿到增益。**P2.6 的目標（自動辨識何時值得 proactive consolidation）尚未達成。**
+3. **教訓**：要分辨「值得開 DER++ 的長共享流」需要 horizon / function-space 訊號（例如真正評估「開 DER++ 後舊任務 replay accuracy 是否改善且新任務不受傷」的反事實量測），而不是 task-onset 的權重梯度方向。這把 P2.6 的開放問題退回 backlog（見 NEXT_STEPS）。
 
 ## 13. 結論
 
@@ -525,6 +544,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 11. **Conflicting-task 校正了通用性判斷（§12）**。當 task 的底層函數真的不同，ReplayEWC 仍是最穩骨幹（final/Joint 0.756），但 DER++ α=0.5 反而降低 final/Joint 到 0.698；它降低 forgetting，卻阻礙學新衝突規則。這把「最終答案」從單一 trainer 改成一個設計原則：**replay + Fisher-EWC 是核心骨幹；DER++、NCM、adapter、episodic readout 是依 task regime 自適應開關的模組。**
 12. **Adaptive distillation 的第一版是安全閥，不是完整解（§12.2）**。`AdaptiveDarkReplayEWC` 能在 conflicting 下自動把蒸餾降到 0，回到 ReplayEWC、避開固定 DER++ 傷害；confidence gate 也能減少固化低品質 logits 的副作用。但目前梯度 cosine 訊號在短流 `label_permuted` 也偏負，無法自動重現長流 DER++ 的優勢。下一步要找更好的「何時開蒸餾」訊號，而不是只調 α。
 13. **Pressure/maturity gating 進一步縮小了答案空間（§12.3）**。可靠記憶 × label-loss pressure 是安全的，能在 130-task 把 ReplayEWC 0.815 拉到 0.847，但仍不及 full DER++ 0.892；logit drift 會誤判，delayed start=40/80 也不夠。這說明 DER++ 的價值是 proactive consolidation，而不是 reactive repair。下一步要做 regime/horizon detector，而不是再找單一局部 gate。
+14. **cos-RTP regime 偵測器失敗，但釐清了訊號需求（§12.4，負面結果）**。task-onset 共享層梯度餘弦無法分辨「共享規則長流（該開 DER++）」與「真衝突（該關）」——3-seed 驗收下 RTP 幾乎永遠判 conflicting、退化成 ReplayEWC，130-task 只有 0.818（< full DER++ 0.893，甚至略低於 ReplayEWC 0.832）。threshold 掃描證明機制完好（強制永遠開→0.898），病灶是訊號：多頭標籤排列把不同反傳誤差旋進共享層，污染了梯度方向。這把 §12.2/12.3/12.4 三次嘗試的共同教訓定型：**局部、reactive、權重空間的訊號（cosine、logit drift、label loss）都不足以判斷「是否值得 proactive consolidation」；要做就得用 function-space 反事實量測（開 DER++ 後舊任務 replay accuracy 是否真的改善且新任務不受傷）或 horizon 訊號。** 在找到這種訊號前，實務上的穩健選擇是：已知長共享流就直接開 full DER++，已知短流/衝突就用 ReplayEWC。
 
 ---
 
@@ -546,6 +566,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 - `results_conflicting_*.json`：§12 任務底層函數真衝突 benchmark 與 DER++ alpha sweep。
 - `results_*adaptive*_sanity.json`、`results_*confidence_dark*_sanity.json`、`results_*dark_baseline_sanity.json`：§12.2 adaptive/confidence-gated distillation 的短流 sanity。
 - `results_*pressure*.json`、`results_label_permuted_delayed_dark_*.json`：§12.3 reliability × forgetting-pressure 與 delayed DER++ maturity gate 實驗。
+- `results_rtp_longstream_label_permuted.json`（130 tasks）/ `results_rtp_conflicting_40.json`（40 tasks）/ `results_rtp_{20,80}_label_permuted.json`：§12.4 cos-RTP regime 偵測器的 3-seed 正式驗收（負面結果：RTP 退化成 ReplayEWC、拿不到長流 DER++ 增益）。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

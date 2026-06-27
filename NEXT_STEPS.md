@@ -24,6 +24,7 @@
 - **Class-IL（誠實硬測試，§11）**：拿掉 task id 後線性頭因 recency bias 崩壞（**DER++ 反轉成有害**）。**已解：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 0.31→0.858、遺忘 0.50→0.06、retention>1.0**（§11.3）。教訓：表徵骨幹用 replay+EWC，讀出依設定換（Task-IL：head+DER++；Class-IL：無偏原型）。benchmark Class-IL 上限 ~200 類（K=8 位數和僅 ~73 相異值）。
 - **Adaptive distillation 初步結果（§12.2）**：`AdaptiveDarkReplayEWC` 可在 conflicting 下自動把 α 降到 0，退回 ReplayEWC、避免固定 DER++ 傷害；confidence gate 可減少低品質 logits 的副作用。但目前梯度 cosine 只能當安全閥，還不能自動判斷何時該在長流共享規則下打開 DER++。
 - **Pressure / maturity gating 邊界（§12.3）**：`PressureDarkReplayEWC`（可靠 logits × label-loss pressure）安全但偏保守，130-task 把 ReplayEWC **0.815→0.847**，仍低於 full DER++ **0.892**；logit drift 是假警報，delayed DER++ start=40/80 也不夠。下一步要做的是 **regime/horizon detector**，不是再調單一 batch-level gate。
+- **cos-RTP regime detector 失敗（§12.4，3-seed 驗收）**：task-onset 共享層梯度餘弦**不是**有效 regime 訊號——RTP 幾乎永遠判 conflicting、退化成 ReplayEWC，130-task 只有 **0.818**（< full DER++ 0.893）。機制完好（強制永遠開→0.898），病灶在訊號（多頭標籤排列污染共享層梯度方向）。教訓：局部/reactive/權重空間訊號（cosine、logit drift、label loss）都不足，要用 function-space 反事實量測或 horizon 訊號（→ P2.7）。
 - **正向遷移**：表徵層有（晚段任務最終準確率更高），學習速度沒有（§10.3）。
 
 ## 2. Backlog（依優先序；每項含 為什麼 / 做法 / 驗收）
@@ -34,9 +35,10 @@
 - **P1 — Class-IL 遺忘缺口**：已用 `NCMReplayEWC` 解掉線性頭 recency bias，詳見 §11.3。
 - **P2 — Conflicting-task benchmark**：已新增真衝突任務、40-task scorecard、DER++ alpha sweep，詳見 §12.1。
 - **P2.5 — Pressure / maturity gating**：已實作 `PressureDarkReplayEWC`、confidence/loss-pressure gate、delayed DER++ maturity gate，並完成 20/80/130-task 對照，詳見 §12.3。
-- **P2.6 — Lookahead 與 RTP 動態 Regime 偵測器**：已實作 Lookahead 與基於梯度餘弦的 RTP 門控，自動分類 Synergistic/Conflicting 任務，詳見 §12.4。
+- **P2.6 — Lookahead 與 RTP 動態 Regime 偵測器（已做完並 3-seed 驗收，結論為負面）**：實作了 Lookahead 與 cos-RTP 門控，但 **3-seed 正式驗收推翻初版「成功」結論**：cos-RTP 在 130-task label_permuted 只有 0.818（< full DER++ 0.893、甚至略低於 ReplayEWC 0.832），因為它幾乎永遠判 conflicting、退化成 ReplayEWC（alpha_mean≈0.011）。threshold 掃描證明機制完好（強制永遠開→0.898）、病灶是訊號（task-onset 梯度餘弦分不開共享規則長流 vs 真衝突）。詳見 §12.4.1/12.4.2。**P2.6 的目標（自動辨識何時值得 proactive consolidation）尚未達成 → 退回 backlog 為 P2.7。**
 
 **下一個要做 / Todo**
+- **P2.7 — function-space / horizon regime 偵測器（接續 P2.6 的未竟目標）**：見下方 backlog。task-onset 權重梯度餘弦已證實無效，改用反事實 replay-accuracy 量測或 horizon 訊號。
 - **P3 — Task-free (無邊界) CL**：移除 `on_task_end` 依賴，將 Fisher 估計與 EWC anchor 鎖定轉為線上滾動形式。
 - **P4 — Buffer-free / generative replay**：用特徵級回放（Feature Replay）或高斯偽特徵生成（Gaussian Pseudo-Rehearsal），取代原始樣本 Buffer。
 
@@ -85,15 +87,26 @@
 - 結論：reactive pressure 能降低壞 seed 風險但太保守；maturity gate 太粗；logit drift 是假警報；full DER++ 的優勢是 proactive consolidation。
 - 下一步不應再調單一 alpha，而是做 **P2.6：自動辨識「共享規則長流」vs「真衝突/短流」regime**。
 
-### P2.6 — Regime / horizon detector（下一個最有價值工作）
-**要做的事情**：不要再調單一 alpha，而是讓系統判斷目前 stream 屬於「共享規則長流」還是「真衝突/短流」，再決定 `distill_mode = off / pressure / full`。
+### ✅/❌ P2.6 — cos-RTP regime detector（已做完並 3-seed 驗收，結論為負面，§12.4）
+**做完的事情**：實作 `LookaheadDarkReplayEWC`（單步反事實，因雜訊放棄）與 `RtpDarkReplayEWC`（task-onset 前 5 步累積共享層梯度 vs buffer 歷史梯度餘弦，>= threshold 判 synergistic→α=0.5、否則 conflicting→α=0）。CLI：`--rtp-cos-threshold`、`--rtp-probe-steps`。
 
-- **為什麼**：目前已知道 full DER++ 在共享規則長流最強，但在真衝突/短流有害；ReplayEWC/Pressure 比較安全但拿不到 full DER++ 的長流增益。局部訊號（gradient cosine、logit drift、label-loss pressure、單純 task count）都不夠。需要一個更上層的 policy 判斷「這條 stream 是否值得 proactive consolidation」。
-- **做法候選**：
-  - **雙軌 shadow probe**：主模型用 ReplayEWC；低成本 shadow 指標估計「若開 DER++，replay loss/old accuracy 是否改善且 current-task diagonal 是否不受傷」。可先不維護完整第二模型，只在 replay batch 上計算反事實 gradient/短步 lookahead。
-  - **regime scorecard online 化**：維護最近窗口的 old-task label loss、current-task learning slope、replay/current gradient conflict、stored-logit reliability、任務數/horizon；用簡單規則輸出 `distill_mode ∈ {off, pressure, full}`。
-  - **先用 oracle validation 做上界**：離線掃描每個任務區段應開/關 DER++ 的 schedule，確認「可學 schedule」真的存在，再做線上 detector。
-- **驗收**：在三個設定同時測：
+**3-seed 驗收結果（推翻初版 1-seed「成功」）**：
+- 130-task label_permuted：RTP **0.818 ± 0.042**，未達 ≥0.87 目標、略低於 ReplayEWC **0.832**，遠不及 full DER++ **0.893**。
+- 40-task conflicting：RTP 0.487（f/J 0.646）≈ ReplayEWC 0.486（0.644），達標但只因退回 ReplayEWC。
+- 20/80-task label_permuted：RTP 0.865 / 0.816 ≈ ReplayEWC 0.873 / 0.818，達標但只因退回 ReplayEWC。
+- 診斷：RTP `alpha_mean≈0.011`（全程僅 ~2% task 判 synergistic）= 幾乎永遠關閉 DER++。threshold 掃描：-0.05→0.818、-0.2→0.810、**-1.0（強制永遠開）→0.898≈DER++**。
+
+**結論**：機制完好，**task-onset 權重梯度餘弦不是有效的 regime 訊號**（多頭標籤排列把不同反傳誤差旋進共享層，污染梯度方向，使共享規則長流與真衝突都被判 conflicting）。P2.6 目標未達成，退回 backlog 成 P2.7。結果檔：`results_rtp_*.json`。
+
+### P2.7 — function-space / horizon regime detector（接續 P2.6 未竟目標）
+**要做的事情**：讓系統判斷目前 stream 是「共享規則長流（該開 DER++）」還是「真衝突/短流（該用 ReplayEWC）」，但**不要再用 task-onset 權重梯度餘弦**（P2.6 已證實無效），也不要再用 logit drift / label-loss（P2.3/P2.5 已證實是 reactive、假警報多）。
+
+- **為什麼**：full DER++ 在共享規則長流最強（130-task 0.893）但在真衝突/短流有害；ReplayEWC 安全但拿不到長流增益。需要一個能在線上、用**函數空間後果**判斷「開 DER++ 是否真的有益」的訊號。
+- **做法候選（依 P2.6 教訓更新）**：
+  - **反事實 replay-accuracy probe（首選）**：週期性做小型反事實量測——在一小批 replay 上比較「開 DER++ 蒸餾 vs 不開」對**舊任務 replay accuracy** 的影響，以及對**當前任務 diagonal** 的傷害。若舊任務有改善且新任務不受傷→開；否則→關。這是 function-space 後果量測，繞過 P2.6 的權重方向污染。
+  - **oracle validation 先做上界**：離線掃描「每段任務該開/關 DER++」的 schedule，確認存在「可學 schedule」能同時逼近 130-task DER++ 與 40-task ReplayEWC，再做線上 detector。若 oracle 都做不到，代表單一可切換 α 不夠，需要更細的 per-layer / per-task 蒸餾。
+  - **horizon 訊號**：估計剩餘 stream 長度 / 任務重複度；長流才值得 proactive consolidation。
+- **驗收**（同 P2.6，未變）：
   - label_permuted 130-task：接近 full DER++（目標 ≥0.87）。
   - conflicting 40-task：接近 ReplayEWC（目標 final/Joint 不低於 ReplayEWC 2%）。
   - label_permuted 20/80-task：不能明顯低於 ReplayEWC。
@@ -111,9 +124,9 @@
   - 對照原始 buffer 的 DER++/ReplayEWC。
 - **驗收**：在 label_permuted 130-task 與 P2 conflicting-task 上，buffer-free 版本 retention 能不能接近原始 DER++。
 
-## 3. 建議順序與理由（P1 已完成）
+## 3. 建議順序與理由（P1/P2/P2.5 已完成；P2.6 做完但結論為負面）
 
-1. **P3（task-free）** — 下一個最高價值：目前機制均依賴 `on_task_end`（算 Fisher、更新 adapter/GPM 基、Class-IL 切片）。需要將 Fisher 對角線更新改為每步 running estimate 指數衰減，並移除對明確任務邊界的依賴。
+1. **P2.7（function-space / horizon regime detector）或 P3（task-free）二選一** — P2.7 接續 P2.6 未竟目標（自動切換 DER++），但 P2.6 已證實這條路不好走、要改用反事實 replay-accuracy probe，風險較高；建議**先用 oracle validation 確認可學 schedule 存在**再投入。若想要更穩的進展，可先做 **P3（task-free）**：目前機制均依賴 `on_task_end`（算 Fisher、更新 adapter/GPM 基、Class-IL 切片），需要將 Fisher 對角線更新改為每步 running estimate 指數衰減，並移除對明確任務邊界的依賴。
 2. **P4（buffer-free / generative replay）** — 最後拿掉 raw replay buffer，改為在隱藏特徵空間中重播特徵（Feature Replay）或為每個類別維護 Gaussian 分布做 Pseudo-Rehearsal。
 
 ## 4. 慣例
