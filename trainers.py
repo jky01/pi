@@ -1691,7 +1691,7 @@ class BenefitDarkReplayEWCTrainer(DarkReplayEWCTrainer):
                  distill_ramp_tasks: int = 0, benefit_probe_interval: int = 100,
                  benefit_ema_decay: float = 0.9, benefit_threshold: float = 0.0,
                  benefit_alpha_lr: float = 1.0, benefit_harm_weight: float = 1.0,
-                 benefit_logit_weight: float = 0.25, benefit_min_old: int = 4):
+                 benefit_logit_weight: float = 0.0, benefit_min_old: int = 4):
         super().__init__(
             model,
             lr=lr,
