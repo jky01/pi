@@ -1,5 +1,29 @@
 # 用 pi 數位序列驗證持續學習演算法：實驗報告
 
+## 0. 主要結果摘要（TL;DR）
+
+純 numpy 手刻的 80→64→64→10 MLP，在 pi 數位構造的 Permuted-Pi-Digits 長串流上測 15 種持續學習機制。三個分階段的主要結論：
+
+**(A) 兩種任務流、兩種瓶頸**（80 tasks，final average accuracy，3 seeds）
+
+| 設置 | 最佳法 | 最佳 final | 離線上界 (Joint) | 瓶頸性質 |
+| :--- | :--- | :---: | :---: | :--- |
+| `label_permuted`（多頭 Task-IL） | HippocampalReplayEWC | **86.6%** | **99.3%** | 遺忘（還有 ~13% 空間） |
+| `input_permuted`（單頭 Domain-IL） | — | 12% | **12%** | 結構性：單一共享輸入層無法反排列 80 個輸入 |
+
+**(B) 輸入轉接器把 input_permuted 從「不可能」變成「可解」**（§7）
+
+`input_permuted` 連離線上界都只有 12% → 證明不是遺忘問題。給每個 task 一個 identity 初始化的輸入 adapter 後：Naive 12%→20%（恢復可學性）、**ReplayEWC 12%→54.7%**、上界 12%→81.1%。所有 replay/記憶路徑都已接好 adapter。
+
+**(C) 可永續學習：瓶頸是遺忘、不是可塑性流失**（§9，壓力測到 250 tasks）
+
+- 只要有 replay，對角線（可塑性）一路上升不崩潰（0.72→0.90 @250 tasks）→ 可塑性根本不綁定。
+- `SustainableReplayEWC`（Fisher 保護回收）修好了 ReplayContinualBP 的記憶損傷，但在有 replay 時換不到準確率。
+- `BennaFusi`（複雜突觸，冪律遺忘）驗證有效（forget 0.23→0.03），但被 Fisher-selective EWC 支配；其棲位在 **replay-free**：80-task 下把 Naive 29%→53%、逼近 EWC 58% 且不存樣本、不算 Fisher。
+- **設計準則**：能存樣本就用 replay(+EWC)；不能存樣本才換複雜突觸；可塑性注入只在完全沒有 replay 時才有意義。
+
+---
+
 ## 1. 目的
 
 延續設計的持續學習（continual learning, CL）測試框架（accuracy matrix + 對角線可塑性探針 + BWT 遺忘指標），用 pi 的十進位小數位構造一個決定性、可重現、近乎不重複的長串流資料來源，實測九種主表演算法在 80 個依序到來的 task 上的表現：Naive（無防護下界）、EWC、Experience Replay、ReplayEWC、SurpriseReplayEWC、HippocampalReplayEWC、TaskBalancedReplay、Continual Backprop、ReplayContinualBP。
@@ -34,7 +58,7 @@
 
 ## 3. 模型與演算法
 
-兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含十一個 trainer，其中九個已納入兩個模式的 80-task 完整表格；`DarkReplayEWC` 與 `MarginSurpriseReplayEWC` 是文獻啟發的實驗方法，暫不列入主表。
+兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含十二個 trainer（含 §7 新增的 Joint 離線上界），其中九個已納入兩個模式的 80-task 完整表格；`DarkReplayEWC` 與 `MarginSurpriseReplayEWC` 是文獻啟發的實驗方法，暫不列入主表。
 
 - **Naive**：純線上 SGD，無任何保護機制，作為下界基準。
 - **EWC**：以 Fisher 資訊對角線錨定舊參數的二次懲罰項。方案 A 中二次懲罰主要應用於共享隱藏層參數。
@@ -139,7 +163,51 @@
 
 ---
 
-## 7. 本次改進：更接近「持續學習」的實驗閉環
+## 7. 上界基準線與輸入轉接器（本輪新增）
+
+先前只有下界（Naive）與強參考（Replay/EWC），缺一條真正的上界，導致「86.6% 算好還是不好」沒有定義。本輪補上離線多任務上界 **Joint**，並針對 `input_permuted` 一直破不了的瓶頸做了一個結構性介入：**per-task input adapter（輸入轉接器）**。
+
+### 7.1 Joint 離線上界：重新定義天花板
+
+`JointTrainer` 儲存所有看過的樣本，每步從「目前為止所有 task 的聯集」均勻抽 mini-batch 做 i.i.d. 更新，等於拿掉持續學習的循序限制。它蓄意打破計算/記憶體預算公平性，只當天花板基準，且因為它不是循序學習者，**只有 `final_avg_acc` 有意義，其 BWT/對角線是假象**（會出現 BWT 為正、retention > 1 等數值）。
+
+| 設置 | Joint final average accuracy（3 seeds） |
+| :--- | :---: |
+| `label_permuted`（多頭） | **99.3% ± 0.2%** |
+| `input_permuted`（單頭，無 adapter） | **12.1% ± 0.2%** |
+
+兩個結果都很關鍵：
+
+1. **label_permuted 的真天花板是 99.3%，不是先前對角線暗示的 ~93%。** 目前最佳的 HippocampalReplayEWC（86.6%）其實還離上界有 **~13%** 的空間，先前「已接近極限」的判斷是錯的——是缺了上界才看不出來。
+2. **input_permuted 的 12% 不是遺忘造成的。** 連「看過全部資料、完全不受遺忘限制」的離線上界都只有 12%（≈ 隨機猜測），證明這個瓶頸是**結構性、資訊理論層級**的：單一共享的第一層 `W1` 在數學上無法同時把 80 個不同的輸入排列 `P_t` 對應回同一個 `sum→bucket` 函數。這條過去被當成「持續學習失敗」的曲線，其實根本不是持續學習問題。
+
+### 7.2 輸入轉接器：把「不可能」變成「一般的持續學習問題」
+
+針對上述結構瓶頸，我們給每個 task 一個 identity 初始化的 `in_dim × in_dim` 線性轉接器 `A_t`，在進 `W1` 之前先做 `X @ A_t`。`A_t` 學會把該 task 的排列輸入轉回共享網路的正則空間，於是 `W1/W2/W3` 只需學一份共享的 `sum→bucket` 計算。轉接器是 task-specific 的（像輸出頭一樣），**不受 EWC 正則**。梯度以數值微分驗證為精確（float64 下相對誤差 ~1e-9）。
+
+| 設置（`input_permuted`，80 tasks，3 seeds） | final average accuracy | BWT | mean forgetting | diag（early→late） |
+| :--- | :---: | :---: | :---: | :---: |
+| Naive（無 adapter） | 12.3% | -30.4% | 0.30 | — |
+| Joint（無 adapter，上界） | 12.1% | — | — | — |
+| **Naive + adapter** | **19.7% ± 4.0%** | -46.4% | 0.48 | 0.60→0.64 |
+| SurpriseReplayEWC + adapter | **48.4% ± 0.8%** | -21.4% | 0.27 | 0.71→0.67 |
+| HippocampalReplayEWC + adapter | **49.8% ± 0.7%** | -21.6% | 0.26 | 0.75→0.67 |
+| **ReplayEWC + adapter** | **54.7% ± 1.2%** | -14.8% | 0.22 | 0.66→0.69 |
+| **Joint + adapter（上界）** | **81.1% ± 0.5%** | — | — | — |
+
+![input_permuted：輸入轉接器打破結構性下限（final average accuracy，越高越好）](fig4_input_permuted_adapter_ladder.png)
+
+三個重點：
+
+1. **轉接器恢復了「可學性」，但沒解決遺忘。** 加上轉接器後，Naive 的對角線可塑性立刻回到 0.60（無 adapter 時 diag_first 只有 ~0.23），代表每個 task 變得學得動了；但 Naive 仍災難性遺忘（BWT -46%），final 只有 19.7%。也就是說，**轉接器把 input_permuted 從「結構上不可學（連 Joint 都只有 12%）」轉換成「一般的穩定性–可塑性問題（可學、但會忘）」**——而後者正是 replay/EWC 擅長的場景。
+
+2. **接好 adapter 的 replay 把 12% 抬到 55%。** 為了讓 replay 在 adapter 下正確運作，我們把所有重播/記憶讀取路徑改成依 task 分組、各自套用對應 adapter（單頭共享輸出頭、但每個 task 走自己的 adapter）。修好之後 **ReplayEWC + adapter 達到 54.7%**，BWT 從 Naive 的 -46% 改善到 -15%，回收了轉接器打開的 19.7% → 81.1% 空間的一半以上。
+
+3. **方法排名翻轉。** 在 `label_permuted`：Hippocampal > Surprise > ReplayEWC；在 `input_permuted + adapter`：**ReplayEWC > Hippocampal > Surprise**。在這個 regime，surprise-prioritized sampling 與 episodic memory 反而拖後腿（遺忘 0.27 vs ReplayEWC 0.22）——很可能是因為轉接器還在學的過程中，「surprise」會過度偏向 adapter 尚未收斂的樣本，而 episodic prototype 所在的特徵空間也還在漂移。在這裡**樸素的 replay+EWC 反而最穩健**。剩下 55% → 81% 的差距主要是遺忘（diag_last ~0.69，可塑性沒問題），下一步的槓桿是更大的 buffer / 更強的 shared-layer EWC，而不是更花俏的取樣。
+
+---
+
+## 8. 本次改進：更接近「持續學習」的實驗閉環
 
 這版程式把「持續學習效果」拆成三個可觀察面向，而不是只看單一 final accuracy：
 
@@ -165,12 +233,62 @@
 
 `analyze.py` 也改成會自動偵測結果檔裡的方法清單，並在沒有 matplotlib 的 Python 環境中仍可輸出 `summary_stats_*.json`，只跳過圖表產生。
 
-## 8. 結論
+## 9. 可永續學習探針：可塑性流失 vs 遺忘，哪個才是長串流的瓶頸？
+
+「可永續學習」要求模型在無上限的串流上同時不遺忘（失效 A）且不流失可塑性（失效 B）。為了找出本 benchmark 真正的瓶頸，我們把串流拉長並新增一個直接針對 §6.1 開放問題的方法。
+
+### 9.1 新方法：`SustainableReplayEWC`（Fisher 保護的神經元回收）
+
+§6.1 指出 ReplayContinualBP 的問題：神經元盲目重置會覆寫舊任務權重（48% < 純 Replay 60%）。`SustainableReplayEWC` 在 ReplayEWC 上加可塑性維護，但讓回收「對舊任務記憶有感」：(1) 只回收同時低效用且 **Fisher 重要度低**（對舊任務不關鍵）的成熟單元；(2) 被回收的單元連同其 EWC anchor/Fisher 一併清掉，避免正則項把新權重拉回死亡值。
+
+### 9.2 長串流結果：可塑性在有 replay 時根本不綁定
+
+| 130 tasks × 4000 steps（label_permuted，2 seeds） | final | retention | dead_h2 e→l | effrank_h1 e→l |
+| :--- | :---: | :---: | :---: | :---: |
+| ReplayEWC | **0.815** | **0.921** | 0.12→0.42 | 45.6→32.3 |
+| ReplayContinualBP | 0.460 | 0.538 | 0.00→0.01 | 47.3→29.0 |
+| **SustainableReplayEWC** | 0.706 | 0.804 | 0.02→**0.00** | 45.7→**35.3** |
+
+把串流再拉到 **250 tasks × 2000 steps**，ReplayEWC 的對角線（可塑性）不但沒崩，反而**單調上升**：50-task 分箱為 `0.72 → 0.82 → 0.83 → 0.86 → 0.90`，即使它的 dead_h2 一路爬到 0.48。SustainableReplayEWC 把 dead_h2 壓在 ~0、effective rank 全場最高，對角線軌跡卻幾乎與 ReplayEWC 重合（0.73→0.87），final 反而較低（0.587 vs 0.680）且方差更大。`input_permuted + adapter` 也是同一個型態：對角線整段持平在 ~0.70，dead_h2 升到 0.38，但學習本身不受影響。
+
+### 9.3 結論：瓶頸是遺忘，不是可塑性流失
+
+三個關鍵推論：
+
+1. **只要有 replay，多頭網路在 250 個任務內都不會可塑性崩潰**——對角線持續上升，dead-unit 比例升高並不轉化成學不動。亦即 dead-unit / effective rank 這些微觀徵兆在「有 replay」時不是學習的綁定限制。
+2. **`SustainableReplayEWC` 完成了它的設計目標、但解了一個本 regime 不存在的問題。** 它是唯一同時做到 retention > 0.8、dead-unit ≈ 0、effective rank 最高的方法，也確實修好了 ReplayContinualBP 的記憶損傷（0.71/0.80 vs 0.46/0.54，證明 Fisher 保護有效）；但因為 ReplayEWC 本來就沒有可塑性瓶頸，回收買到的可塑性餘裕**換不到任何準確率**，反而引入擾動。
+3. **本 benchmark 真正的可永續瓶頸是遺忘**：對角線（剛學完 ~0.70–0.90）與 final（~0.55–0.82）之間的差距全是遺忘。下一步提升「可永續性」的正確槓桿是壓低殘餘遺忘（更大/更聰明的記憶、更強的 shared-layer 保護、power-law 遺忘的 Benna-Fusi 複雜突觸、generative replay），而不是再加可塑性機制。可塑性注入要見效，得換到 **沒有 replay** 或 replay 嚴重不足的 regime。
+
+### 9.4 Benna-Fusi 複雜突觸：冪律遺忘有效，但 isotropic consolidation 不敵 Fisher-selective EWC
+
+依 §9.3 的指引，我們實作 Benna & Fusi (2016) 的複雜突觸（`BennaFusi` / `BennaFusiReplay`）：把每個共享權重換成一條 N 級、時間尺度幾何遞增的耦合變數鏈，梯度只打進最快的可見變數，鬆弛步驟把值往慢變數擴散；慢變數的共識會把可見權重往回拉，給出**冪律（而非指數）遺忘**，且完全不儲存樣本、不算 Fisher。
+
+機制如預期：純 `BennaFusi` 把 20-task 的 mean forgetting 從 Naive 的 0.226 壓到 0.026、retention 從 0.67 拉到 >1.0，weight norm 受封閉鏈約束而穩定。`bf_dt` 是穩定↔可塑的旋鈕（越大越穩、越不可塑）。
+
+但兩個對照給出清楚的定位：
+
+| 80 tasks label_permuted（replay-free，mean of 2 seeds） | final | forget | retention |
+| :--- | :---: | :---: | :---: |
+| Naive | 0.291 | 0.342 | 0.470 |
+| ContinualBP | 0.311 | 0.395 | 0.448 |
+| **BennaFusi (dt=0.05)** | **0.533** | **0.122** | **0.884** |
+| EWC | 0.577 | 0.212 | 0.777 |
+
+1. **有 replay 時，Benna-Fusi 被 ReplayEWC 完全支配。** 40-task 下 `BennaFusiReplay`（無 EWC）即使把耦合調到極弱（dt=0.001），對角線仍只有 0.73（ReplayEWC 0.87），final 0.75 < 0.82。原因有原理性：EWC 是 **Fisher 選擇性**懲罰（只擋對舊任務重要的方向），Benna-Fusi 是 **各向同性**地拖住所有權重，於是用同樣的遺忘保護付出更多可塑性代價——在 replay 已覆蓋舊資料時，選擇性方法勝出。
+2. **Benna-Fusi 的真正棲位是 replay-free / Fisher-free 線上鞏固。** 上表中它把 Naive 的 0.291 幾乎翻倍到 0.533、逼近 EWC 的 0.577，而且 forgetting（0.122）比 EWC（0.212）更低、retention 更高——關鍵是它**完全線上、不需要任何 per-task Fisher 計算、不存任何樣本**。這正是對話 §8 所說「多時間尺度突觸當記憶基質」的低成本實例。
+
+結論：Benna-Fusi 驗證了冪律遺忘確實有效，但在本 benchmark「有 replay」的主線上，Fisher-selective EWC 是更有效率的權重穩定機制；Benna-Fusi 的價值在**無法存樣本、也不想算 Fisher 的純線上場景**。
+
+## 10. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
 3.  **機制互補性**：ContinualBP 強於可塑性維護，EWC 與 Replay 強於舊記憶維持。ReplayEWC 顯示樣本級 replay 與 shared-weight EWC 可以互補；ReplayContinualBP 則提醒我們，神經元重置若沒有更細緻的保護機制，仍可能傷害長期記憶。
-4.  **腦啟發機制的邊界**：海馬迴式 episodic memory 對 Task-IL 有幫助，但必須 gated；固定比例記憶混合或過度 sleep consolidation 會在長流中傷害表現。對 `input_permuted`，HippocampalReplayEWC 仍停在約 10.6%，表示單靠記憶召回無法解決 domain-IL 的共享表示問題，下一步應更偏向 learned router / adapter / modularity。
+4.  **腦啟發機制的邊界**：海馬迴式 episodic memory 對 Task-IL 有幫助，但必須 gated；固定比例記憶混合或過度 sleep consolidation 會在長流中傷害表現。
+5.  **上界基準改寫了結論**：補上 Joint 離線上界後才看清，`label_permuted` 的真天花板是 99.3%（最佳法 86.6% 還有 ~13% 空間），而 `input_permuted` 連上界都只有 12%——後者根本不是遺忘問題，是單一共享輸入層的結構性矛盾。
+6.  **轉接器把 input_permuted 從不可能變成可解**：給每個 task 一個輸入轉接器後，瓶頸從「結構不可學」轉成「一般的穩定性–可塑性問題」；接好 adapter 的 ReplayEWC 把 final average accuracy 從 12% 抬到 54.7%（上界 81.1%）。值得注意的是此 regime 下 **ReplayEWC 反而勝過 Surprise/Hippocampal**，與 `label_permuted` 的排名相反——說明前沿機制的優劣會隨任務結構翻轉，沒有單一全勝的方法。下一步是更大 buffer / 更強 shared-layer 保護來收掉剩下的 55%→81% 遺忘缺口，以及把 adapter 推向 learned router / modularity。
+7.  **可永續學習的瓶頸是遺忘、不是可塑性流失（§9）**：把串流拉到 250 個任務，有 replay 的方法對角線不降反升，可塑性根本不綁定；專門維護可塑性的 `SustainableReplayEWC` 雖然完成設計目標（dead-unit≈0、effective rank 最高、且修好了 ReplayContinualBP 的記憶損傷），卻換不到準確率，因為這個 regime 本來就不缺可塑性。要再提升「可永續性」應主攻遺忘（更強記憶/正則、Benna-Fusi、generative replay）；可塑性注入要見效得換到無 replay 的 regime。
+8.  **Benna-Fusi 複雜突觸：冪律遺忘有效，但棲位在 replay-free（§9.4）**：純 `BennaFusi` 把遺忘從 0.23 壓到 0.03，驗證冪律記憶有效；但它各向同性地拖住所有權重，在有 replay 時被 Fisher-selective 的 ReplayEWC 完全支配。它的真正價值是 replay-free / Fisher-free 的線上鞏固——80-task 下把 Naive 的 29% 翻倍到 53%、逼近 EWC 的 58% 且遺忘更低，且完全不存樣本、不算 Fisher。這把「該用哪種穩定機制」收斂成一條清楚的設計準則：能存樣本就用 replay(+EWC)，不能存樣本才換複雜突觸。
 
 ---
 
@@ -178,10 +296,14 @@
 
 - `pi_digits.py`：產生/快取 pi 小數位序列。
 - `benchmark.py`：Permuted-Pi-Digits 串流（支持多頭 `label_permuted` 和單頭 `input_permuted`）。
-- `model.py`：支持多頭選擇與可塑性診斷的 numpy MLP 實現。
-- `trainers.py`：適配多輸出頭、樣本重播分組、ReplayEWC、DarkReplayEWC、SurpriseReplayEWC、HippocampalReplayEWC、MarginSurpriseReplayEWC、task-balanced replay 與神經元重置的十一種 CL Trainer。
-- `run.py` / `run_one_combo.py`：主實驗腳本（支持命令行參數選擇模式、方法、seed、任務數與輸出路徑）。
-- `analyze.py`：彙整多 seed 實驗結果，輸出 JSON 與畫圖；缺 matplotlib 時仍會輸出 summary JSON。
-- `results_label_permuted.json` / `results_input_permuted.json`：實驗原始數據。
+- `model.py`：支持多頭選擇、per-task 輸入轉接器（`input_adapter`）與可塑性診斷的 numpy MLP 實現。
+- `trainers.py`：15 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
+- `run.py` / `run_one_combo.py`：主實驗腳本（命令行選模式、方法、seed、任務數；`--input-adapter` 開啟輸入轉接器，`--joint-batch/--joint-steps` 控制上界）。
+- `analyze.py`：彙整多 seed 實驗結果，輸出 JSON 與畫圖；缺 matplotlib 時用 Pillow 輸出圖表並產生 summary JSON。
+- `results_label_permuted.json` / `results_input_permuted.json`：9 種主方法的原始數據。
+- `results_joint_*.json`：Joint 離線上界。`results_naiveadapter_*.json` / `results_jointadapter_*.json` / `results_adapter_replay_*.json`：輸入轉接器系列實驗。
+- `results_longstream_*.json`（130 tasks）/ `results_verylong_*.json`（250 tasks）/ `results_longstream_sustainable.json`：§9 可永續學習長串流探針數據。
+- `results_bennafusi_dt0*_label_permuted.json`：§9.4 Benna-Fusi 複雜突觸 replay-free 定位實驗。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
-- `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：性能對比與診斷圖表。
+- `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
+- `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

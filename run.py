@@ -63,6 +63,9 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
     model_kwargs = dict(model_kwargs)
     model_kwargs["multi_head"] = (mode == "label_permuted")
     model_kwargs["n_tasks"] = stream_kwargs.get("n_tasks", 80)
+    # input_adapter is opt-in (only meaningful for the single-head input_permuted mode):
+    # gives each task a learnable input transform so a shared net can serve all permutations.
+    model_kwargs["input_adapter"] = model_kwargs.get("input_adapter", False)
     
     stream = PermutedPiDigitsStream(digits, seed=seed, **stream_kwargs)
     n_tasks = stream.n_tasks
@@ -202,6 +205,19 @@ def main():
                         help="Override ContinualBP maturity threshold.")
     parser.add_argument("--cbp-util-decay", type=float, default=None,
                         help="Override ContinualBP utility EMA decay.")
+    parser.add_argument("--input-adapter", action="store_true",
+                        help="Give each task a learnable input adapter (single-head input_permuted only). "
+                             "Lets a shared net serve all input permutations; breaks the ~11%% floor.")
+    parser.add_argument("--joint-batch", type=int, default=None,
+                        help="Joint upper-bound mini-batch size sampled from all seen tasks.")
+    parser.add_argument("--joint-steps", type=int, default=None,
+                        help="Joint upper-bound i.i.d. update steps per incoming batch.")
+    parser.add_argument("--bf-levels", type=int, default=None,
+                        help="Benna-Fusi synapse chain length (number of timescales).")
+    parser.add_argument("--bf-g0", type=float, default=None,
+                        help="Benna-Fusi base conductance (coupling strength of the fastest variable).")
+    parser.add_argument("--bf-dt", type=float, default=None,
+                        help="Benna-Fusi relaxation step size: stability<->plasticity knob (higher = more stable).")
     parser.add_argument("--output", default=None,
                         help="Output JSON path. Defaults to results_<mode>.json in the project folder.")
     args = parser.parse_args()
@@ -257,13 +273,23 @@ def main():
         trainer_kwargs["maturity_threshold"] = args.cbp_maturity_threshold
     if args.cbp_util_decay is not None:
         trainer_kwargs["util_decay"] = args.cbp_util_decay
+    if args.joint_batch is not None:
+        trainer_kwargs["joint_batch"] = args.joint_batch
+    if args.joint_steps is not None:
+        trainer_kwargs["joint_steps"] = args.joint_steps
+    if args.bf_levels is not None:
+        trainer_kwargs["bf_levels"] = args.bf_levels
+    if args.bf_g0 is not None:
+        trainer_kwargs["bf_g0"] = args.bf_g0
+    if args.bf_dt is not None:
+        trainer_kwargs["bf_dt"] = args.bf_dt
 
     stream_kwargs_template = dict(
         digits_file="pi_digits_600000.txt",
         K=K, n_tasks=n_tasks, steps_per_task=steps_per_task, test_per_task=test_per_task,
         mode=mode,
     )
-    model_kwargs = dict(in_dim=10 * K, h1=64, h2=64, out_dim=10)
+    model_kwargs = dict(in_dim=10 * K, h1=64, h2=64, out_dim=10, input_adapter=args.input_adapter)
 
     all_results = {}
     t_start = time.time()

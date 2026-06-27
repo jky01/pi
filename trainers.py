@@ -209,9 +209,41 @@ class ReplayTrainer:
                     self.model.sgd_step(t_grads, self.lr * 0.5, task_idx=t)
             return grads
 
+        if self.model.input_adapter:
+            return self._mix_replay_grads_adapter(grads, rX, rY, rtasks, task_idx)
+
         rcache = self.model.forward(rX)
         rgrads = self.model.backward(rcache, rY)
         return {k: 0.5 * grads[k] + 0.5 * rgrads[k] for k in grads}
+
+    def _mix_replay_grads_adapter(self, grads, rX, rY, rtasks, task_idx):
+        """Single-head + per-task input adapter: shared head (W3/b3) is shared across
+        tasks, but each task's samples must go through its own adapter. Group replayed
+        samples by task, accumulate shared grads, and update each replayed task's adapter."""
+        shared_keys = ["W1", "b1", "W2", "b2", "W3", "b3"]
+        rgrads_accum = {k: np.zeros_like(grads[k]) for k in shared_keys}
+        adapter_grads = {}
+        for t in sorted(set(rtasks)):
+            sub_idx = [i for i, val in enumerate(rtasks) if val == t]
+            sub_cache = self.model.forward(rX[sub_idx], t)
+            sub_grads = self.model.backward(sub_cache, rY[sub_idx], t)
+            weight = len(sub_idx) / len(rtasks)
+            for k in shared_keys:
+                rgrads_accum[k] += weight * sub_grads[k]
+            if "A" in sub_grads:
+                adapter_grads[t] = weight * sub_grads["A"]
+
+        mixed = {k: 0.5 * grads[k] + 0.5 * rgrads_accum[k] for k in shared_keys}
+        # current task's adapter: carried in returned grads, applied by the outer sgd_step
+        if "A" in grads:
+            mixed["A"] = 0.5 * grads["A"]
+            if task_idx in adapter_grads:
+                mixed["A"] += 0.5 * adapter_grads[task_idx]
+        # replayed (non-current) tasks' adapters: applied here
+        for t, gA in adapter_grads.items():
+            if t != task_idx:
+                self.model.adapters[t] -= self.lr * 0.5 * gA
+        return mixed
 
     def train_step(self, X, Y, task_idx: int = None):
         loss, acc = self.model.loss_acc(X, Y, task_idx)
@@ -523,6 +555,32 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
                     self.model.sgd_step(t_grads, self.lr * replay_weight, task_idx=t)
             return grads
 
+        if self.model.input_adapter:
+            shared_keys = ["W1", "b1", "W2", "b2", "W3", "b3"]
+            rgrads_accum = {k: np.zeros_like(grads[k]) for k in shared_keys}
+            adapter_grads = {}
+            for t in sorted(set(rtasks)):
+                sub_idx = [i for i, val in enumerate(rtasks) if val == t]
+                sub_cache = self.model.forward(rX[sub_idx], t)
+                ce_grads = self.model.backward(sub_cache, rY[sub_idx], t)
+                dark_grads = self._dark_grads(sub_cache, rlogits[sub_idx], t)
+                sub_grads = self._add_grads(ce_grads, dark_grads, self.dark_alpha)
+                weight = len(sub_idx) / len(rtasks)
+                for k in shared_keys:
+                    rgrads_accum[k] += weight * sub_grads[k]
+                if "A" in sub_grads:
+                    adapter_grads[t] = weight * sub_grads["A"]
+
+            mixed = {k: current_weight * grads[k] + replay_weight * rgrads_accum[k] for k in shared_keys}
+            if "A" in grads:
+                mixed["A"] = current_weight * grads["A"]
+                if task_idx in adapter_grads:
+                    mixed["A"] += replay_weight * adapter_grads[task_idx]
+            for t, gA in adapter_grads.items():
+                if t != task_idx:
+                    self.model.adapters[t] -= self.lr * replay_weight * gA
+            return mixed
+
         rcache = self.model.forward(rX)
         ce_grads = self.model.backward(rcache, rY)
         dark_grads = self._dark_grads(rcache, rlogits, None)
@@ -582,7 +640,7 @@ class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
         losses = np.zeros(n_candidates, dtype=np.float64)
         margins = np.zeros(n_candidates, dtype=np.float64)
 
-        if self.model.multi_head:
+        if self.model.multi_head or self.model.input_adapter:
             for t in sorted(set(ctasks)):
                 sub_pos = np.array([i for i, val in enumerate(ctasks) if val == t], dtype=np.int64)
                 cache = self.model.forward(cX[sub_pos], t)
@@ -719,7 +777,10 @@ class HippocampalReplayEWCTrainer(SurpriseReplayEWCTrainer):
     def _memory_indices(self, task_idx):
         if len(self.buf_X) == 0:
             return []
-        use_context = self.model.multi_head or self.memory_task_filter
+        # With an input adapter, each task's features live in the shared space only after
+        # passing through that task's adapter, so memory must be task-filtered (queried by
+        # same-task inputs) for the prototype comparison to be in a consistent space.
+        use_context = self.model.multi_head or self.memory_task_filter or self.model.input_adapter
         if not use_context:
             return list(range(len(self.buf_X)))
         if task_idx is None:
@@ -727,7 +788,7 @@ class HippocampalReplayEWCTrainer(SurpriseReplayEWCTrainer):
         return [i for i, t in enumerate(self.buf_task) if t == task_idx]
 
     def _feature_cache(self, X, task_idx):
-        if self.model.multi_head:
+        if self.model.multi_head or self.model.input_adapter:
             return self.model.forward(X, task_idx)["a2"]
         return self.model.forward(X)["a2"]
 
@@ -774,7 +835,8 @@ class HippocampalReplayEWCTrainer(SurpriseReplayEWCTrainer):
         return e / e.sum(axis=1, keepdims=True)
 
     def loss_acc(self, X, Y, task_idx: int = None):
-        cache = self.model.forward(X, task_idx if self.model.multi_head else None)
+        needs_ctx = self.model.multi_head or self.model.input_adapter
+        cache = self.model.forward(X, task_idx if needs_ctx else None)
         probs = cache["probs"].astype(np.float64)
         mem_probs = self._episodic_probs(X, task_idx, probs.shape[1])
         if mem_probs is not None and self.memory_alpha > 0:
@@ -830,6 +892,24 @@ class HippocampalReplayEWCTrainer(SurpriseReplayEWCTrainer):
             for t, grads in head_grads.items():
                 self.model.heads_W[t] -= lr * grads["W3"]
                 self.model.heads_b[t] -= lr * grads["b3"]
+            return
+
+        if self.model.input_adapter:
+            shared = {k: np.zeros_like(getattr(self.model, k))
+                      for k in ["W1", "b1", "W2", "b2", "W3", "b3"]}
+            for t in sorted(set(rtasks)):
+                sub_idx = [i for i, val in enumerate(rtasks) if val == t]
+                cache = self.model.forward(rX[sub_idx], t)
+                grads = self.model.backward(cache, rY[sub_idx], t)
+                weight = len(sub_idx) / len(rtasks)
+                for k in shared:
+                    shared[k] += weight * grads[k]
+                if "A" in grads:
+                    self.model.adapters[t] -= lr * weight * grads["A"]
+            ewc = self._ewc_grad(None)
+            for k in shared:
+                p = getattr(self.model, k)
+                p -= lr * (shared[k] + ewc.get(k, 0.0))
             return
 
         cache = self.model.forward(rX)
@@ -1004,8 +1084,270 @@ class ReplayContinualBackpropTrainer(TaskBalancedReplayTrainer):
         return loss, acc
 
 
+class JointTrainer:
+    """離線多任務上界（offline / cumulative joint）。
+
+    儲存所有看過的樣本（無上限 buffer），每一步從「目前為止所有 task 的聯集」均勻抽
+    mini-batch 做 i.i.d. 更新，等於拿掉持續學習的循序限制。這是判斷其他方法好壞的天花板：
+    它的 final average accuracy 就是「同一個網路在沒有遺忘限制下能到多高」。
+
+    注意：這蓄意打破計算/記憶體預算公平性（它能重看所有舊資料），所以只當上界基準，
+    不列入與其他方法的同預算比較。多頭與 input-adapter 都支援：抽到的混合 batch 會依
+    task 分組，各自走對應的 head / adapter。
+    """
+    name = "Joint"
+
+    def __init__(self, model: MLP, lr: float = 0.05, joint_batch: int = 64,
+                 joint_steps: int = 2, seed: int = 0):
+        self.model = model
+        self.lr = lr
+        self.joint_batch = max(1, int(joint_batch))
+        self.joint_steps = max(1, int(joint_steps))
+        self.rng = np.random.RandomState(seed)
+        self.buf_X = []
+        self.buf_Y = []
+        self.buf_task = []
+
+    def _insert(self, X, Y, task_idx):
+        t = 0 if task_idx is None else int(task_idx)
+        for i in range(X.shape[0]):
+            self.buf_X.append(X[i].copy())
+            self.buf_Y.append(int(Y[i]))
+            self.buf_task.append(t)
+
+    def _sample(self):
+        n = min(self.joint_batch, len(self.buf_X))
+        idx = self.rng.randint(0, len(self.buf_X), size=n)
+        bX = np.stack([self.buf_X[i] for i in idx])
+        bY = np.array([self.buf_Y[i] for i in idx], dtype=np.int64)
+        bt = [self.buf_task[i] for i in idx]
+        return bX, bY, bt
+
+    def _joint_update(self, bX, bY, btasks):
+        m = self.model
+        n = len(bY)
+        shared_keys = ["W1", "b1", "W2", "b2"]
+        if not m.multi_head:
+            shared_keys += ["W3", "b3"]
+
+        shared = None
+        per_task = []  # (task, head/adapter grads)
+        for t in sorted(set(int(v) for v in btasks)):
+            sub_idx = [i for i, val in enumerate(btasks) if int(val) == t]
+            cache = m.forward(bX[sub_idx], t)
+            g = m.backward(cache, bY[sub_idx], t)
+            weight = len(sub_idx) / n
+            if shared is None:
+                shared = {k: np.zeros_like(g[k]) for k in shared_keys}
+            for k in shared_keys:
+                shared[k] += weight * g[k]
+            extra = {}
+            if m.multi_head:
+                extra["W3"] = weight * g["W3"]
+                extra["b3"] = weight * g["b3"]
+            if m.input_adapter and "A" in g:
+                extra["A"] = g["A"]
+            per_task.append((t, extra))
+
+        for k in shared_keys:
+            p = getattr(m, k)
+            p -= self.lr * shared[k]
+        for t, extra in per_task:
+            if "W3" in extra:
+                m.heads_W[t] -= self.lr * extra["W3"]
+                m.heads_b[t] -= self.lr * extra["b3"]
+            if "A" in extra:
+                m.adapters[t] -= self.lr * extra["A"]
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = self.model.loss_acc(X, Y, task_idx)
+        self._insert(X, Y, task_idx)
+        for _ in range(self.joint_steps):
+            self._joint_update(*self._sample())
+        return loss, acc
+
+    def on_task_end(self, task_X, task_Y, task_idx: int = None):
+        pass
+
+
+class SustainableReplayEWCTrainer(ReplayEWCTrainer):
+    """可永續學習：ReplayEWC（穩定性）+ Fisher 保護的神經元回收（可塑性）。
+
+    動機：continual backprop 能維持可塑性，但它的「盲目重置」會覆寫舊任務權重——
+    這正是 ReplayContinualBP 表現反而比純 Replay 差的原因（48% vs 60%）。本方法的修正是
+    讓神經元回收「對舊任務記憶有感」：
+
+    1. 只回收同時「低效用」且「對舊任務不重要（Fisher importance 低）」的成熟單元。
+       Fisher 是 EWC 跨任務累積的重要度，高 Fisher 的單元即使現在看似休眠，也可能對舊任務
+       關鍵，因此被保護、不重置。
+    2. 被回收的單元，連同它在 EWC 的 anchor/Fisher 一併清掉，否則正則項會把新初始化的權重
+       又拉回舊的死亡值，回收等於白做。
+
+    目標：在長串流上同時壓住遺忘（失效 A）與可塑性流失（失效 B）。
+    """
+    name = "SustainableReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, replacement_rate: float = 1e-4,
+                 maturity_threshold: int = 100, util_decay: float = 0.99,
+                 fisher_protect_quantile: float = 0.5):
+        super().__init__(model, lr=lr, capacity=capacity, replay_batch=replay_batch,
+                         seed=seed, lam=lam, fisher_batches=fisher_batches,
+                         fisher_decay=fisher_decay, grad_clip_norm=grad_clip_norm)
+        self.replacement_rate = replacement_rate
+        self.maturity_threshold = maturity_threshold
+        self.util_decay = util_decay
+        self.fisher_protect_quantile = float(np.clip(fisher_protect_quantile, 0.0, 1.0))
+
+        h1, h2 = model.dims[1], model.dims[2]
+        self.age = {"h1": np.zeros(h1, dtype=np.int64), "h2": np.zeros(h2, dtype=np.int64)}
+        self.util = {"h1": np.zeros(h1, dtype=np.float64), "h2": np.zeros(h2, dtype=np.float64)}
+        self.replace_accum = {"h1": 0.0, "h2": 0.0}
+
+    def _update_utility(self, layer_key, activations, outgoing_W):
+        contrib = np.abs(activations).mean(axis=0) * np.abs(outgoing_W).sum(axis=1)
+        self.util[layer_key] *= self.util_decay
+        self.util[layer_key] += (1 - self.util_decay) * contrib
+        self.age[layer_key] += 1
+
+    def _fisher_importance(self, layer_key):
+        """每個隱藏單元對舊任務的重要度，取自 EWC 累積的 Fisher（越高越該保護）。"""
+        if layer_key == "h1":
+            return self.fisher["W1"].sum(axis=0) + self.fisher["W2"].sum(axis=1)
+        imp = self.fisher["W2"].sum(axis=0)
+        if "W3" in self.fisher:  # single-head: outgoing weights are EWC-tracked
+            imp = imp + self.fisher["W3"].sum(axis=1)
+        return imp
+
+    def _clear_ewc_for_unit(self, layer_key, idx):
+        """回收後把該單元的 EWC anchor/Fisher 清掉（重新初始化＝全新單元，不該被舊錨拉回）。"""
+        m = self.model
+        if layer_key == "h1":
+            self.fisher["W1"][:, idx] = 0.0; self.anchor["W1"][:, idx] = m.W1[:, idx]
+            self.fisher["b1"][idx] = 0.0;    self.anchor["b1"][idx] = m.b1[idx]
+            self.fisher["W2"][idx, :] = 0.0; self.anchor["W2"][idx, :] = m.W2[idx, :]
+        else:
+            self.fisher["W2"][:, idx] = 0.0; self.anchor["W2"][:, idx] = m.W2[:, idx]
+            self.fisher["b2"][idx] = 0.0;    self.anchor["b2"][idx] = m.b2[idx]
+            if "W3" in self.fisher:
+                self.fisher["W3"][idx, :] = 0.0; self.anchor["W3"][idx, :] = m.W3[idx, :]
+
+    def _maybe_replace(self, layer_key, incoming_W, incoming_b, outgoing_W):
+        n_units = len(self.util[layer_key])
+        self.replace_accum[layer_key] += self.replacement_rate * n_units
+        n_replace = int(self.replace_accum[layer_key])
+        if n_replace < 1:
+            return
+        self.replace_accum[layer_key] -= n_replace
+
+        mature = self.age[layer_key] >= self.maturity_threshold
+        if not np.any(mature):
+            return
+        imp = self._fisher_importance(layer_key)
+        # 保護舊任務關鍵單元：只有 Fisher 重要度落在低分位以下的成熟單元才符合回收資格。
+        thresh = np.quantile(imp, self.fisher_protect_quantile)
+        eligible = np.where(mature & (imp <= thresh))[0]
+        if len(eligible) == 0:
+            return
+        n_replace = min(n_replace, len(eligible))
+        order = eligible[np.argsort(self.util[layer_key][eligible])]
+        to_reset = order[:n_replace]
+
+        fan_in = incoming_W.shape[0]
+        std = np.sqrt(2.0 / fan_in)
+        for idx in to_reset:
+            incoming_W[:, idx] = self.rng.randn(fan_in) * std
+            incoming_b[idx] = 0.0
+            if self.model.multi_head and layer_key == "h2":
+                for h_w in self.model.heads_W:
+                    h_w[idx, :] = 0.0
+            else:
+                outgoing_W[idx, :] = 0.0
+            self.util[layer_key][idx] = 0.0
+            self.age[layer_key][idx] = 0
+            self._clear_ewc_for_unit(layer_key, idx)
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = super().train_step(X, Y, task_idx)
+        m = self.model
+        cache = m.forward(X, task_idx)
+        outgoing_W3 = m.heads_W[task_idx] if m.multi_head else m.W3
+        self._update_utility("h1", cache["a1"], m.W2)
+        self._update_utility("h2", cache["a2"], outgoing_W3)
+        self._maybe_replace("h1", m.W1, m.b1, m.W2)
+        self._maybe_replace("h2", m.W2, m.b2, outgoing_W3)
+        return loss, acc
+
+
+def _benna_fusi_init(model, keys, levels, g0):
+    """每個權重一條 N 級鏈：capacity C_k=2^k（容量幾何遞增）、conductance g_k=g0·2^-k
+    （管徑幾何遞減）。隱藏變數 u_2..u_N 以目前可見權重初始化（加入瞬間鏈一致、不擾動函數）。"""
+    C = np.array([2.0 ** i for i in range(levels)], dtype=np.float64)
+    g = np.array([g0 * 2.0 ** (-i) for i in range(levels)], dtype=np.float64)
+    hidden = {k: [getattr(model, k).astype(np.float64) for _ in range(levels - 1)] for k in keys}
+    return C, g, hidden
+
+
+def _benna_fusi_relax(model, keys, hidden, C, g, dt, levels):
+    """一步擴散鬆弛（封閉鏈，無洩漏到 ground，保總量守恆）：可見變數 u_1 被往鏈的
+    慢速共識拉，抗快速覆寫＝較慢漂移＝較少遺忘；深層慢變數承載鞏固後的歷史。"""
+    for k in keys:
+        chain = [getattr(model, k)] + hidden[k]          # u_1 (可見) .. u_N
+        new = []
+        for i in range(levels):
+            inflow = g[i - 1] * (chain[i - 1] - chain[i]) if i > 0 else 0.0
+            outflow = g[i] * (chain[i] - chain[i + 1]) if i + 1 < levels else 0.0
+            new.append(chain[i] + dt * (inflow - outflow) / C[i])
+        getattr(model, k)[...] = new[0]
+        for j in range(levels - 1):
+            hidden[k][j] = new[j + 1]
+
+
+class BennaFusiTrainer(NaiveTrainer):
+    """Benna-Fusi 複雜突觸（Benna & Fusi 2016）：把每個共享權重換成一串耦合、不同時間尺度的
+    內部變數，記憶先進快變數再逐步轉移到慢變數，給出冪律（而非指數）遺忘——記憶壽命大幅延長，
+    且完全不儲存任何過去樣本。這裡是純機制版（線上 SGD + 複雜突觸），對照 Naive 看遺忘是否下降。"""
+    name = "BennaFusi"
+
+    def __init__(self, model: MLP, lr: float = 0.05, bf_levels: int = 5,
+                 bf_g0: float = 1.0, bf_dt: float = 0.1):
+        super().__init__(model, lr=lr)
+        self.bf_levels = max(2, int(bf_levels))
+        self.bf_dt = float(bf_dt)
+        self.bf_keys = ["W1", "b1", "W2", "b2"] + ([] if model.multi_head else ["W3", "b3"])
+        self.bf_C, self.bf_g, self.bf_hidden = _benna_fusi_init(model, self.bf_keys, self.bf_levels, bf_g0)
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = super().train_step(X, Y, task_idx)
+        _benna_fusi_relax(self.model, self.bf_keys, self.bf_hidden, self.bf_C, self.bf_g, self.bf_dt, self.bf_levels)
+        return loss, acc
+
+
+class BennaFusiReplayTrainer(ReplayTrainer):
+    """Experience Replay + Benna-Fusi 複雜突觸（無 EWC）。複雜突觸取代 EWC 當「權重穩定」機制，
+    測試冪律遺忘能否補足、甚至替代 shared-weight 正則：對照 ReplayEWC 看是否打平/超越。"""
+    name = "BennaFusiReplay"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, bf_levels: int = 5,
+                 bf_g0: float = 1.0, bf_dt: float = 0.1):
+        super().__init__(model, lr=lr, capacity=capacity, replay_batch=replay_batch, seed=seed)
+        self.bf_levels = max(2, int(bf_levels))
+        self.bf_dt = float(bf_dt)
+        self.bf_keys = ["W1", "b1", "W2", "b2"] + ([] if model.multi_head else ["W3", "b3"])
+        self.bf_C, self.bf_g, self.bf_hidden = _benna_fusi_init(model, self.bf_keys, self.bf_levels, bf_g0)
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = super().train_step(X, Y, task_idx)
+        _benna_fusi_relax(self.model, self.bf_keys, self.bf_hidden, self.bf_C, self.bf_g, self.bf_dt, self.bf_levels)
+        return loss, acc
+
+
 TRAINER_REGISTRY = {
     "Naive": NaiveTrainer,
+    "Joint": JointTrainer,
     "EWC": EWCTrainer,
     "Replay": ReplayTrainer,
     "ReplayEWC": ReplayEWCTrainer,
@@ -1016,4 +1358,7 @@ TRAINER_REGISTRY = {
     "TaskBalancedReplay": TaskBalancedReplayTrainer,
     "ContinualBP": ContinualBackpropTrainer,
     "ReplayContinualBP": ReplayContinualBackpropTrainer,
+    "SustainableReplayEWC": SustainableReplayEWCTrainer,
+    "BennaFusi": BennaFusiTrainer,
+    "BennaFusiReplay": BennaFusiReplayTrainer,
 }

@@ -44,7 +44,8 @@ def dead_unit_fraction(activations: np.ndarray) -> float:
 class MLP:
     """2 個隱藏層的 MLP：in_dim -> h1 -> h2 -> out_dim，ReLU + softmax + cross entropy。"""
 
-    def __init__(self, in_dim: int, h1: int, h2: int, out_dim: int, seed: int = 0, multi_head: bool = False, n_tasks: int = 80):
+    def __init__(self, in_dim: int, h1: int, h2: int, out_dim: int, seed: int = 0, multi_head: bool = False,
+                 n_tasks: int = 80, input_adapter: bool = False):
         rng = np.random.RandomState(seed)
         self.dims = (in_dim, h1, h2, out_dim)
         self.W1 = self._he_init(rng, in_dim, h1)
@@ -62,6 +63,14 @@ class MLP:
             self.b3 = np.zeros(out_dim, dtype=np.float32)
             self.heads_W = None
             self.heads_b = None
+        # 每個 task 一個輸入端線性 adapter（in_dim x in_dim），identity 初始化（加入瞬間函數保持）。
+        # 用於 input_permuted：adapter 學會把該 task 的輸入排列轉回共享網路的正則空間，
+        # 讓 W1/W2/W3 只需學一份共享的 sum->bucket 計算。
+        self.input_adapter = input_adapter
+        if input_adapter:
+            self.adapters = [np.eye(in_dim, dtype=np.float32) for _ in range(n_tasks)]
+        else:
+            self.adapters = None
         self.rng = rng
 
     @staticmethod
@@ -82,7 +91,11 @@ class MLP:
             return [self.W1, self.b1, self.W2, self.b2, self.W3, self.b3]
 
     def forward(self, X: np.ndarray, task_idx: int = None) -> dict:
-        z1 = X @ self.W1 + self.b1
+        if self.input_adapter and task_idx is not None:
+            X_in = X @ self.adapters[task_idx]
+        else:
+            X_in = X
+        z1 = X_in @ self.W1 + self.b1
         a1 = relu(z1)
         z2 = a1 @ self.W2 + self.b2
         a2 = relu(z2)
@@ -96,7 +109,7 @@ class MLP:
             b3 = self.b3
         logits = a2 @ W3 + b3
         probs = softmax(logits)
-        return dict(X=X, z1=z1, a1=a1, z2=z2, a2=a2, logits=logits, probs=probs)
+        return dict(X=X, X_in=X_in, z1=z1, a1=a1, z2=z2, a2=a2, logits=logits, probs=probs)
 
     def loss_acc(self, X: np.ndarray, Y: np.ndarray, task_idx: int = None) -> tuple:
         cache = self.forward(X, task_idx)
@@ -131,11 +144,16 @@ class MLP:
 
         da1 = dz2 @ W2.T
         dz1 = da1 * (cache["z1"] > 0)
-        X = cache["X"]
-        gW1 = X.T @ dz1
+        X_in = cache["X_in"]
+        gW1 = X_in.T @ dz1
         gb1 = dz1.sum(axis=0)
 
-        return dict(W1=gW1, b1=gb1, W2=gW2, b2=gb2, W3=gW3, b3=gb3)
+        grads = dict(W1=gW1, b1=gb1, W2=gW2, b2=gb2, W3=gW3, b3=gb3)
+        if self.input_adapter and task_idx is not None:
+            # X_in = X @ A_t  =>  dA_t = X^T @ (dz1 @ W1^T)
+            dX_in = dz1 @ self.W1.T
+            grads["A"] = cache["X"].T @ dX_in
+        return grads
 
     def backward(self, cache: dict, Y: np.ndarray, task_idx: int = None) -> dict:
         """回傳每個參數的 cross-entropy 梯度（mean over batch）。"""
@@ -159,6 +177,8 @@ class MLP:
         else:
             self.W3 -= lr * grads["W3"]
             self.b3 -= lr * grads["b3"]
+        if self.input_adapter and task_idx is not None and "A" in grads:
+            self.adapters[task_idx] -= lr * grads["A"]
 
     def weight_norm(self) -> float:
         return float(sum(np.linalg.norm(p) for p in self.params()))
