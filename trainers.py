@@ -1059,6 +1059,56 @@ class ScholarGenerativeReplayEWCTrainer(GenerativeReplayEWCTrainer):
             self.scholar_max_task = task_idx
 
 
+class ScholarGlobalGenerativeReplayEWCTrainer(ScholarGenerativeReplayEWCTrainer):
+    """P6: scholar generative replay with an on-manifold input generator.
+
+    P5's scholar sampled synthetic inputs from each class's per-position marginals
+    — a skewed, atypical distribution that is *off* the data manifold, so the
+    teacher's logits there are unreliable (capping plasticity). But pi's digits are
+    ~iid uniform, so the true input distribution is genuinely factorized: sampling
+    each position from the *global* (class-agnostic) per-task marginal reproduces
+    the real digit-window distribution (on-manifold), and the scholar supplies the
+    label. This decouples input generation (now correct) from labeling (the
+    teacher), so it is fully rule-agnostic and stays close to the true manifold.
+    """
+    name = "ScholarGlobalGenerativeReplayEWC"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gen_global = {}    # task -> (in_dim,) class-agnostic one-hot counts
+        self.gen_global_n = {}  # task -> total count
+
+    def _reservoir_insert(self, X, Y, task_idx=None):
+        super()._reservoir_insert(X, Y, task_idx)  # keep per-class stats too (unused here)
+        if task_idx not in self.gen_global:
+            self.gen_global[task_idx] = np.zeros(self.in_dim, dtype=np.float64)
+            self.gen_global_n[task_idx] = 0
+        self.gen_global[task_idx] += X.sum(axis=0)
+        self.gen_global_n[task_idx] += X.shape[0]
+
+    def _generate_global(self, task, m):
+        counts = self.gen_global[task].reshape(self.K, self.alphabet) + self.gen_smoothing
+        probs = counts / counts.sum(axis=1, keepdims=True)
+        return self._sample_digits(probs, m)[0]
+
+    def _sample_replay(self):
+        tasks = [t for t in self.gen_global if self.gen_global_n[t] > 0]
+        if not tasks:
+            return None
+        counts = np.array([self.gen_global_n[t] for t in tasks], dtype=np.float64)
+        probs = counts / counts.sum()
+        idx = self.rng.choice(len(tasks), size=self.replay_batch, p=probs)
+        rX_list, rtasks = [], []
+        for ti in np.unique(idx):
+            t = tasks[int(ti)]
+            m = int(np.sum(idx == ti))
+            rX_list.append(self._generate_global(t, m))
+            rtasks.extend([t] * m)
+        rX = np.concatenate(rX_list, axis=0)
+        rY = np.zeros(len(rtasks), dtype=np.int64)  # unused; the scholar provides labels
+        return rX, rY, rtasks
+
+
 class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
     """DarkReplayEWC with gradient-conflict gated logit distillation.
 
@@ -2460,6 +2510,7 @@ TRAINER_REGISTRY = {
     "GenerativeReplayEWC": GenerativeReplayEWCTrainer,
     "NBGenerativeReplayEWC": NBGenerativeReplayEWCTrainer,
     "ScholarGenerativeReplayEWC": ScholarGenerativeReplayEWCTrainer,
+    "ScholarGlobalGenerativeReplayEWC": ScholarGlobalGenerativeReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "HippocampalReplayEWC": HippocampalReplayEWCTrainer,

@@ -28,6 +28,7 @@
 - **Task-free 的代價趨近於零（§13，P3）**：把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計後，80-task 下 ReplayEWC 0.818→0.826、DER++ 0.868→0.855（在 std 內）。核心配方（replay + Fisher-EWC + DER++）天生接近 task-free；邊界在此 regime 可有可無。
 - **Buffer-free 生成式回放長流反超 raw replay（§14，P4）**：`GenerativeReplayEWC` 不存原始樣本，label_permuted 80-task **0.916** 勝過 raw ReplayEWC 0.818 / DER++ 0.868（固定 buffer 在長流被稀釋、生成統計量不衰減）；但須條件在定義標籤的統計量上（sum-matched ablation 0.470→0.753），conflicting 多變規則下保真度不足（0.431<0.486）。
 - **rule-agnostic 生成回放：scholar teacher 補上 conflicting（§15，P5）**：NB 自分類器失敗（太弱，label 退步到 0.521）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher 對合成輸入蒸餾）conflicting 0.474（final/Joint 差 raw 僅 1.6%）、遺忘最低 0.082。沒有單一 buffer-free 生成器全勝（簡單統計量→sum-match；複雜規則→scholar）；殘留缺口源自因子化輸入保真度。
+- **on-manifold 輸入生成器假設被推翻（§16，P6，負面）**：全域 per-task 邊際抽 on-manifold 輸入 + scholar，3-seed 全面更差（conflicting 0.428、label 0.769），瓶頸是可塑性。per-class 集中回放 > 全域覆蓋；殘留小差距是真實樣本的不可取代價值（正向後向遷移），非輸入失配。整個 P4–P6：不存原始樣本可行且常足夠（長流甚至贏 raw），但完全追平 raw 仍有一道由真實樣本聯合結構撐起的小硬牆。
 - **正向遷移**：表徵層有（晚段任務最終準確率更高），學習速度沒有（§10.3）。
 
 ## 2. Backlog（依優先序；每項含 為什麼 / 做法 / 驗收）
@@ -43,10 +44,11 @@
 - **P3 — Task-free (無邊界) CL（已完成，§13）**：新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`，把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計（從 reservoir buffer 取樣）。80-task × 3 seeds：失去邊界知識的代價趨近於零（EWC +0.008、DER++ −0.012 在 std 內），無邊界 DER++ 仍勝過有邊界 ReplayEWC。
 - **P4 — Buffer-free / generative replay（已完成，§14）**：新增 `GenerativeReplayEWC`（完全不存原始樣本，per-(task,class) categorical 生成模型 + sum-matched conditional generation）。label_permuted 80-task buffer-free **0.916 反超** raw ReplayEWC 0.818 與 DER++ 0.868（長流 buffer 被稀釋、生成統計量不衰減）；conflicting 0.431 < raw 0.486（sum-matched 條件統計量對非 sum 規則不符）。
 - **P5 — rule-agnostic 生成回放（已完成，§15）**：試兩條路。`NBGenerativeReplayEWC`（從儲存 categorical 自建 NB 分類器 rejection）**失敗**（conflicting 0.418、label 退步到 0.521）。`ScholarGenerativeReplayEWC`（每任務凍結 teacher、對合成輸入 soft-logit 蒸餾，generative DER++）**成功補上 conflicting 缺口**：0.474（final/Joint 0.628 vs raw 0.644，差 1.6%≤2%）、遺忘最低 0.082；label_permuted ≈ raw（0.809）但不及 sum-match 峰值 0.916。沒有單一 buffer-free 生成器全勝；殘留缺口源自因子化輸入保真度 → P6。
+- **P6 — 更強的輸入生成器（已完成，§16，負面結果）**：`ScholarGlobalGenerativeReplayEWC`（全域 per-task 邊際抽 on-manifold 輸入 + scholar 標註）**推翻 P5 的 on-manifold 歸因**——3-seed 全面更差（conflicting 0.428 < scholar-class 0.474；label 0.769 < 0.809），儘管 forgetting 最低（0.052），瓶頸是可塑性（diag 0.54→0.45）。per-class 集中回放比全域覆蓋更重要；殘留小差距更像真實樣本不可取代的價值（精確 per-class 聯合結構→正向後向遷移），非輸入分布失配。
 
 **下一個要做 / Todo**
-- **P6 — 更強的輸入生成器（接續 P5）**：P5 確認 sum-match 與 scholar 的殘留缺口都源自因子化 categorical 的**輸入保真度**（獨立逐位置→離流形），不是標註。下一步用能抓住位置間相關的生成器（autoregressive over positions / 小 RBM / 特徵空間 Gaussian + decoder），看能否讓 scholar 在 conflicting 完全追平 raw、且在 label_permuted 拿回 sum-match 峰值。
 - **P2.7 — function-space / horizon regime 偵測器（接續 P2.6 的未竟目標）**：見下方 backlog。task-onset 權重梯度餘弦已證實無效，改用反事實 replay-accuracy 量測或 horizon 訊號。
+- **（可選）P6b — per-class autoregressive 生成器**：P6 證明「全域 on-manifold」方向錯；唯一還沒試的是 per-class **autoregressive**（抓類內位置相關）能否把 scholar-class 從 0.474 再推近 raw 0.486。但邊際空間極小（僅差 1.6% final/Joint），優先序低。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
 **結果**：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 Class-IL final 0.31→**0.858**、遺忘 0.50→**0.06**、retention>1.0（3 seeds, std 0.003）。診斷正確：病灶是線性頭的 recency/magnitude bias，換成無偏原型讀出即解。候選清單裡的 cosine/BiC/class-balanced replay 尚未試（NCM 已夠強，這些可作為進一步小幅優化或在更大規模時備用）。
@@ -149,15 +151,21 @@
 
 **結論**：沒有單一 buffer-free 生成器全勝——已知簡單統計量用 sum-match（甚至贏 raw），規則複雜/未知用 scholar（一份常數快照換 rule-agnostic 標註）。NB 證實「從儲存統計量自建分類器」太弱。殘留缺口（conflicting 仍差 raw 一點、scholar 拿不到 label 峰值）都源自因子化輸入保真度 → P6。
 
-### P6 — 更強的輸入生成器（接續 P5 未竟）
-- **為什麼**：P5 已把「標註」解掉（scholar），剩下的瓶頸是因子化 categorical 的**輸入保真度**——獨立逐位置抽樣產生離流形的合成輸入，teacher 在其上的 logits 也跟著失真，limits plasticity（scholar diag 偏低）並讓 conflicting 仍差 raw 一截。
-- **做法候選**：(a) autoregressive over positions（用前面位置條件後面位置，抓相關）；(b) 小型 RBM / 每類別混合模型；(c) 特徵空間 Gaussian + 反解，或直接在隱藏特徵空間做 replay（但要解 shared-layer staleness）。
-- **驗收**：scholar/sum-match 在 conflicting 完全追平 raw ReplayEWC，且 label_permuted 拿回 sum-match 峰值。
+### ✅/❌ P6 — 更強的輸入生成器（已完成，§16，結論為負面）
+**做完的事情**：實作 `ScholarGlobalGenerativeReplayEWC`——驗證 P5 的「輸入保真度（離流形）」歸因。觀察 pi 數位 ~iid uniform→真實輸入分布本就因子化，P5 從**每類別**邊際抽樣才是偏斜離流形；改從**全域 per-task 邊際**抽樣（≈ 真實 uniform＝on-manifold）+ scholar 標註。
 
-## 3. 建議順序與理由（P1/P2/P2.5/P3/P4/P5 已完成；P2.6 做完但結論為負面）
+**結果（3 seeds）推翻 on-manifold 假設**：
+- conflicting 40-task：scholar-global **0.428 ± 0.011** < scholar-class 0.474 < raw 0.486，forget 最低 0.052。
+- label_permuted 80-task：scholar-global **0.769 ± 0.027** < scholar-class 0.809 < sum-match 0.916。
+- 瓶頸是**可塑性**（diag 0.54→0.45）：全域均勻蒸餾過度正則共享層、稀釋類界訊號。**per-class 集中回放 > 全域 on-manifold 覆蓋。**
+- 結果檔：`results_p6_scholar_global_{conflicting_40,label_permuted}.json`。
 
-1. **P6（更強的輸入生成器）** — 直接接續 P5：標註已被 scholar 解掉，剩輸入保真度。用 autoregressive / 混合模型抓位置間相關，看能否完全追平 raw 並拿回 sum-match 峰值。
-2. **P2.7（function-space / horizon regime detector）** — 接續 P2.6 未竟目標（自動切換 DER++），但 P2.6 已證實 task-onset 權重梯度餘弦無效，要改用反事實 replay-accuracy probe，風險較高；建議**先用 oracle validation 確認可學 schedule 存在**再投入。
+**結論**：殘留缺口不是 on-manifold 與否的問題。scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw conflicting 有 +BWT、合成回放沒有）。P4–P6 總結：不存原始樣本可行且常足夠（長流甚至贏 raw），完全追平 raw 仍有一道由真實樣本聯合結構撐起的小硬牆。唯一未試：per-class autoregressive（見上方 Todo P6b，優先序低）。
+
+## 3. 建議順序與理由（P1/P2/P2.5/P3/P4/P5/P6 已完成；P2.6 做完但結論為負面）
+
+1. **P2.7（function-space / horizon regime detector）** — 接續 P2.6 未竟目標（自動切換 DER++），但 P2.6 已證實 task-onset 權重梯度餘弦無效，要改用反事實 replay-accuracy probe，風險較高；建議**先用 oracle validation 確認可學 schedule 存在**再投入。這是目前 backlog 中最有開放價值的題目。
+2. **（可選）P6b（per-class autoregressive 生成器）** — 邊際空間極小（scholar-class 距 raw 僅 1.6%），優先序低。
 
 ## 4. 慣例
 
