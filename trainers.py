@@ -24,6 +24,8 @@
     train_step(X, Y) -> (loss, acc)   在這個 batch 上更新一次參數，回傳更新前的 loss/acc
     on_task_end(task_X, task_Y)       task 訓練段結束時呼叫的 hook（EWC 用來算 Fisher）
 """
+import copy
+
 import numpy as np
 
 from model import MLP
@@ -888,6 +890,173 @@ class GenerativeReplayEWCTrainer(ReplayEWCTrainer):
         rX = np.concatenate(rX_list, axis=0)
         rY = np.array(rY, dtype=np.int64)
         return rX, rY, rtasks
+
+
+class NBGenerativeReplayEWCTrainer(GenerativeReplayEWCTrainer):
+    """Rule-agnostic buffer-free generative replay (P5).
+
+    P4's ``GenerativeReplayEWC`` conditions synthetic windows on the total
+    digit-sum — the right label-defining statistic only for the default ``sum``
+    rule. Under ``conflicting`` mode each task uses a different rule
+    (weighted/half-window/adjacent-product), so matching the total sum is the
+    wrong statistic and fidelity drops.
+
+    Here we instead accept a synthetic window only if a naive-Bayes classifier
+    built from the *stored per-class categoricals of the same task* assigns it to
+    the target class. Because NB weighs each position by how class-discriminative
+    its stored marginal is, rejection automatically concentrates on whichever
+    positions actually define this task's rule — with no model in the loop (so no
+    staleness/confirmation bias). One generator works rule-agnostically for both
+    ``label_permuted`` and ``conflicting``.
+    """
+    name = "NBGenerativeReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, gen_smoothing: float = 0.1,
+                 gen_sum_tol: float = 1.0, nb_margin: float = 0.0):
+        super().__init__(model, lr=lr, capacity=capacity, replay_batch=replay_batch,
+                         seed=seed, lam=lam, fisher_batches=fisher_batches,
+                         fisher_decay=fisher_decay, grad_clip_norm=grad_clip_norm,
+                         gen_smoothing=gen_smoothing, gen_sum_match=False,
+                         gen_sum_tol=gen_sum_tol)
+        self.nb_margin = float(nb_margin)
+
+    def _task_logtables(self, task):
+        # log P(digit | task, class) per position, for every class seen in this task.
+        tables = {}
+        for (tt, c) in self.gen_keys:
+            if tt == task:
+                counts = self.gen_sum[(tt, c)].reshape(self.K, self.alphabet) + self.gen_smoothing
+                tables[c] = np.log(counts / counts.sum(axis=1, keepdims=True))
+        return tables
+
+    def _generate(self, key, m):
+        task, target = key
+        counts = self.gen_sum[key].reshape(self.K, self.alphabet) + self.gen_smoothing
+        probs = counts / counts.sum(axis=1, keepdims=True)
+        tables = self._task_logtables(task)
+        if len(tables) < 2:
+            return self._sample_digits(probs, m)[0]
+        classes = sorted(tables.keys())
+        logt = np.stack([tables[c] for c in classes])  # (C, K, alphabet)
+        tgt_i = classes.index(target)
+        pos = np.arange(self.K)
+        kept = []
+        for _ in range(8):  # bounded rejection sampling
+            cand, _ = self._sample_digits(probs, max(m, 4 * m))
+            digits = cand.reshape(-1, self.K, self.alphabet).argmax(axis=2)  # (n, K)
+            # NB log-scores per class: sum_p logt[c, p, digit_p]
+            scores = np.stack([logt[ci][pos, digits].sum(axis=1)
+                               for ci in range(len(classes))], axis=1)  # (n, C)
+            tgt_score = scores[:, tgt_i].copy()
+            scores[:, tgt_i] = -np.inf
+            ok = (tgt_score - scores.max(axis=1)) >= self.nb_margin
+            if ok.any():
+                kept.append(cand[ok])
+                if sum(len(a) for a in kept) >= m:
+                    break
+        if not kept:
+            return self._sample_digits(probs, m)[0]  # fall back if accept region empty
+        pool = np.concatenate(kept, axis=0)
+        if pool.shape[0] < m:
+            pool = np.concatenate([pool, self._sample_digits(probs, m - pool.shape[0])[0]], axis=0)
+        return pool[:m]
+
+
+class ScholarGenerativeReplayEWCTrainer(GenerativeReplayEWCTrainer):
+    """Rule-agnostic buffer-free generative replay via a scholar/teacher (P5).
+
+    Deep-generative-replay style. At each task boundary we snapshot the model as a
+    frozen *scholar*. During later tasks we draw synthetic inputs from the
+    per-class categorical generator (unconditional — the realized hard label may be
+    wrong) and train the current model to match the *scholar's soft logits* on
+    those inputs (generative DER++/distillation). The scholar encodes every past
+    task's actual input->class rule, including nonlinear interaction rules, so it
+    labels synthetic inputs correctly where a hand-picked statistic (P4 sum-match)
+    or a factorized naive-Bayes classifier (NBGenerativeReplayEWC) cannot. Cost:
+    one constant-size model snapshot; still no raw samples retained.
+    """
+    name = "ScholarGenerativeReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, gen_smoothing: float = 0.1,
+                 dark_alpha: float = 0.5, replay_weight: float = 0.5):
+        # The scholar provides labels, so the generator need not condition on a
+        # hand-picked statistic — generate unconditionally (gen_sum_match=False).
+        super().__init__(model, lr=lr, capacity=capacity, replay_batch=replay_batch,
+                         seed=seed, lam=lam, fisher_batches=fisher_batches,
+                         fisher_decay=fisher_decay, grad_clip_norm=grad_clip_norm,
+                         gen_smoothing=gen_smoothing, gen_sum_match=False)
+        self.dark_alpha = float(dark_alpha)
+        self.replay_weight = float(replay_weight)
+        self.scholar = None
+        self.scholar_max_task = -1  # highest task index the scholar has learned
+
+    def _distill_grads(self, cache, teacher_logits, task_idx):
+        n, out_dim = teacher_logits.shape
+        dlogits = 2.0 * (cache["logits"] - teacher_logits) / max(1, n * out_dim)
+        return self.model.backward_from_logits_grad(cache, dlogits, task_idx)
+
+    def _mix_scholar_grads(self, grads, rX, rtasks, task_idx):
+        w = self.replay_weight
+        cw = 1.0 - w
+        if self.model.multi_head:
+            shared = ["W1", "b1", "W2", "b2"]
+            accum = {k: np.zeros_like(grads[k]) for k in shared}
+            for t in sorted(set(rtasks)):
+                idx = [i for i, v in enumerate(rtasks) if v == t]
+                sx = rX[idx]
+                tlog = self.scholar.forward(sx, t)["logits"]
+                cache = self.model.forward(sx, t)
+                g = self._distill_grads(cache, tlog, t)
+                weight = (len(idx) / len(rtasks)) * self.dark_alpha
+                for k in shared:
+                    accum[k] += weight * g[k]
+                # apply the replayed task's own head update directly
+                t_grads = {
+                    "W1": np.zeros_like(self.model.W1), "b1": np.zeros_like(self.model.b1),
+                    "W2": np.zeros_like(self.model.W2), "b2": np.zeros_like(self.model.b2),
+                    "W3": weight * g["W3"], "b3": weight * g["b3"],
+                }
+                self.model.sgd_step(t_grads, self.lr * w, task_idx=t)
+            for k in shared:
+                grads[k] = cw * grads[k] + w * accum[k]
+            return grads
+        # single head (no adapter routing for synthetic inputs): distill globally
+        tlog = self.scholar.forward(rX)["logits"]
+        cache = self.model.forward(rX)
+        g = self._distill_grads(cache, tlog, None)
+        return {k: cw * grads[k] + w * self.dark_alpha * g[k] for k in grads}
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = self.model.loss_acc(X, Y, task_idx)
+        cache = self.model.forward(X, task_idx)
+        grads = self.model.backward(cache, Y, task_idx)
+
+        if self.scholar is not None:
+            sample = self._sample_replay()
+            if sample is not None:
+                rX, _, rtasks = sample
+                keep = [i for i, t in enumerate(rtasks)
+                        if t is not None and t <= self.scholar_max_task and t != task_idx]
+                if keep:
+                    grads = self._mix_scholar_grads(grads, rX[keep],
+                                                    [rtasks[i] for i in keep], task_idx)
+
+        ewc_grads = self._ewc_grad(task_idx)
+        self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
+        self._reservoir_insert(X, Y, task_idx)
+        return loss, acc
+
+    def on_task_end(self, task_X, task_Y, task_idx: int = None):
+        super().on_task_end(task_X, task_Y, task_idx)  # EWC Fisher/anchor on current data
+        self.scholar = copy.deepcopy(self.model)
+        if task_idx is not None:
+            self.scholar_max_task = task_idx
 
 
 class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
@@ -2289,6 +2458,8 @@ TRAINER_REGISTRY = {
     "OnlineEWCReplay": OnlineEWCReplayTrainer,
     "OnlineDarkReplayEWC": OnlineDarkReplayEWCTrainer,
     "GenerativeReplayEWC": GenerativeReplayEWCTrainer,
+    "NBGenerativeReplayEWC": NBGenerativeReplayEWCTrainer,
+    "ScholarGenerativeReplayEWC": ScholarGenerativeReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "HippocampalReplayEWC": HippocampalReplayEWCTrainer,

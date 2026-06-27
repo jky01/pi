@@ -27,6 +27,7 @@
 - **cos-RTP regime detector 失敗（§12.4，3-seed 驗收）**：task-onset 共享層梯度餘弦**不是**有效 regime 訊號——RTP 幾乎永遠判 conflicting、退化成 ReplayEWC，130-task 只有 **0.818**（< full DER++ 0.893）。機制完好（強制永遠開→0.898），病灶在訊號（多頭標籤排列污染共享層梯度方向）。教訓：局部/reactive/權重空間訊號（cosine、logit drift、label loss）都不足，要用 function-space 反事實量測或 horizon 訊號（→ P2.7）。
 - **Task-free 的代價趨近於零（§13，P3）**：把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計後，80-task 下 ReplayEWC 0.818→0.826、DER++ 0.868→0.855（在 std 內）。核心配方（replay + Fisher-EWC + DER++）天生接近 task-free；邊界在此 regime 可有可無。
 - **Buffer-free 生成式回放長流反超 raw replay（§14，P4）**：`GenerativeReplayEWC` 不存原始樣本，label_permuted 80-task **0.916** 勝過 raw ReplayEWC 0.818 / DER++ 0.868（固定 buffer 在長流被稀釋、生成統計量不衰減）；但須條件在定義標籤的統計量上（sum-matched ablation 0.470→0.753），conflicting 多變規則下保真度不足（0.431<0.486）。
+- **rule-agnostic 生成回放：scholar teacher 補上 conflicting（§15，P5）**：NB 自分類器失敗（太弱，label 退步到 0.521）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher 對合成輸入蒸餾）conflicting 0.474（final/Joint 差 raw 僅 1.6%）、遺忘最低 0.082。沒有單一 buffer-free 生成器全勝（簡單統計量→sum-match；複雜規則→scholar）；殘留缺口源自因子化輸入保真度。
 - **正向遷移**：表徵層有（晚段任務最終準確率更高），學習速度沒有（§10.3）。
 
 ## 2. Backlog（依優先序；每項含 為什麼 / 做法 / 驗收）
@@ -41,10 +42,11 @@
 
 - **P3 — Task-free (無邊界) CL（已完成，§13）**：新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`，把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計（從 reservoir buffer 取樣）。80-task × 3 seeds：失去邊界知識的代價趨近於零（EWC +0.008、DER++ −0.012 在 std 內），無邊界 DER++ 仍勝過有邊界 ReplayEWC。
 - **P4 — Buffer-free / generative replay（已完成，§14）**：新增 `GenerativeReplayEWC`（完全不存原始樣本，per-(task,class) categorical 生成模型 + sum-matched conditional generation）。label_permuted 80-task buffer-free **0.916 反超** raw ReplayEWC 0.818 與 DER++ 0.868（長流 buffer 被稀釋、生成統計量不衰減）；conflicting 0.431 < raw 0.486（sum-matched 條件統計量對非 sum 規則不符）。
+- **P5 — rule-agnostic 生成回放（已完成，§15）**：試兩條路。`NBGenerativeReplayEWC`（從儲存 categorical 自建 NB 分類器 rejection）**失敗**（conflicting 0.418、label 退步到 0.521）。`ScholarGenerativeReplayEWC`（每任務凍結 teacher、對合成輸入 soft-logit 蒸餾，generative DER++）**成功補上 conflicting 缺口**：0.474（final/Joint 0.628 vs raw 0.644，差 1.6%≤2%）、遺忘最低 0.082；label_permuted ≈ raw（0.809）但不及 sum-match 峰值 0.916。沒有單一 buffer-free 生成器全勝；殘留缺口源自因子化輸入保真度 → P6。
 
 **下一個要做 / Todo**
+- **P6 — 更強的輸入生成器（接續 P5）**：P5 確認 sum-match 與 scholar 的殘留缺口都源自因子化 categorical 的**輸入保真度**（獨立逐位置→離流形），不是標註。下一步用能抓住位置間相關的生成器（autoregressive over positions / 小 RBM / 特徵空間 Gaussian + decoder），看能否讓 scholar 在 conflicting 完全追平 raw、且在 label_permuted 拿回 sum-match 峰值。
 - **P2.7 — function-space / horizon regime 偵測器（接續 P2.6 的未竟目標）**：見下方 backlog。task-onset 權重梯度餘弦已證實無效，改用反事實 replay-accuracy 量測或 horizon 訊號。
-- **P5 — rule-agnostic 生成式回放（接續 P4）**：P4 的 sum-matched 只條件在總和、對 conflicting 多變規則不符。下一步讓生成模型條件在「真正定義該任務標籤的統計量」或模型自身特徵/logits，補上 conflicting 的保真度缺口。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
 **結果**：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 Class-IL final 0.31→**0.858**、遺忘 0.50→**0.06**、retention>1.0（3 seeds, std 0.003）。診斷正確：病灶是線性頭的 recency/magnitude bias，換成無偏原型讀出即解。候選清單裡的 cosine/BiC/class-balanced replay 尚未試（NCM 已夠強，這些可作為進一步小幅優化或在更大規模時備用）。
@@ -137,14 +139,24 @@
 
 **結論**：不存原始樣本可行、且在「條件統計量對得上 + 串流夠長」時甚至超越 raw replay；瓶頸是生成模型能否抓住定義標籤的統計量，而非記憶機制本身。→ 開 P5。
 
-### P5 — rule-agnostic 生成式回放（接續 P4 未竟）
-- **為什麼**：P4 的 sum-matched 條件統計量是手挑的（總和），只對預設 sum 規則對。conflicting 多變規則下保真度不足（0.431<0.486）。
-- **做法候選**：(a) 條件在模型自身的倒數第二層特徵或 logits（資料驅動，自動對齊任務規則）；(b) 每 (task,class) 存小型 Gaussian / 混合模型於特徵空間並配合 feature replay；(c) 用每任務凍結 teacher 對合成樣本做 DER++ 蒸餾（generative dark replay）。
-- **驗收**：conflicting 40-task buffer-free 逼近 raw ReplayEWC（final/Joint 差距 ≤2%），且 label_permuted 不退步。
+### ✅ P5 — rule-agnostic 生成式回放（已完成，§15）
+**做完的事情**：兩條路。
+- `NBGenerativeReplayEWC`（候選 a 的廉價版：用儲存 categorical 自建 naive-Bayes 分類器做 rejection）——**失敗**，conflicting 40-task 0.418 < sum-match 0.431，label_permuted 80-task 退步到 0.521（forget 0.256）。因子化邊際做的分類器太弱，accept region 無效。
+- `ScholarGenerativeReplayEWC`（候選 c：每任務 `on_task_end` 把模型 `copy.deepcopy` 成凍結 teacher；replay 時抽合成輸入、用 teacher soft logits 蒸餾，generative DER++，只蒸餾 `task ≤ scholar_max_task` 的舊任務）——**成功**。CLI：`--dark-alpha`、`--replay-weight`。
+  - conflicting 40-task：**0.474（final/Joint 0.628 vs raw 0.644，差 1.6%≤2%）**、forget **0.082**（最低）。
+  - label_permuted 80-task：0.809 ≈ raw 0.818，但不及 sum-match 峰值 0.916。
+- 結果檔：`results_p5_{nb,scholar}_{conflicting_40,label_permuted}.json`。
 
-## 3. 建議順序與理由（P1/P2/P2.5/P3/P4 已完成；P2.6 做完但結論為負面）
+**結論**：沒有單一 buffer-free 生成器全勝——已知簡單統計量用 sum-match（甚至贏 raw），規則複雜/未知用 scholar（一份常數快照換 rule-agnostic 標註）。NB 證實「從儲存統計量自建分類器」太弱。殘留缺口（conflicting 仍差 raw 一點、scholar 拿不到 label 峰值）都源自因子化輸入保真度 → P6。
 
-1. **P5（rule-agnostic 生成式回放）** — 直接接續 P4：把生成模型的條件從手挑統計量改成資料驅動（特徵/logits），補上 conflicting 保真度缺口。價值高且路徑清楚。
+### P6 — 更強的輸入生成器（接續 P5 未竟）
+- **為什麼**：P5 已把「標註」解掉（scholar），剩下的瓶頸是因子化 categorical 的**輸入保真度**——獨立逐位置抽樣產生離流形的合成輸入，teacher 在其上的 logits 也跟著失真，limits plasticity（scholar diag 偏低）並讓 conflicting 仍差 raw 一截。
+- **做法候選**：(a) autoregressive over positions（用前面位置條件後面位置，抓相關）；(b) 小型 RBM / 每類別混合模型；(c) 特徵空間 Gaussian + 反解，或直接在隱藏特徵空間做 replay（但要解 shared-layer staleness）。
+- **驗收**：scholar/sum-match 在 conflicting 完全追平 raw ReplayEWC，且 label_permuted 拿回 sum-match 峰值。
+
+## 3. 建議順序與理由（P1/P2/P2.5/P3/P4/P5 已完成；P2.6 做完但結論為負面）
+
+1. **P6（更強的輸入生成器）** — 直接接續 P5：標註已被 scholar 解掉，剩輸入保真度。用 autoregressive / 混合模型抓位置間相關，看能否完全追平 raw 並拿回 sum-match 峰值。
 2. **P2.7（function-space / horizon regime detector）** — 接續 P2.6 未竟目標（自動切換 DER++），但 P2.6 已證實 task-onset 權重梯度餘弦無效，要改用反事實 replay-accuracy probe，風險較高；建議**先用 oracle validation 確認可學 schedule 存在**再投入。
 
 ## 4. 慣例

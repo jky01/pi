@@ -315,6 +315,8 @@ def main():
                         help="Sum-band tolerance (in stds) for GenerativeReplayEWC conditional generation.")
     parser.add_argument("--gen-sum-match-off", action="store_true",
                         help="Disable sum-matched rejection sampling in GenerativeReplayEWC (ablation).")
+    parser.add_argument("--nb-margin", type=float, default=None,
+                        help="Naive-Bayes accept margin for NBGenerativeReplayEWC (rule-agnostic generation).")
     parser.add_argument("--output", default=None,
                         help="Output JSON path. Defaults to results_<mode>.json in the project folder.")
     args = parser.parse_args()
@@ -426,6 +428,8 @@ def main():
         trainer_kwargs["gen_sum_tol"] = args.gen_sum_tol
     if args.gen_sum_match_off:
         trainer_kwargs["gen_sum_match"] = False
+    if args.nb_margin is not None:
+        trainer_kwargs["nb_margin"] = args.nb_margin
 
     stream_kwargs_template = dict(
         digits_file="pi_digits_600000.txt",
