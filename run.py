@@ -136,6 +136,24 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
                 trainer_diagnostics[f"{out_key}_mean"] = float(np.mean(vals))
                 trainer_diagnostics[f"{out_key}_tail_mean"] = float(np.mean(vals[-tail_n:]))
 
+    dark_alpha_trace = np.array(getattr(trainer, "dark_alpha_trace", []), dtype=np.float64)
+    if len(dark_alpha_trace) > 0:
+        tail_n = min(200, len(dark_alpha_trace))
+        trainer_diagnostics["dark_effective_alpha_mean"] = float(np.mean(dark_alpha_trace))
+        trainer_diagnostics["dark_effective_alpha_tail_mean"] = float(np.mean(dark_alpha_trace[-tail_n:]))
+
+    for attr, out_key in [
+        ("pressure_weight_trace", "pressure_dark_weight"),
+        ("reliability_trace", "pressure_dark_reliability"),
+        ("loss_pressure_trace", "pressure_dark_loss_pressure"),
+        ("drift_pressure_trace", "pressure_dark_drift_pressure"),
+    ]:
+        vals = np.array(getattr(trainer, attr, []), dtype=np.float64)
+        if len(vals) > 0:
+            tail_n = min(200, len(vals))
+            trainer_diagnostics[f"{out_key}_mean"] = float(np.mean(vals))
+            trainer_diagnostics[f"{out_key}_tail_mean"] = float(np.mean(vals[-tail_n:]))
+
     return dict(
         method=method_name,
         seed=seed,
@@ -214,6 +232,18 @@ def main():
                         help="Only distill stored logits above this target confidence; lower-confidence samples get downweighted.")
     parser.add_argument("--dark-require-correct", action="store_true",
                         help="Only distill stored logits whose argmax matched the sample label when saved.")
+    parser.add_argument("--distill-start-task", type=int, default=None,
+                        help="Do not apply dark-logit distillation before this task index.")
+    parser.add_argument("--distill-ramp-tasks", type=int, default=None,
+                        help="Linearly ramp dark-logit distillation over this many tasks after distill-start-task.")
+    parser.add_argument("--pressure-loss-low", type=float, default=None,
+                        help="Replay CE loss where PressureDarkReplayEWC begins turning on distillation.")
+    parser.add_argument("--pressure-loss-high", type=float, default=None,
+                        help="Replay CE loss where PressureDarkReplayEWC reaches full loss pressure.")
+    parser.add_argument("--pressure-drift-low", type=float, default=None,
+                        help="Logit RMSE where PressureDarkReplayEWC begins turning on distillation.")
+    parser.add_argument("--pressure-drift-high", type=float, default=None,
+                        help="Logit RMSE where PressureDarkReplayEWC reaches full drift pressure.")
     parser.add_argument("--dark-alpha-min", type=float, default=None,
                         help="Minimum logit-consistency strength for AdaptiveDarkReplayEWC.")
     parser.add_argument("--conflict-margin", type=float, default=None,
@@ -298,6 +328,18 @@ def main():
         trainer_kwargs["dark_confidence_threshold"] = args.dark_confidence_threshold
     if args.dark_require_correct:
         trainer_kwargs["dark_require_correct"] = True
+    if args.distill_start_task is not None:
+        trainer_kwargs["distill_start_task"] = args.distill_start_task
+    if args.distill_ramp_tasks is not None:
+        trainer_kwargs["distill_ramp_tasks"] = args.distill_ramp_tasks
+    if args.pressure_loss_low is not None:
+        trainer_kwargs["pressure_loss_low"] = args.pressure_loss_low
+    if args.pressure_loss_high is not None:
+        trainer_kwargs["pressure_loss_high"] = args.pressure_loss_high
+    if args.pressure_drift_low is not None:
+        trainer_kwargs["pressure_drift_low"] = args.pressure_drift_low
+    if args.pressure_drift_high is not None:
+        trainer_kwargs["pressure_drift_high"] = args.pressure_drift_high
     if args.dark_alpha_min is not None:
         trainer_kwargs["dark_alpha_min"] = args.dark_alpha_min
     if args.conflict_margin is not None:

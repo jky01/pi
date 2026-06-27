@@ -10,7 +10,7 @@
   `/Users/jackyyeh/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3`
 - 跑 benchmark：`$PY run.py <mode> --methods ... --seeds 0 1 2 --n-tasks N --steps-per-task S --output results_xxx.json`
   - mode ∈ `label_permuted`（Task-IL 多頭）、`input_permuted`（Domain-IL 單頭，加 `--input-adapter`）、`class_il`（單頭、無 task id）。
-- 冒煙測試（16 trainers × 2 mode）：`$PY -m unittest test_smoke`
+- 冒煙測試（目前 registry 內所有 trainers × label/input/conflicting 三種 mode）：`$PY -m unittest test_smoke`
 - 長串流受 `pi_digits_600000.txt` 600k 位數限制：`n_tasks*(steps+test) ≲ 560k`。
 - 結果分析：`$PY analyze.py <mode>`，或直接讀 `results_*.json`（`run.summarize` 算 final/bwt/forget/retention）。
 
@@ -23,6 +23,7 @@
 - **GPM 梯度投影不適配本 benchmark**（輸入平穩→凍結共享層）；函數空間錨定要用「輸出蒸餾」不是「輸入子空間投影」（§10.1）。
 - **Class-IL（誠實硬測試，§11）**：拿掉 task id 後線性頭因 recency bias 崩壞（**DER++ 反轉成有害**）。**已解：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 0.31→0.858、遺忘 0.50→0.06、retention>1.0**（§11.3）。教訓：表徵骨幹用 replay+EWC，讀出依設定換（Task-IL：head+DER++；Class-IL：無偏原型）。benchmark Class-IL 上限 ~200 類（K=8 位數和僅 ~73 相異值）。
 - **Adaptive distillation 初步結果（§12.2）**：`AdaptiveDarkReplayEWC` 可在 conflicting 下自動把 α 降到 0，退回 ReplayEWC、避免固定 DER++ 傷害；confidence gate 可減少低品質 logits 的副作用。但目前梯度 cosine 只能當安全閥，還不能自動判斷何時該在長流共享規則下打開 DER++。
+- **Pressure / maturity gating 邊界（§12.3）**：`PressureDarkReplayEWC`（可靠 logits × label-loss pressure）安全但偏保守，130-task 把 ReplayEWC **0.815→0.847**，仍低於 full DER++ **0.892**；logit drift 是假警報，delayed DER++ start=40/80 也不夠。下一步要做的是 **regime/horizon detector**，不是再調單一 batch-level gate。
 - **正向遷移**：表徵層有（晚段任務最終準確率更高），學習速度沒有（§10.3）。
 
 ## 2. Backlog（依優先序；每項含 為什麼 / 做法 / 驗收）
@@ -62,6 +63,22 @@
   - conflicting：ReplayEWC **0.384 ± 0.008**；固定 DarkReplayEWC α=0.5 **0.305 ± 0.002**；`AdaptiveDarkReplayEWC` **0.384 ± 0.008**（α 平均降到 0）；confidence-gated DarkReplayEWC **0.371 ± 0.007**。
   - label_permuted：ReplayEWC **0.602 ± 0.004**；固定 DarkReplayEWC α=0.5 **0.470 ± 0.005**；`AdaptiveDarkReplayEWC` **0.601 ± 0.004**；confidence-gated DarkReplayEWC **0.550 ± 0.011**。
   - 結論：gradient-conflict gate 是有效安全閥，可避免 DER++ 在真衝突下傷害模型；confidence gate 支持「可靠記憶才鞏固」的假設。但 current-vs-dark 梯度 cosine 在短流 label_permuted 也偏負，不能當完整 regime detector。下一步不要只調 α，應找 **何時開蒸餾** 的訊號（長期遺忘壓力、任務相似度、reliability × drift policy）。
+- **P2.5 pressure/maturity gating（已寫入 `report.md` §12.3）**：
+  - `PressureDarkReplayEWC` 新增：可靠記憶（stored logits 高信心且正確）× label-loss forgetting pressure。預設 **不使用 logit drift**，因為 80-task telemetry 顯示 drift pressure 幾乎全開但 final 下降，代表 logit geometry drift 不是功能性遺忘。
+  - 20-task sanity（loss-only default）：conflicting **0.382 ± 0.010**、label_permuted **0.598 ± 0.005**，幾乎退回 ReplayEWC，可避開固定 DER++ 短流傷害。
+  - 130-task label_permuted：ReplayEWC **0.815 ± 0.074**；full DarkReplayEWC α=0.5 **0.892 ± 0.019**；PressureDarkReplayEWC **0.847 ± 0.030**；delayed DER++ start=40 **0.827 ± 0.024**；start=80 **0.779 ± 0.047**。
+  - 結論：reactive pressure 能降低壞 seed 風險但太保守；maturity gate 太粗；full DER++ 的優勢是 proactive consolidation。**下一步是自動辨識「共享規則長流」vs「真衝突/短流」regime。**
+
+### P2.6 — Regime / horizon detector（下一個最有價值工作）
+- **為什麼**：目前已知道 full DER++ 在共享規則長流最強，但在真衝突/短流有害；ReplayEWC/Pressure 比較安全但拿不到 full DER++ 的長流增益。局部訊號（gradient cosine、logit drift、label-loss pressure、單純 task count）都不夠。需要一個更上層的 policy 判斷「這條 stream 是否值得 proactive consolidation」。
+- **做法候選**：
+  - **雙軌 shadow probe**：主模型用 ReplayEWC；低成本 shadow 指標估計「若開 DER++，replay loss/old accuracy 是否改善且 current-task diagonal 是否不受傷」。可先不維護完整第二模型，只在 replay batch 上計算反事實 gradient/短步 lookahead。
+  - **regime scorecard online 化**：維護最近窗口的 old-task label loss、current-task learning slope、replay/current gradient conflict、stored-logit reliability、任務數/horizon；用簡單規則輸出 `distill_mode ∈ {off, pressure, full}`。
+  - **先用 oracle validation 做上界**：離線掃描每個任務區段應開/關 DER++ 的 schedule，確認「可學 schedule」真的存在，再做線上 detector。
+- **驗收**：在三個設定同時測：
+  - label_permuted 130-task：接近 full DER++（目標 ≥0.87）。
+  - conflicting 40-task：接近 ReplayEWC（目標 final/Joint 不低於 ReplayEWC 2%）。
+  - label_permuted 20/80-task：不能明顯低於 ReplayEWC。
 
 ### P3 — Task-free（無邊界）CL
 - **為什麼**：目前都靠 `on_task_end`（算 Fisher、更新 adapter/GPM 基、Class-IL 切片）——等於知道任務何時切換。真實串流沒有邊界。

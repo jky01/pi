@@ -8,12 +8,14 @@
 5. DarkReplayEWCTrainer     — ReplayEWC + logits consistency（DER/SER 系列方向）。
 6. AdaptiveDarkReplayEWCTrainer
                             — DarkReplayEWC + gradient-conflict gated distillation。
-7. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
-8. MarginSurpriseReplayEWCTrainer
+7. PressureDarkReplayEWCTrainer
+                            — DarkReplayEWC + reliability × forgetting-pressure distillation。
+8. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
+9. MarginSurpriseReplayEWCTrainer
                             — ReplayEWC + loss/surprise + low-margin boundary replay。
-9. HippocampalReplayEWCTrainer
+10. HippocampalReplayEWCTrainer
                             — SurpriseReplayEWC + episodic prototype memory at inference。
-10. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
+11. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
                               重置「低效用、夠老」的死/低貢獻單元，其餘權重完全
                               不動——這是對話第一輪明確回答「不重置權重」的機制，
                               主打可塑性流失（失效 B），跟前兩者主打遺忘（失效 A）形成對照。
@@ -453,7 +455,8 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
                  fisher_batches: int = 30, fisher_decay: float = 0.9,
                  grad_clip_norm: float = 50.0, dark_alpha: float = 0.1,
                  replay_weight: float = 0.5, dark_confidence_threshold: float = 0.0,
-                 dark_require_correct: bool = False):
+                 dark_require_correct: bool = False, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0):
         super().__init__(
             model,
             lr=lr,
@@ -469,6 +472,10 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
         self.replay_weight = replay_weight
         self.dark_confidence_threshold = float(np.clip(dark_confidence_threshold, 0.0, 1.0))
         self.dark_require_correct = bool(dark_require_correct)
+        self.distill_start_task = max(0, int(distill_start_task))
+        self.distill_ramp_tasks = max(0, int(distill_ramp_tasks))
+        self._active_task_idx = None
+        self.dark_alpha_trace = []
         self.buf_logits = []
 
     @staticmethod
@@ -511,23 +518,43 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
         e = np.exp(z)
         return e / e.sum(axis=1, keepdims=True)
 
-    def _dark_grads(self, cache, target_logits, task_idx, labels=None):
-        n, out_dim = target_logits.shape
-        dlogits = 2.0 * (cache["logits"] - target_logits) / max(1, n * out_dim)
+    def _dark_sample_weights(self, cache, target_logits, labels=None):
+        n = target_logits.shape[0]
+        weights = np.ones(n, dtype=np.float64)
         if self.dark_confidence_threshold > 0.0 or self.dark_require_correct:
             target_probs = self._target_probs(target_logits)
             confidence = target_probs.max(axis=1)
-            weights = np.ones(n, dtype=np.float64)
             if self.dark_confidence_threshold > 0.0:
                 denom = max(1e-12, 1.0 - self.dark_confidence_threshold)
                 weights *= np.clip((confidence - self.dark_confidence_threshold) / denom, 0.0, 1.0)
             if self.dark_require_correct and labels is not None:
                 weights *= (target_probs.argmax(axis=1) == labels).astype(np.float64)
+        return weights
+
+    def _dark_grads(self, cache, target_logits, task_idx, labels=None):
+        n, out_dim = target_logits.shape
+        dlogits = 2.0 * (cache["logits"] - target_logits) / max(1, n * out_dim)
+        weights = self._dark_sample_weights(cache, target_logits, labels)
+        if not np.allclose(weights, 1.0):
             dlogits = dlogits * weights[:, None]
         return self.model.backward_from_logits_grad(cache, dlogits, task_idx)
 
     def _effective_dark_alpha(self, current_grads, ce_grads, dark_grads):
-        return self.dark_alpha
+        alpha = self.dark_alpha * self._distill_age_scale()
+        self.dark_alpha_trace.append(float(alpha))
+        if len(self.dark_alpha_trace) > 2000:
+            self.dark_alpha_trace = self.dark_alpha_trace[-1000:]
+        return alpha
+
+    def _distill_age_scale(self):
+        if self._active_task_idx is None:
+            return 1.0
+        task_idx = int(self._active_task_idx)
+        if task_idx < self.distill_start_task:
+            return 0.0
+        if self.distill_ramp_tasks <= 0:
+            return 1.0
+        return float(np.clip((task_idx - self.distill_start_task + 1) / self.distill_ramp_tasks, 0.0, 1.0))
 
     def _mix_dark_replay_grads(self, grads, rX, rY, rtasks, rlogits, task_idx):
         replay_weight = self.replay_weight
@@ -615,6 +642,7 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
         return {k: current_weight * grads[k] + replay_weight * rgrads[k] for k in grads}
 
     def train_step(self, X, Y, task_idx: int = None):
+        self._active_task_idx = task_idx
         loss, acc = self.model.loss_acc(X, Y, task_idx)
         cache = self.model.forward(X, task_idx)
         grads = self.model.backward(cache, Y, task_idx)
@@ -646,7 +674,8 @@ class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
                  replay_weight: float = 0.5, dark_alpha_min: float = 0.0,
                  conflict_margin: float = 0.2, alpha_smoothing: float = 0.2,
                  conflict_ema_decay: float = 0.95, dark_confidence_threshold: float = 0.0,
-                 dark_require_correct: bool = False):
+                 dark_require_correct: bool = False, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0):
         super().__init__(
             model,
             lr=lr,
@@ -661,6 +690,8 @@ class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
             replay_weight=replay_weight,
             dark_confidence_threshold=dark_confidence_threshold,
             dark_require_correct=dark_require_correct,
+            distill_start_task=distill_start_task,
+            distill_ramp_tasks=distill_ramp_tasks,
         )
         self.dark_alpha_max = float(dark_alpha)
         self.dark_alpha_min = float(dark_alpha_min)
@@ -719,6 +750,7 @@ class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
         else:
             s = self.alpha_smoothing
             alpha = (1.0 - s) * self.adaptive_dark_alpha + s * target_alpha
+        alpha *= self._distill_age_scale()
         self.adaptive_dark_alpha = float(alpha)
 
         self.alpha_trace.append(float(alpha))
@@ -735,6 +767,84 @@ class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
             self.current_dark_cos_trace = self.current_dark_cos_trace[-1000:]
             self.ce_dark_cos_trace = self.ce_dark_cos_trace[-1000:]
         return float(alpha)
+
+
+class PressureDarkReplayEWCTrainer(DarkReplayEWCTrainer):
+    """DarkReplayEWC with reliability × forgetting-pressure gating.
+
+    Reliability asks whether the stored logits were worth consolidating when they
+    entered memory. Pressure asks whether the replayed old sample is currently
+    being forgotten. By default this is label-loss dominant; logit drift is kept
+    as an opt-in signal because geometric drift can be harmless plasticity.
+    """
+    name = "PressureDarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, dark_confidence_threshold: float = 0.4,
+                 dark_require_correct: bool = True, pressure_loss_low: float = 0.8,
+                 pressure_loss_high: float = 2.3, pressure_drift_low: float = 999.0,
+                 pressure_drift_high: float = 1000.0, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            dark_alpha=dark_alpha,
+            replay_weight=replay_weight,
+            dark_confidence_threshold=dark_confidence_threshold,
+            dark_require_correct=dark_require_correct,
+            distill_start_task=distill_start_task,
+            distill_ramp_tasks=distill_ramp_tasks,
+        )
+        self.pressure_loss_low = float(pressure_loss_low)
+        self.pressure_loss_high = max(self.pressure_loss_low + 1e-6, float(pressure_loss_high))
+        self.pressure_drift_low = float(pressure_drift_low)
+        self.pressure_drift_high = max(self.pressure_drift_low + 1e-6, float(pressure_drift_high))
+        self.pressure_weight_trace = []
+        self.reliability_trace = []
+        self.loss_pressure_trace = []
+        self.drift_pressure_trace = []
+
+    @staticmethod
+    def _ramp(values, low, high):
+        return np.clip((values - low) / max(1e-12, high - low), 0.0, 1.0)
+
+    def _forgetting_pressure(self, cache, target_logits, labels=None):
+        n = target_logits.shape[0]
+        loss_pressure = np.zeros(n, dtype=np.float64)
+        if labels is not None:
+            probs = cache["probs"]
+            losses = -np.log(probs[np.arange(n), labels] + 1e-12)
+            loss_pressure = self._ramp(losses, self.pressure_loss_low, self.pressure_loss_high)
+
+        drift = np.sqrt(np.mean((cache["logits"] - target_logits) ** 2, axis=1))
+        drift_pressure = self._ramp(drift, self.pressure_drift_low, self.pressure_drift_high)
+        return np.maximum(loss_pressure, drift_pressure), loss_pressure, drift_pressure
+
+    def _dark_sample_weights(self, cache, target_logits, labels=None):
+        reliability = super()._dark_sample_weights(cache, target_logits, labels)
+        pressure, loss_pressure, drift_pressure = self._forgetting_pressure(cache, target_logits, labels)
+        weights = reliability * pressure
+
+        self.pressure_weight_trace.append(float(np.mean(weights)))
+        self.reliability_trace.append(float(np.mean(reliability)))
+        self.loss_pressure_trace.append(float(np.mean(loss_pressure)))
+        self.drift_pressure_trace.append(float(np.mean(drift_pressure)))
+        if len(self.pressure_weight_trace) > 2000:
+            self.pressure_weight_trace = self.pressure_weight_trace[-1000:]
+            self.reliability_trace = self.reliability_trace[-1000:]
+            self.loss_pressure_trace = self.loss_pressure_trace[-1000:]
+            self.drift_pressure_trace = self.drift_pressure_trace[-1000:]
+        return weights
 
 
 class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
@@ -1623,6 +1733,7 @@ TRAINER_REGISTRY = {
     "ReplayEWC": ReplayEWCTrainer,
     "DarkReplayEWC": DarkReplayEWCTrainer,
     "AdaptiveDarkReplayEWC": AdaptiveDarkReplayEWCTrainer,
+    "PressureDarkReplayEWC": PressureDarkReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "HippocampalReplayEWC": HippocampalReplayEWCTrainer,

@@ -32,6 +32,8 @@
 
 **(G) 初步 adaptive distillation 結果**（§12.2）。新增 `AdaptiveDarkReplayEWC`：用共享層梯度 cosine 的 EMA 當 conflict detector，只有偵測到正向對齊時才開 DER++ 蒸餾；另讓 `DarkReplayEWC` 支援高信心/正確 logits 才蒸餾。20-task sanity 顯示：在 `conflicting` 下 adaptive 會把 α 降到 0，final 回到 ReplayEWC 的 **0.384**，避免固定 DER++ 的 **0.305** 傷害；confidence gate 也把固定 DER++ 拉到 **0.371**。但同一個梯度訊號在短流 `label_permuted` 也偏負，adaptive 會退回 ReplayEWC，尚未做到「共享規則長流時自動打開 DER++」。因此目前 adaptive gate 是安全閥，不是完整解。
 
+**(H) P2.5：reactive pressure 與 maturity gate 的邊界**（§12.3）。新增 `PressureDarkReplayEWC`（可靠 logits × label-loss forgetting pressure）與 `DarkReplayEWC --distill-start-task`。結果：20-task 下 Pressure 幾乎退回 ReplayEWC，避開固定 DER++ 傷害；130-task 下 Pressure **0.847**，高於 ReplayEWC **0.815**，但低於 full DER++ **0.892**。delayed DER++ start=40 得 **0.827**、start=80 得 **0.779**，都不如 full DER++。新教訓：**logit drift 不是可靠遺忘訊號，單純晚開蒸餾也太弱；full DER++ 的優勢是 proactive consolidation，不是等 label loss 壞掉才補救。**
+
 ---
 
 ## 1. 目的
@@ -68,7 +70,7 @@
 
 ## 3. 模型與演算法
 
-兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含十二個 trainer（含 §7 新增的 Joint 離線上界），其中九個已納入兩個模式的 80-task 完整表格；`DarkReplayEWC` 與 `MarginSurpriseReplayEWC` 是文獻啟發的實驗方法，暫不列入主表。
+兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含 19 個 trainer（含 §7 新增的 Joint 離線上界，以及後續的 Class-IL、DER++、adaptive/pressure gating、Benna-Fusi、FunctionSpace 等實驗方法）；早期主表仍保留九個核心方法，後續章節再分別報告新增方法。
 
 - **Naive**：純線上 SGD，無任何保護機制，作為下界基準。
 - **EWC**：以 Fisher 資訊對角線錨定舊參數的二次懲罰項。方案 A 中二次懲罰主要應用於共享隱藏層參數。
@@ -442,6 +444,40 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 
 下一步不應再只調單一 α；更值得做的是 **雙條件蒸餾 policy**：先用 confidence/reliability 過濾可鞏固記憶，再用長期遺忘壓力或任務相似度訊號決定是否打開蒸餾。若做不到，就保持 `ReplayEWC` 為預設核心，DER++ 只在已知共享規則、長流遺忘主導的設定中手動開啟。
 
+### 12.3 P2.5：reliability × forgetting pressure 與 maturity gate
+
+§12.2 證明 gradient-conflict gate 可以避免傷害，但不能自動重現長流 DER++ 的優勢。本節再測兩個更貼近「腦式鞏固」的 policy：
+
+- `PressureDarkReplayEWC`：只蒸餾可靠記憶。stored logits 必須高信心、且寫入時 argmax 與標籤一致；再乘上 replay label-loss pressure。預設不使用 logit drift，因為 80-task telemetry 顯示 drift 幾乎全場很高，卻不等於功能性遺忘。
+- `DarkReplayEWC --distill-start-task N`：maturity gate。早期先只做 ReplayEWC，等任務數夠多後再打開 DER++，模擬「記憶成熟後再鞏固」。
+
+短流 sanity（20 tasks × 1000 steps × 2 seeds）：
+
+| mode | 方法 | final | BWT | mean forgetting | 解讀 |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| conflicting | PressureDarkReplayEWC（loss-only） | 0.382 ± 0.010 | 0.074 | 0.031 | 幾乎退回 ReplayEWC，避開固定 DER++ 傷害 |
+| label_permuted | PressureDarkReplayEWC（loss-only） | 0.598 ± 0.005 | 0.145 | 0.046 | 幾乎退回 ReplayEWC，短流不亂開蒸餾 |
+
+中長流與長流（label_permuted）：
+
+| 設定 | 方法 | final | BWT | mean forgetting | retention |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| 80 tasks × 2000 | ReplayEWC | **0.791 ± 0.029** | 0.018 | 0.095 | 1.023 |
+| 80 tasks × 2000 | Pressure（drift enabled，負例） | 0.758 ± 0.005 | 0.010 | 0.071 | 1.014 |
+| 80 tasks × 2000 | Pressure（loss-only） | 0.778 ± 0.015 | 0.005 | 0.106 | 1.007 |
+| 130 tasks × 4000 | ReplayEWC | 0.815 ± 0.074 | -0.069 | 0.130 | 0.921 |
+| 130 tasks × 4000 | **DarkReplayEWC α=0.5（full DER++）** | **0.892 ± 0.019** | **0.010** | **0.043** | **1.012** |
+| 130 tasks × 4000 | PressureDarkReplayEWC（loss-only） | 0.847 ± 0.030 | -0.049 | 0.108 | 0.946 |
+| 130 tasks × 4000 | delayed DER++ start=40 | 0.827 ± 0.024 | -0.031 | 0.089 | 0.964 |
+| 130 tasks × 4000 | delayed DER++ start=80 | 0.779 ± 0.047 | -0.080 | 0.142 | 0.907 |
+
+結論：
+
+1. **logit drift 是假警報。** 80-task telemetry 顯示 drift pressure 幾乎全開（~0.92），但這時 ReplayEWC label performance 還很好；把 drift 當遺忘壓力會過早蒸餾，final 下降。真正該看的是功能性遺忘（label loss / accuracy），不是輸出幾何有沒有改變。
+2. **reactive pressure 太保守。** PressureDarkReplayEWC 在 130-task 把 ReplayEWC 的 0.815 拉到 0.847，尤其降低壞 seed 風險；但它遠低於 full DER++ 的 0.892。原因是它等 label loss 明顯惡化才出手，而 DER++ 的強處是 proactive consolidation：在舊函數還沒壞掉前就維持其 soft geometry。
+3. **單純 maturity gate 不夠。** start=40/start=80 都沒有接近 full DER++。太晚開會錯過早期鞏固；太早開又會回到短流/衝突任務的傷害問題。任務數本身不是可靠 regime detector。
+4. **目前可用 policy 應該是顯式 regime 選擇。** 若已知是共享底層規則、長流遺忘主導，用 full `DarkReplayEWC α=0.5`；若任務可能真衝突、短流、或 regime 未知，用 ReplayEWC / PressureDarkReplayEWC 作為安全預設。下一個真正要解的是「自動辨識 regime / horizon」，不是再微調單一 batch-level gate。
+
 ## 13. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
@@ -456,6 +492,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 10. **Class-IL 校正並隨後補強（§11）**。拿掉 task ID（單頭、200 類）後，Task-IL 的英雄 **DER++ 反轉成有害**（0.23 < 純 ReplayEWC 0.31），病灶是線性頭的 recency/magnitude bias。**把讀出換成 NCM 原型分類器（iCaRL 式，`NCMReplayEWC`）後，缺口幾乎補滿：0.31 → 0.858、遺忘 0.50 → 0.06、retention >1.0**（甚至超過線性頭 Joint 0.742）。關鍵教訓：**對的機制隨設定而變**——跨設定穩健的是 replay + Fisher-EWC 當表徵骨幹，再依設定換對的讀出（Task-IL：head + DER++ 蒸餾；Class-IL：無偏原型）。benchmark 的 Class-IL 規模上限 ~200 類（K=8 位數和僅 ~73 個相異值）。
 11. **Conflicting-task 校正了通用性判斷（§12）**。當 task 的底層函數真的不同，ReplayEWC 仍是最穩骨幹（final/Joint 0.756），但 DER++ α=0.5 反而降低 final/Joint 到 0.698；它降低 forgetting，卻阻礙學新衝突規則。這把「最終答案」從單一 trainer 改成一個設計原則：**replay + Fisher-EWC 是核心骨幹；DER++、NCM、adapter、episodic readout 是依 task regime 自適應開關的模組。**
 12. **Adaptive distillation 的第一版是安全閥，不是完整解（§12.2）**。`AdaptiveDarkReplayEWC` 能在 conflicting 下自動把蒸餾降到 0，回到 ReplayEWC、避開固定 DER++ 傷害；confidence gate 也能減少固化低品質 logits 的副作用。但目前梯度 cosine 訊號在短流 `label_permuted` 也偏負，無法自動重現長流 DER++ 的優勢。下一步要找更好的「何時開蒸餾」訊號，而不是只調 α。
+13. **Pressure/maturity gating 進一步縮小了答案空間（§12.3）**。可靠記憶 × label-loss pressure 是安全的，能在 130-task 把 ReplayEWC 0.815 拉到 0.847，但仍不及 full DER++ 0.892；logit drift 會誤判，delayed start=40/80 也不夠。這說明 DER++ 的價值是 proactive consolidation，而不是 reactive repair。下一步要做 regime/horizon detector，而不是再找單一局部 gate。
 
 ---
 
@@ -464,7 +501,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 - `pi_digits.py`：產生/快取 pi 小數位序列。
 - `benchmark.py`：Permuted-Pi-Digits 串流（支持多頭 `label_permuted` 和單頭 `input_permuted`）。
 - `model.py`：支持多頭選擇、per-task 輸入轉接器（`input_adapter`）與可塑性診斷的 numpy MLP 實現。
-- `trainers.py`：16 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**、**FunctionSpaceReplay（Replay + DER++ 蒸餾 + GPM 投影，可切換）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
+- `trainers.py`：19 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、AdaptiveDarkReplayEWC、PressureDarkReplayEWC、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、NCMReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**、**FunctionSpaceReplay（Replay + DER++ 蒸餾 + GPM 投影，可切換）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
 - `run.py` / `run_one_combo.py`：主實驗腳本（命令行選模式、方法、seed、任務數；`--input-adapter` 開啟輸入轉接器，`--joint-batch/--joint-steps` 控制上界）。
 - `analyze.py`：彙整多 seed 實驗結果，輸出 JSON 與畫圖；缺 matplotlib 時用 Pillow 輸出圖表並產生 summary JSON。
 - `results_label_permuted.json` / `results_input_permuted.json`：9 種主方法的原始數據。
@@ -476,6 +513,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 - `results_classil_ncm.json` / `results_classil_ncm_trainer.json`：§11.3 NCM 原型分類器解 Class-IL 缺口。
 - `results_conflicting_*.json`：§12 任務底層函數真衝突 benchmark 與 DER++ alpha sweep。
 - `results_*adaptive*_sanity.json`、`results_*confidence_dark*_sanity.json`、`results_*dark_baseline_sanity.json`：§12.2 adaptive/confidence-gated distillation 的短流 sanity。
+- `results_*pressure*.json`、`results_label_permuted_delayed_dark_*.json`：§12.3 reliability × forgetting-pressure 與 delayed DER++ maturity gate 實驗。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。
