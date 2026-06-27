@@ -48,6 +48,7 @@ class MLP:
                  n_tasks: int = 80, input_adapter: bool = False):
         rng = np.random.RandomState(seed)
         self.dims = (in_dim, h1, h2, out_dim)
+        self.n_tasks = int(n_tasks)
         self.W1 = self._he_init(rng, in_dim, h1)
         self.b1 = np.zeros(h1, dtype=np.float32)
         self.W2 = self._he_init(rng, h1, h2)

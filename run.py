@@ -305,6 +305,10 @@ def main():
                         help="Cosine threshold for RtpDarkReplayEWC regime detector.")
     parser.add_argument("--rtp-probe-steps", type=int, default=None,
                         help="Number of steps to probe gradient cosine in RtpDarkReplayEWC.")
+    parser.add_argument("--horizon-threshold", type=int, default=None,
+                        help="Minimum known/estimated stream horizon for HorizonDarkReplayEWC to enable DER++.")
+    parser.add_argument("--horizon-override", type=int, default=None,
+                        help="Override the model n_tasks horizon used by HorizonDarkReplayEWC (oracle/probe use).")
     parser.add_argument("--consolidate-every", type=int, default=None,
                         help="Step interval for task-free online EWC consolidation (Online*EWC* trainers).")
     parser.add_argument("--fisher-sample", type=int, default=None,
@@ -418,6 +422,10 @@ def main():
         trainer_kwargs["rtp_cos_threshold"] = args.rtp_cos_threshold
     if args.rtp_probe_steps is not None:
         trainer_kwargs["rtp_probe_steps"] = args.rtp_probe_steps
+    if args.horizon_threshold is not None:
+        trainer_kwargs["horizon_threshold"] = args.horizon_threshold
+    if args.horizon_override is not None:
+        trainer_kwargs["horizon_override"] = args.horizon_override
     if args.consolidate_every is not None:
         trainer_kwargs["consolidate_every"] = args.consolidate_every
     if args.fisher_sample is not None:

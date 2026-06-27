@@ -1616,6 +1616,55 @@ class RtpDarkReplayEWCTrainer(DarkReplayEWCTrainer):
         return loss, acc
 
 
+class HorizonDarkReplayEWCTrainer(DarkReplayEWCTrainer):
+    """Oracle horizon-gated DER++ baseline for P2.7.
+
+    If the known/estimated stream horizon is long enough, proactive DER++
+    consolidation is enabled from the start; otherwise it is disabled and the
+    trainer collapses to ReplayEWC. This is not a complete online detector. It is
+    an oracle validation of whether a high-level horizon signal can choose
+    between the two regimes better than local gradient/drift signals.
+    """
+    name = "HorizonDarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, dark_confidence_threshold: float = 0.0,
+                 dark_require_correct: bool = False, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0, horizon_threshold: int = 80,
+                 horizon_override: int = None):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            dark_alpha=dark_alpha,
+            replay_weight=replay_weight,
+            dark_confidence_threshold=dark_confidence_threshold,
+            dark_require_correct=dark_require_correct,
+            distill_start_task=distill_start_task,
+            distill_ramp_tasks=distill_ramp_tasks,
+        )
+        self.horizon_threshold = max(1, int(horizon_threshold))
+        if horizon_override is None:
+            self.horizon = int(getattr(model, "n_tasks", 0))
+        else:
+            self.horizon = int(horizon_override)
+        self.horizon_regime = "long" if self.horizon >= self.horizon_threshold else "short"
+
+    def _distill_age_scale(self):
+        if self.horizon_regime != "long":
+            return 0.0
+        return super()._distill_age_scale()
+
+
 class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
     """ReplayEWC with surprise-prioritized replay sampling.
 
@@ -2505,6 +2554,7 @@ TRAINER_REGISTRY = {
     "PressureDarkReplayEWC": PressureDarkReplayEWCTrainer,
     "LookaheadDarkReplayEWC": LookaheadDarkReplayEWCTrainer,
     "RtpDarkReplayEWC": RtpDarkReplayEWCTrainer,
+    "HorizonDarkReplayEWC": HorizonDarkReplayEWCTrainer,
     "OnlineEWCReplay": OnlineEWCReplayTrainer,
     "OnlineDarkReplayEWC": OnlineDarkReplayEWCTrainer,
     "GenerativeReplayEWC": GenerativeReplayEWCTrainer,
