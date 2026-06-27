@@ -147,6 +147,22 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
             trainer_diagnostics[attr] = getattr(trainer, attr)
 
     for attr, out_key in [
+        ("benefit_alpha_trace", "benefit_alpha"),
+        ("benefit_score_trace", "benefit_score"),
+        ("benefit_score_ema_trace", "benefit_score_ema"),
+        ("benefit_old_label_gain_trace", "benefit_old_label_gain"),
+        ("benefit_old_logit_gain_trace", "benefit_old_logit_gain"),
+        ("benefit_current_harm_trace", "benefit_current_harm"),
+    ]:
+        vals = np.array(getattr(trainer, attr, []), dtype=np.float64)
+        if len(vals) > 0:
+            tail_n = min(200, len(vals))
+            trainer_diagnostics[f"{out_key}_mean"] = float(np.mean(vals))
+            trainer_diagnostics[f"{out_key}_tail_mean"] = float(np.mean(vals[-tail_n:]))
+    if hasattr(trainer, "benefit_probe_count"):
+        trainer_diagnostics["benefit_probe_count"] = int(trainer.benefit_probe_count)
+
+    for attr, out_key in [
         ("pressure_weight_trace", "pressure_dark_weight"),
         ("reliability_trace", "pressure_dark_reliability"),
         ("loss_pressure_trace", "pressure_dark_loss_pressure"),
@@ -313,6 +329,20 @@ def main():
                         help="Minimum known/estimated stream horizon for HorizonDarkReplayEWC to enable DER++.")
     parser.add_argument("--horizon-override", type=int, default=None,
                         help="Override the model n_tasks horizon used by HorizonDarkReplayEWC (oracle/probe use).")
+    parser.add_argument("--benefit-probe-interval", type=int, default=None,
+                        help="Step interval for BenefitDarkReplayEWC virtual DER++ on/off probes.")
+    parser.add_argument("--benefit-ema-decay", type=float, default=None,
+                        help="EMA decay for BenefitDarkReplayEWC's function-space benefit score.")
+    parser.add_argument("--benefit-threshold", type=float, default=None,
+                        help="Benefit score EMA threshold for turning DER++ on in BenefitDarkReplayEWC.")
+    parser.add_argument("--benefit-alpha-lr", type=float, default=None,
+                        help="Smoothing rate for BenefitDarkReplayEWC alpha updates.")
+    parser.add_argument("--benefit-harm-weight", type=float, default=None,
+                        help="Penalty weight for current-task loss harm in BenefitDarkReplayEWC.")
+    parser.add_argument("--benefit-logit-weight", type=float, default=None,
+                        help="Weight for old replay logit-MSE improvement in BenefitDarkReplayEWC.")
+    parser.add_argument("--benefit-min-old", type=int, default=None,
+                        help="Minimum old replay samples required to run a BenefitDarkReplayEWC probe.")
     parser.add_argument("--consolidate-every", type=int, default=None,
                         help="Step interval for task-free online EWC consolidation (Online*EWC* trainers).")
     parser.add_argument("--fisher-sample", type=int, default=None,
@@ -430,6 +460,20 @@ def main():
         trainer_kwargs["horizon_threshold"] = args.horizon_threshold
     if args.horizon_override is not None:
         trainer_kwargs["horizon_override"] = args.horizon_override
+    if args.benefit_probe_interval is not None:
+        trainer_kwargs["benefit_probe_interval"] = args.benefit_probe_interval
+    if args.benefit_ema_decay is not None:
+        trainer_kwargs["benefit_ema_decay"] = args.benefit_ema_decay
+    if args.benefit_threshold is not None:
+        trainer_kwargs["benefit_threshold"] = args.benefit_threshold
+    if args.benefit_alpha_lr is not None:
+        trainer_kwargs["benefit_alpha_lr"] = args.benefit_alpha_lr
+    if args.benefit_harm_weight is not None:
+        trainer_kwargs["benefit_harm_weight"] = args.benefit_harm_weight
+    if args.benefit_logit_weight is not None:
+        trainer_kwargs["benefit_logit_weight"] = args.benefit_logit_weight
+    if args.benefit_min_old is not None:
+        trainer_kwargs["benefit_min_old"] = args.benefit_min_old
     if args.consolidate_every is not None:
         trainer_kwargs["consolidate_every"] = args.consolidate_every
     if args.fisher_sample is not None:

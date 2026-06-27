@@ -13,12 +13,14 @@
 8. HorizonDarkReplayEWCTrainer
                             — oracle horizon-gated DER++：長流開 logits distillation，
                               短流/衝突關閉，驗證 P2.7 regime 訊號需求。
-9. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
-10. MarginSurpriseReplayEWCTrainer
+9. BenefitDarkReplayEWCTrainer
+                            — P2.8：用 function-space 反事實收益偵測是否開 DER++。
+10. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
+11. MarginSurpriseReplayEWCTrainer
                             — ReplayEWC + loss/surprise + low-margin boundary replay。
-11. HippocampalReplayEWCTrainer
+12. HippocampalReplayEWCTrainer
                             — SurpriseReplayEWC + episodic prototype memory at inference。
-12. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
+13. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
                               重置「低效用、夠老」的死/低貢獻單元，其餘權重完全
                               不動——這是對話第一輪明確回答「不重置權重」的機制，
                               主打可塑性流失（失效 B），跟前兩者主打遺忘（失效 A）形成對照。
@@ -1668,6 +1670,240 @@ class HorizonDarkReplayEWCTrainer(DarkReplayEWCTrainer):
         return super()._distill_age_scale()
 
 
+class BenefitDarkReplayEWCTrainer(DarkReplayEWCTrainer):
+    """Online function-space benefit detector for DER++ distillation (P2.8).
+
+    The detector periodically compares two reversible virtual updates on the
+    same current batch and replay sample: DER++ off (alpha=0) vs DER++ on
+    (alpha=dark_alpha). It turns distillation on only when the virtual DER++ step
+    improves old replay behavior more than it harms the current batch. This
+    avoids peeking at the stream horizon and tests whether function-space
+    consequences can replace the failed weight-space RTP signal.
+    """
+    name = "BenefitDarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, dark_confidence_threshold: float = 0.0,
+                 dark_require_correct: bool = False, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0, benefit_probe_interval: int = 100,
+                 benefit_ema_decay: float = 0.9, benefit_threshold: float = 0.0,
+                 benefit_alpha_lr: float = 1.0, benefit_harm_weight: float = 1.0,
+                 benefit_logit_weight: float = 0.25, benefit_min_old: int = 4):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            dark_alpha=dark_alpha,
+            replay_weight=replay_weight,
+            dark_confidence_threshold=dark_confidence_threshold,
+            dark_require_correct=dark_require_correct,
+            distill_start_task=distill_start_task,
+            distill_ramp_tasks=distill_ramp_tasks,
+        )
+        self.benefit_probe_interval = max(1, int(benefit_probe_interval))
+        self.benefit_ema_decay = float(np.clip(benefit_ema_decay, 0.0, 0.999))
+        self.benefit_threshold = float(benefit_threshold)
+        self.benefit_alpha_lr = float(np.clip(benefit_alpha_lr, 0.0, 1.0))
+        self.benefit_harm_weight = float(benefit_harm_weight)
+        self.benefit_logit_weight = float(benefit_logit_weight)
+        self.benefit_min_old = max(1, int(benefit_min_old))
+        self.benefit_alpha = 0.0
+        self.benefit_score_ema = None
+        self.benefit_step = 0
+        self.benefit_probe_count = 0
+        self._probe_alpha_override = None
+        self._suppress_alpha_trace = False
+        self.benefit_alpha_trace = []
+        self.benefit_score_trace = []
+        self.benefit_score_ema_trace = []
+        self.benefit_old_label_gain_trace = []
+        self.benefit_old_logit_gain_trace = []
+        self.benefit_current_harm_trace = []
+
+    @staticmethod
+    def _copy_grads(grads):
+        return {k: v.copy() for k, v in grads.items()}
+
+    def _snapshot_model(self):
+        snap = {
+            "W1": self.model.W1.copy(),
+            "b1": self.model.b1.copy(),
+            "W2": self.model.W2.copy(),
+            "b2": self.model.b2.copy(),
+        }
+        if self.model.multi_head:
+            snap["heads_W"] = [w.copy() for w in self.model.heads_W]
+            snap["heads_b"] = [b.copy() for b in self.model.heads_b]
+        else:
+            snap["W3"] = self.model.W3.copy()
+            snap["b3"] = self.model.b3.copy()
+        if self.model.input_adapter:
+            snap["adapters"] = [a.copy() for a in self.model.adapters]
+        return snap
+
+    def _restore_model(self, snap):
+        self.model.W1 = snap["W1"]
+        self.model.b1 = snap["b1"]
+        self.model.W2 = snap["W2"]
+        self.model.b2 = snap["b2"]
+        if self.model.multi_head:
+            self.model.heads_W = snap["heads_W"]
+            self.model.heads_b = snap["heads_b"]
+        else:
+            self.model.W3 = snap["W3"]
+            self.model.b3 = snap["b3"]
+        if self.model.input_adapter:
+            self.model.adapters = snap["adapters"]
+
+    def _routed_loss_acc(self, X, Y, tasks):
+        if len(X) == 0:
+            return float("nan"), float("nan")
+        if self.model.multi_head or self.model.input_adapter:
+            total_loss = 0.0
+            total_acc = 0.0
+            for t in sorted(set(tasks)):
+                idx = [i for i, val in enumerate(tasks) if val == t]
+                loss, acc = self.model.loss_acc(X[idx], Y[idx], t)
+                total_loss += loss * len(idx)
+                total_acc += acc * len(idx)
+            return total_loss / len(tasks), total_acc / len(tasks)
+        return self.model.loss_acc(X, Y)
+
+    def _routed_logit_mse(self, X, tasks, target_logits):
+        if len(X) == 0:
+            return float("nan")
+        if self.model.multi_head or self.model.input_adapter:
+            total = 0.0
+            for t in sorted(set(tasks)):
+                idx = [i for i, val in enumerate(tasks) if val == t]
+                logits = self.model.forward(X[idx], t)["logits"]
+                total += float(np.mean((logits - target_logits[idx]) ** 2)) * len(idx)
+            return total / len(tasks)
+        logits = self.model.forward(X)["logits"]
+        return float(np.mean((logits - target_logits) ** 2))
+
+    def _old_replay_subset(self, rX, rY, rtasks, rlogits, task_idx):
+        if task_idx is None:
+            idx = list(range(len(rtasks)))
+        else:
+            idx = [i for i, t in enumerate(rtasks) if t is not None and t < task_idx]
+        if len(idx) == 0:
+            return None
+        return rX[idx], rY[idx], [rtasks[i] for i in idx], rlogits[idx]
+
+    def _virtual_metrics(self, alpha, current_grads, X, Y, sample, task_idx, old_subset):
+        snap = self._snapshot_model()
+        prev_override = self._probe_alpha_override
+        prev_suppress = self._suppress_alpha_trace
+        try:
+            self._probe_alpha_override = float(alpha)
+            self._suppress_alpha_trace = True
+            grads = self._copy_grads(current_grads)
+            grads = self._mix_dark_replay_grads(grads, *sample, task_idx)
+            ewc_grads = self._ewc_grad(task_idx)
+            self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
+
+            old_X, old_Y, old_tasks, old_logits = old_subset
+            old_loss, old_acc = self._routed_loss_acc(old_X, old_Y, old_tasks)
+            old_mse = self._routed_logit_mse(old_X, old_tasks, old_logits)
+            cur_loss, cur_acc = self.model.loss_acc(X, Y, task_idx)
+            return dict(
+                old_loss=float(old_loss),
+                old_acc=float(old_acc),
+                old_logit_mse=float(old_mse),
+                current_loss=float(cur_loss),
+                current_acc=float(cur_acc),
+            )
+        finally:
+            self._probe_alpha_override = prev_override
+            self._suppress_alpha_trace = prev_suppress
+            self._restore_model(snap)
+
+    def _update_benefit_alpha(self, current_grads, X, Y, sample, task_idx):
+        max_alpha = float(self.dark_alpha * self._distill_age_scale())
+        if max_alpha <= 0.0:
+            self.benefit_alpha = 0.0
+            return
+        old_subset = self._old_replay_subset(*sample, task_idx)
+        if old_subset is None or len(old_subset[0]) < self.benefit_min_old:
+            return
+        if self.benefit_step % self.benefit_probe_interval != 0:
+            return
+
+        off = self._virtual_metrics(0.0, current_grads, X, Y, sample, task_idx, old_subset)
+        on = self._virtual_metrics(max_alpha, current_grads, X, Y, sample, task_idx, old_subset)
+
+        old_label_gain = off["old_loss"] - on["old_loss"]
+        old_logit_gain = off["old_logit_mse"] - on["old_logit_mse"]
+        current_harm = on["current_loss"] - off["current_loss"]
+        score = (
+            old_label_gain
+            + self.benefit_logit_weight * old_logit_gain
+            - self.benefit_harm_weight * max(0.0, current_harm)
+        )
+
+        if self.benefit_score_ema is None:
+            self.benefit_score_ema = float(score)
+        else:
+            d = self.benefit_ema_decay
+            self.benefit_score_ema = float(d * self.benefit_score_ema + (1.0 - d) * score)
+
+        target_alpha = max_alpha if self.benefit_score_ema > self.benefit_threshold else 0.0
+        lr = self.benefit_alpha_lr
+        self.benefit_alpha = float(np.clip((1.0 - lr) * self.benefit_alpha + lr * target_alpha, 0.0, max_alpha))
+        self.benefit_probe_count += 1
+
+        self.benefit_alpha_trace.append(float(self.benefit_alpha))
+        self.benefit_score_trace.append(float(score))
+        self.benefit_score_ema_trace.append(float(self.benefit_score_ema))
+        self.benefit_old_label_gain_trace.append(float(old_label_gain))
+        self.benefit_old_logit_gain_trace.append(float(old_logit_gain))
+        self.benefit_current_harm_trace.append(float(current_harm))
+        if len(self.benefit_score_trace) > 2000:
+            self.benefit_alpha_trace = self.benefit_alpha_trace[-1000:]
+            self.benefit_score_trace = self.benefit_score_trace[-1000:]
+            self.benefit_score_ema_trace = self.benefit_score_ema_trace[-1000:]
+            self.benefit_old_label_gain_trace = self.benefit_old_label_gain_trace[-1000:]
+            self.benefit_old_logit_gain_trace = self.benefit_old_logit_gain_trace[-1000:]
+            self.benefit_current_harm_trace = self.benefit_current_harm_trace[-1000:]
+
+    def _effective_dark_alpha(self, current_grads, ce_grads, dark_grads):
+        if self._probe_alpha_override is not None:
+            return float(self._probe_alpha_override)
+        alpha = float(np.clip(self.benefit_alpha, 0.0, self.dark_alpha * self._distill_age_scale()))
+        if not self._suppress_alpha_trace:
+            self.dark_alpha_trace.append(alpha)
+            if len(self.dark_alpha_trace) > 2000:
+                self.dark_alpha_trace = self.dark_alpha_trace[-1000:]
+        return alpha
+
+    def train_step(self, X, Y, task_idx: int = None):
+        self._active_task_idx = task_idx
+        self.benefit_step += 1
+        loss, acc = self.model.loss_acc(X, Y, task_idx)
+        cache = self.model.forward(X, task_idx)
+        grads = self.model.backward(cache, Y, task_idx)
+
+        sample = self._sample_replay()
+        if sample is not None:
+            self._update_benefit_alpha(grads, X, Y, sample, task_idx)
+            grads = self._mix_dark_replay_grads(grads, *sample, task_idx)
+
+        ewc_grads = self._ewc_grad(task_idx)
+        self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
+        self._reservoir_insert(X, Y, task_idx)
+        return loss, acc
+
+
 class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
     """ReplayEWC with surprise-prioritized replay sampling.
 
@@ -2558,6 +2794,7 @@ TRAINER_REGISTRY = {
     "LookaheadDarkReplayEWC": LookaheadDarkReplayEWCTrainer,
     "RtpDarkReplayEWC": RtpDarkReplayEWCTrainer,
     "HorizonDarkReplayEWC": HorizonDarkReplayEWCTrainer,
+    "BenefitDarkReplayEWC": BenefitDarkReplayEWCTrainer,
     "OnlineEWCReplay": OnlineEWCReplayTrainer,
     "OnlineDarkReplayEWC": OnlineDarkReplayEWCTrainer,
     "GenerativeReplayEWC": GenerativeReplayEWCTrainer,
