@@ -657,6 +657,122 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
         return loss, acc
 
 
+def _online_consolidate_fisher(self, task_idx):
+    """Task-free (boundary-agnostic) EWC consolidation.
+
+    Instead of waiting for ``on_task_end`` to estimate the Fisher diagonal on the
+    just-finished task's data, estimate it from a random sample of the reservoir
+    buffer (a boundary-free mixture of everything seen so far) and snapshot the
+    anchor. Called on a fixed step interval, never aligned to task boundaries, so
+    the consolidation never uses any task-boundary knowledge. The squared-gradient
+    accumulation and ``fisher_decay`` EMA mirror the boundary-aware ``on_task_end``
+    so the same ``lam`` transfers; only the *timing* and *data source* differ.
+    """
+    if len(self.buf_X) == 0:
+        return
+    n = min(self.fisher_sample, len(self.buf_X))
+    idx = self.rng.randint(0, len(self.buf_X), size=n)
+    sX = np.stack([self.buf_X[i] for i in idx])
+    sY = np.array([self.buf_Y[i] for i in idx], dtype=np.int64)
+    stasks = [self.buf_task[i] for i in idx]
+    accum = {k: np.zeros_like(self.fisher[k]) for k in self.reg_keys}
+    if self.model.multi_head or self.model.input_adapter:
+        # Route each buffered sample through its own head/adapter (task id is an
+        # architectural routing key here, not boundary-timing knowledge).
+        groups = sorted(set(stasks), key=lambda v: (v is None, v))
+        for t in groups:
+            sub = [i for i, v in enumerate(stasks) if v == t]
+            cache = self.model.forward(sX[sub], t)
+            grads = self.model.backward(cache, sY[sub], t)
+            for k in self.reg_keys:
+                accum[k] += grads[k] ** 2
+        denom = max(1, len(groups))
+        for k in self.reg_keys:
+            accum[k] /= denom
+    else:
+        cache = self.model.forward(sX)
+        grads = self.model.backward(cache, sY)
+        for k in self.reg_keys:
+            accum[k] = grads[k] ** 2
+    for k in self.reg_keys:
+        self.fisher[k] = self.fisher_decay * self.fisher[k] + accum[k]
+    self.anchor = {k: v.copy() for k, v in self._current_reg_params(task_idx).items()}
+
+
+class OnlineEWCReplayTrainer(ReplayEWCTrainer):
+    """Task-free ReplayEWC: online Fisher/anchor, no ``on_task_end`` boundary use.
+
+    Reservoir replay is already boundary-agnostic; the only piece of ReplayEWC
+    that needs task boundaries is the Fisher/anchor consolidation in
+    ``on_task_end``. Here that is replaced by ``_online_consolidate_fisher`` fired
+    every ``consolidate_every`` steps, so the trainer never relies on knowing when
+    a task switches. Used to measure the cost of losing boundary knowledge.
+    """
+    name = "OnlineEWCReplay"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, consolidate_every: int = 400,
+                 fisher_sample: int = 256):
+        super().__init__(model, lr=lr, capacity=capacity, replay_batch=replay_batch,
+                         seed=seed, lam=lam, fisher_batches=fisher_batches,
+                         fisher_decay=fisher_decay, grad_clip_norm=grad_clip_norm)
+        self.consolidate_every = max(1, int(consolidate_every))
+        self.fisher_sample = int(fisher_sample)
+        self._online_step = 0
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = super().train_step(X, Y, task_idx)
+        self._online_step += 1
+        if self._online_step % self.consolidate_every == 0:
+            _online_consolidate_fisher(self, task_idx)
+        return loss, acc
+
+    def on_task_end(self, task_X, task_Y, task_idx: int = None):
+        pass  # task-free: consolidation is driven by step interval, not boundaries
+
+
+class OnlineDarkReplayEWCTrainer(DarkReplayEWCTrainer):
+    """Task-free DarkReplayEWC (DER++): online Fisher/anchor, no boundary use.
+
+    Same boundary-free consolidation as ``OnlineEWCReplay`` but keeping DER++ logit
+    distillation. Note the DER++ logit targets are captured at insertion time
+    (already boundary-free), so this is a fully task-free anti-forgetting trainer.
+    """
+    name = "OnlineDarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, dark_confidence_threshold: float = 0.0,
+                 dark_require_correct: bool = False, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0, consolidate_every: int = 400,
+                 fisher_sample: int = 256):
+        super().__init__(model, lr=lr, capacity=capacity, replay_batch=replay_batch,
+                         seed=seed, lam=lam, fisher_batches=fisher_batches,
+                         fisher_decay=fisher_decay, grad_clip_norm=grad_clip_norm,
+                         dark_alpha=dark_alpha, replay_weight=replay_weight,
+                         dark_confidence_threshold=dark_confidence_threshold,
+                         dark_require_correct=dark_require_correct,
+                         distill_start_task=distill_start_task,
+                         distill_ramp_tasks=distill_ramp_tasks)
+        self.consolidate_every = max(1, int(consolidate_every))
+        self.fisher_sample = int(fisher_sample)
+        self._online_step = 0
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = super().train_step(X, Y, task_idx)
+        self._online_step += 1
+        if self._online_step % self.consolidate_every == 0:
+            _online_consolidate_fisher(self, task_idx)
+        return loss, acc
+
+    def on_task_end(self, task_X, task_Y, task_idx: int = None):
+        pass  # task-free: consolidation is driven by step interval, not boundaries
+
+
 class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
     """DarkReplayEWC with gradient-conflict gated logit distillation.
 
@@ -2053,6 +2169,8 @@ TRAINER_REGISTRY = {
     "PressureDarkReplayEWC": PressureDarkReplayEWCTrainer,
     "LookaheadDarkReplayEWC": LookaheadDarkReplayEWCTrainer,
     "RtpDarkReplayEWC": RtpDarkReplayEWCTrainer,
+    "OnlineEWCReplay": OnlineEWCReplayTrainer,
+    "OnlineDarkReplayEWC": OnlineDarkReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "HippocampalReplayEWC": HippocampalReplayEWCTrainer,

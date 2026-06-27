@@ -36,6 +36,8 @@
 
 **(I) P2.6：cos-RTP regime 偵測器 — 3-seed 驗收後判定失敗（負面結果）**（§12.4）。新增 `LookaheadDarkReplayEWC` 與 `RtpDarkReplayEWC`（task-onset 用前 5 步累積梯度與 buffer 歷史梯度做餘弦比對決定開不開 DER++）。初版 20-task×1 seed sanity 誤判成功；**正式 3-seed 驗收推翻**：130-task label_permuted RTP **0.818**，未達 ≥0.87 目標、反略低於 ReplayEWC **0.832**，遠不及 full DER++ **0.893**。診斷：RTP 的 `alpha_mean≈0.011`（全程僅 ~2% task 判 synergistic），等於**幾乎永遠關閉 DER++、退化成 ReplayEWC**；它只在「ReplayEWC≥DER++ 的短流/衝突」看起來贏（=關掉剛好對）。threshold 掃描證實**機制完好**（強制永遠開→0.898≈DER++），**病灶是訊號**：多頭標籤排列把不同反傳誤差旋進共享層，使 task-onset 梯度餘弦分不開「共享規則長流」與「真衝突」。**P2.6 目標（自動辨識何時值得 proactive consolidation）未達成，退回 backlog。**
 
+**(J) P3：移除任務邊界依賴的代價趨近於零（task-free CL）**（§13）。新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`：把靠 `on_task_end` 邊界觸發的 Fisher/anchor 鞏固，改成每固定步距從 reservoir buffer 線上估計（`on_task_end` 改 no-op）。80-task × 3 seeds 對照：ReplayEWC 0.818 → **OnlineEWCReplay 0.826（+0.008）**；DarkReplayEWC 0.868 → **OnlineDarkReplayEWC 0.855（−0.012，在 std 內）**。無邊界 DER++ 仍勝過有邊界 ReplayEWC。結論：核心配方（replay + Fisher-EWC + DER++）**天生就接近 task-free**——reservoir replay 才是主力，Fisher 只需粗略滾動估計，精確 task-end 時機可有可無。
+
 ---
 
 ## 1. 目的
@@ -529,7 +531,33 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 2. **cos-RTP 不是有效的 regime 訊號（負面結果）**：task-onset 的共享層梯度餘弦在本 benchmark 分不開「共享規則長流」與「真衝突」——兩者都被判成 conflicting。它只能當「永遠退回 ReplayEWC 的安全閥」，無法在共享規則長流自動打開 DER++ 拿到增益。**P2.6 的目標（自動辨識何時值得 proactive consolidation）尚未達成。**
 3. **教訓**：要分辨「值得開 DER++ 的長共享流」需要 horizon / function-space 訊號（例如真正評估「開 DER++ 後舊任務 replay accuracy 是否改善且新任務不受傷」的反事實量測），而不是 task-onset 的權重梯度方向。這把 P2.6 的開放問題退回 backlog（見 NEXT_STEPS）。
 
-## 13. 結論
+## 13. Task-free（無邊界）持續學習：移除任務邊界依賴（P3）
+
+到目前為止所有 EWC 系列方法都靠 `on_task_end` 在「任務結束」這個明確邊界上估計 Fisher 對角線並快照 anchor——等於知道任務何時切換。真實串流沒有邊界。P3 把這個依賴拿掉，量化「失去邊界知識的代價」。
+
+**做法**：reservoir replay 本來就 boundary-agnostic（均勻蓄水池抽樣，不分任務），DER++ 的 logit 目標也是在樣本入 buffer 時就抓好的（boundary-free）。唯一用到邊界的是 EWC 的 Fisher/anchor 鞏固。新增兩個 task-free 變體（`trainers.py`）：
+
+- **`OnlineEWCReplay`**：把 `on_task_end` 改成 no-op，改由 `_online_consolidate_fisher` 每 `consolidate_every` 步觸發一次：從 reservoir buffer 隨機抽 `fisher_sample` 筆（涵蓋所有看過任務的混合，多頭時按 head 分組前傳）估計 Fisher 平方梯度，套相同 `fisher_decay` EMA，並快照 anchor。鞏固「時機」是固定步距、永不對齊任務邊界；squared-grad 累加與 EMA 與邊界版一致，因此 `lam` 可直接沿用，只差**時機與資料來源**。
+- **`OnlineDarkReplayEWC`**：同樣的無邊界鞏固，但保留 DER++ logit 蒸餾——是一個完全 task-free 的抗遺忘訓練器。
+
+CLI：`--consolidate-every`、`--fisher-sample`。
+
+**對照結果（80 tasks × 4000 steps × 3 seeds，`consolidate_every=400`＝每任務約一次，與邊界版對齊以隔離「時機錯位」的代價）**。結果檔 `results_taskfree_label_permuted.json`：
+
+| 方法 | 用邊界? | final | BWT | mean forgetting | retention |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| ReplayEWC | ✅ | 0.818 ± 0.037 | -0.035 | 0.111 | 0.959 |
+| **OnlineEWCReplay** | ❌ | **0.826 ± 0.038** | -0.022 | 0.107 | 0.974 |
+| DarkReplayEWC | ✅ | 0.868 ± 0.015 | +0.012 | 0.046 | 1.014 |
+| **OnlineDarkReplayEWC** | ❌ | **0.855 ± 0.015** | +0.004 | 0.053 | 1.004 |
+
+**失去邊界知識的代價趨近於零**：純 EWC 變體 **+0.008**（無邊界反而略好、遺忘更低），DER++ 變體 **−0.012**（落在 seed std ±0.015 內）。而且無邊界 DER++（0.855）仍明顯勝過有邊界 ReplayEWC（0.818）。這與既有結論一致：reservoir replay 才是主力抗遺忘機制（本來就無邊界），Fisher 鞏固只需要粗略的滾動估計，精確的 task-end 時機並不重要。
+
+**穩健性檢驗（故意把 consolidate 步距與 task 長度錯位）**：把 `consolidate_every` 設成 137（不是 400 的因數，鞏固時刻會持續漂移、跨越任務邊界），80-task × 3 seeds 結果 `results_taskfree_misaligned137_label_permuted.json`：OnlineEWCReplay **0.828 ± 0.056**、OnlineDarkReplayEWC **0.861 ± 0.013**——兩者都不比對齊版（0.826 / 0.855）差，甚至略好。這直接證明方法**不靠鞏固時機與任務邊界對齊**，是真正的 task-free，而非偷用了「每任務剛好鞏固一次」的隱性邊界資訊。
+
+結論：**本 benchmark 的核心抗遺忘配方（replay + Fisher-EWC + DER++）天生就接近 task-free**；把 Fisher/anchor 從邊界觸發改成固定步距的線上滾動估計，幾乎不損失效能。這也意味著前面所有「給邊界」的結果並非靠邊界知識撐起來的——邊界在此 regime 是可有可無的便利，不是必要條件。
+
+## 14. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -545,6 +573,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 12. **Adaptive distillation 的第一版是安全閥，不是完整解（§12.2）**。`AdaptiveDarkReplayEWC` 能在 conflicting 下自動把蒸餾降到 0，回到 ReplayEWC、避開固定 DER++ 傷害；confidence gate 也能減少固化低品質 logits 的副作用。但目前梯度 cosine 訊號在短流 `label_permuted` 也偏負，無法自動重現長流 DER++ 的優勢。下一步要找更好的「何時開蒸餾」訊號，而不是只調 α。
 13. **Pressure/maturity gating 進一步縮小了答案空間（§12.3）**。可靠記憶 × label-loss pressure 是安全的，能在 130-task 把 ReplayEWC 0.815 拉到 0.847，但仍不及 full DER++ 0.892；logit drift 會誤判，delayed start=40/80 也不夠。這說明 DER++ 的價值是 proactive consolidation，而不是 reactive repair。下一步要做 regime/horizon detector，而不是再找單一局部 gate。
 14. **cos-RTP regime 偵測器失敗，但釐清了訊號需求（§12.4，負面結果）**。task-onset 共享層梯度餘弦無法分辨「共享規則長流（該開 DER++）」與「真衝突（該關）」——3-seed 驗收下 RTP 幾乎永遠判 conflicting、退化成 ReplayEWC，130-task 只有 0.818（< full DER++ 0.893，甚至略低於 ReplayEWC 0.832）。threshold 掃描證明機制完好（強制永遠開→0.898），病灶是訊號：多頭標籤排列把不同反傳誤差旋進共享層，污染了梯度方向。這把 §12.2/12.3/12.4 三次嘗試的共同教訓定型：**局部、reactive、權重空間的訊號（cosine、logit drift、label loss）都不足以判斷「是否值得 proactive consolidation」；要做就得用 function-space 反事實量測（開 DER++ 後舊任務 replay accuracy 是否真的改善且新任務不受傷）或 horizon 訊號。** 在找到這種訊號前，實務上的穩健選擇是：已知長共享流就直接開 full DER++，已知短流/衝突就用 ReplayEWC。
+15. **核心配方天生接近 task-free（§13，P3）**。把 EWC 的 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距的線上滾動估計（`OnlineEWCReplay` / `OnlineDarkReplayEWC`，`on_task_end` 改 no-op），80-task 下失去邊界知識的代價趨近於零：ReplayEWC 0.818→0.826、DER++ 0.868→0.855（皆在 seed std 內），無邊界 DER++ 仍勝過有邊界 ReplayEWC。原因是 reservoir replay 才是主力抗遺忘機制（本來就無邊界）、DER++ logit 目標也在入 buffer 時就抓好，唯一用到邊界的 Fisher 鞏固只需要粗略估計。**邊界在此 regime 是便利、不是必要**；剩下真正依賴 task id 的只有多頭 head / adapter 的「路由」（架構需求，非鞏固時機），要完全擺脫需走 single-head class_il 或 task-inference。
 
 ---
 
@@ -553,7 +582,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 - `pi_digits.py`：產生/快取 pi 小數位序列。
 - `benchmark.py`：Permuted-Pi-Digits 串流（支持多頭 `label_permuted` 和單頭 `input_permuted`）。
 - `model.py`：支持多頭選擇、per-task 輸入轉接器（`input_adapter`）與可塑性診斷的 numpy MLP 實現。
-- `trainers.py`：19 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、AdaptiveDarkReplayEWC、PressureDarkReplayEWC、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、NCMReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**、**FunctionSpaceReplay（Replay + DER++ 蒸餾 + GPM 投影，可切換）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
+- `trainers.py`：23 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、AdaptiveDarkReplayEWC、PressureDarkReplayEWC、LookaheadDarkReplayEWC、RtpDarkReplayEWC、**OnlineEWCReplay / OnlineDarkReplayEWC（task-free 無邊界線上 Fisher 鞏固）**、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、NCMReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**、**FunctionSpaceReplay（Replay + DER++ 蒸餾 + GPM 投影，可切換）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
 - `run.py` / `run_one_combo.py`：主實驗腳本（命令行選模式、方法、seed、任務數；`--input-adapter` 開啟輸入轉接器，`--joint-batch/--joint-steps` 控制上界）。
 - `analyze.py`：彙整多 seed 實驗結果，輸出 JSON 與畫圖；缺 matplotlib 時用 Pillow 輸出圖表並產生 summary JSON。
 - `results_label_permuted.json` / `results_input_permuted.json`：9 種主方法的原始數據。
@@ -567,6 +596,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 - `results_*adaptive*_sanity.json`、`results_*confidence_dark*_sanity.json`、`results_*dark_baseline_sanity.json`：§12.2 adaptive/confidence-gated distillation 的短流 sanity。
 - `results_*pressure*.json`、`results_label_permuted_delayed_dark_*.json`：§12.3 reliability × forgetting-pressure 與 delayed DER++ maturity gate 實驗。
 - `results_rtp_longstream_label_permuted.json`（130 tasks）/ `results_rtp_conflicting_40.json`（40 tasks）/ `results_rtp_{20,80}_label_permuted.json`：§12.4 cos-RTP regime 偵測器的 3-seed 正式驗收（負面結果：RTP 退化成 ReplayEWC、拿不到長流 DER++ 增益）。
+- `results_taskfree_label_permuted.json` / `results_taskfree_misaligned137_label_permuted.json`：§13 P3 task-free（無邊界）對照——boundary vs OnlineEWCReplay/OnlineDarkReplayEWC，以及故意把鞏固步距錯位的穩健性檢驗。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。
