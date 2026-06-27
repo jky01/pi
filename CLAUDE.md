@@ -50,12 +50,13 @@ The project is a continual learning research benchmark with pure-numpy training 
 `MLP`: pure numpy 2-hidden-layer network with manual `forward`/`backward`. Supports single-head or multi-head (one output head per task, shared hidden layers). `diagnostics()` computes `eff_rank_h1/h2` (effective rank via SVD entropy, measures representation collapse) and `dead_frac_h1/h2` (fraction of always-zero ReLU units). `label_permuted` → `multi_head=True`; `input_permuted` → `multi_head=False`.
 
 ### Trainer hierarchy (`trainers.py`)
-All trainers implement `train_step(X, Y, task_idx) -> (loss, acc)` and `on_task_end(task_X, task_Y, task_idx)`. Registered in `TRAINER_REGISTRY` (28 methods):
+All trainers implement `train_step(X, Y, task_idx) -> (loss, acc)` and `on_task_end(task_X, task_Y, task_idx)`. Registered in `TRAINER_REGISTRY` (29 methods):
 
 ```
 Naive, Joint, EWC, Replay, ReplayEWC, DarkReplayEWC,
 AdaptiveDarkReplayEWC, PressureDarkReplayEWC,
 LookaheadDarkReplayEWC, RtpDarkReplayEWC, HorizonDarkReplayEWC,
+BenefitDarkReplayEWC,
 OnlineEWCReplay, OnlineDarkReplayEWC,
 GenerativeReplayEWC, NBGenerativeReplayEWC,
 ScholarGenerativeReplayEWC, ScholarGlobalGenerativeReplayEWC,
@@ -72,7 +73,8 @@ The sustainable-learning investigation (report §9) established that **forgettin
 Adaptive/regime-gated distillation status (report §12):
 - `AdaptiveDarkReplayEWC` and `PressureDarkReplayEWC` are useful safety gates, but too reactive to recover full long-stream DER++ gains.
 - `RtpDarkReplayEWC` is a negative result: task-onset shared-gradient cosine almost always shuts DER++ off, so it fails on 130-task label_permuted.
-- `HorizonDarkReplayEWC` (P2.7) is an oracle validation: known horizon can choose ReplayEWC-like behavior for short/conflicting streams and DER++ for standard long streams, but horizon alone is too crude (80-task × 2000 steps is a counterexample). Next open direction: online function-space benefit probe.
+- `HorizonDarkReplayEWC` (P2.7) is an oracle validation: known horizon can choose ReplayEWC-like behavior for short/conflicting streams and DER++ for standard long streams, but horizon alone is too crude (80-task × 2000 steps is a counterexample).
+- `BenefitDarkReplayEWC` (P2.8) is a partial negative result: one-step label-loss probes are safe but collapse to ReplayEWC on long streams; logit-MSE probes open DER++ but false-positive on short/conflicting/immature streams. Next open direction: multi-step / slow-timescale consolidation controller (P2.9).
 
 `HippocampalReplayEWCTrainer` overrides `loss_acc()` to blend MLP softmax with prototype-based episodic predictions at evaluation time (the buffer doubles as a hippocampal episodic memory). The blending weight is optionally uncertainty-gated by the MLP's top-2 margin.
 
