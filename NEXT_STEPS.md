@@ -25,6 +25,7 @@
 - **Adaptive distillation 初步結果（§12.2）**：`AdaptiveDarkReplayEWC` 可在 conflicting 下自動把 α 降到 0，退回 ReplayEWC、避免固定 DER++ 傷害；confidence gate 可減少低品質 logits 的副作用。但目前梯度 cosine 只能當安全閥，還不能自動判斷何時該在長流共享規則下打開 DER++。
 - **Pressure / maturity gating 邊界（§12.3）**：`PressureDarkReplayEWC`（可靠 logits × label-loss pressure）安全但偏保守，130-task 把 ReplayEWC **0.815→0.847**，仍低於 full DER++ **0.892**；logit drift 是假警報，delayed DER++ start=40/80 也不夠。下一步要做的是 **regime/horizon detector**，不是再調單一 batch-level gate。
 - **cos-RTP regime detector 失敗（§12.4，3-seed 驗收）**：task-onset 共享層梯度餘弦**不是**有效 regime 訊號——RTP 幾乎永遠判 conflicting、退化成 ReplayEWC，130-task 只有 **0.818**（< full DER++ 0.893）。機制完好（強制永遠開→0.898），病灶在訊號（多頭標籤排列污染共享層梯度方向）。教訓：局部/reactive/權重空間訊號（cosine、logit drift、label loss）都不足，要用 function-space 反事實量測或 horizon 訊號（→ P2.7）。
+- **P2.7 horizon oracle 驗證（§12.5，部分正面）**：`HorizonDarkReplayEWC` 證明「已知 horizon」可作上界 schedule：20-task label 關閉 DER++ 得 **0.873**（= ReplayEWC）、40-task conflicting 關閉得 **0.486**（= ReplayEWC）、80/130-task label 開啟得 **0.868/0.893**（= full DER++）。但 80-task × 2000 steps 反例顯示 horizon 長度本身不夠，還要看訓練 budget / function-space benefit。
 - **Task-free 的代價趨近於零（§13，P3）**：把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計後，80-task 下 ReplayEWC 0.818→0.826、DER++ 0.868→0.855（在 std 內）。核心配方（replay + Fisher-EWC + DER++）天生接近 task-free；邊界在此 regime 可有可無。
 - **Buffer-free 生成式回放長流反超 raw replay（§14，P4）**：`GenerativeReplayEWC` 不存原始樣本，label_permuted 80-task **0.916** 勝過 raw ReplayEWC 0.818 / DER++ 0.868（固定 buffer 在長流被稀釋、生成統計量不衰減）；但須條件在定義標籤的統計量上（sum-matched ablation 0.470→0.753），conflicting 多變規則下保真度不足（0.431<0.486）。
 - **rule-agnostic 生成回放：scholar teacher 補上 conflicting（§15，P5）**：NB 自分類器失敗（太弱，label 退步到 0.521）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher 對合成輸入蒸餾）conflicting 0.474（final/Joint 差 raw 僅 1.6%）、遺忘最低 0.082。沒有單一 buffer-free 生成器全勝（簡單統計量→sum-match；複雜規則→scholar）；殘留缺口源自因子化輸入保真度。
@@ -40,6 +41,7 @@
 - **P2 — Conflicting-task benchmark**：已新增真衝突任務、40-task scorecard、DER++ alpha sweep，詳見 §12.1。
 - **P2.5 — Pressure / maturity gating**：已實作 `PressureDarkReplayEWC`、confidence/loss-pressure gate、delayed DER++ maturity gate，並完成 20/80/130-task 對照，詳見 §12.3。
 - **P2.6 — Lookahead 與 RTP 動態 Regime 偵測器（已做完並 3-seed 驗收，結論為負面）**：實作了 Lookahead 與 cos-RTP 門控，但 **3-seed 正式驗收推翻初版「成功」結論**：cos-RTP 在 130-task label_permuted 只有 0.818（< full DER++ 0.893、甚至略低於 ReplayEWC 0.832），因為它幾乎永遠判 conflicting、退化成 ReplayEWC（alpha_mean≈0.011）。threshold 掃描證明機制完好（強制永遠開→0.898）、病灶是訊號（task-onset 梯度餘弦分不開共享規則長流 vs 真衝突）。詳見 §12.4.1/12.4.2。**P2.6 的目標（自動辨識何時值得 proactive consolidation）尚未達成 → 退回 backlog 為 P2.7。**
+- **P2.7 — Horizon oracle regime detector（已完成，§12.5，部分正面）**：實作 `HorizonDarkReplayEWC` 與 `--horizon-threshold/--horizon-override`。標準驗收下，oracle horizon gate 可在 20/40-task 關閉 DER++、在 80/130-task 開啟 DER++，同時貼近 ReplayEWC 安全性與 full DER++ 長流增益。限制：80-task × 2000 steps 顯示「任務數夠長」不一定代表 DER++ 立刻有益，下一步需改成 online function-space benefit probe。
 
 - **P3 — Task-free (無邊界) CL（已完成，§13）**：新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`，把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計（從 reservoir buffer 取樣）。80-task × 3 seeds：失去邊界知識的代價趨近於零（EWC +0.008、DER++ −0.012 在 std 內），無邊界 DER++ 仍勝過有邊界 ReplayEWC。
 - **P4 — Buffer-free / generative replay（已完成，§14）**：新增 `GenerativeReplayEWC`（完全不存原始樣本，per-(task,class) categorical 生成模型 + sum-matched conditional generation）。label_permuted 80-task buffer-free **0.916 反超** raw ReplayEWC 0.818 與 DER++ 0.868（長流 buffer 被稀釋、生成統計量不衰減）；conflicting 0.431 < raw 0.486（sum-matched 條件統計量對非 sum 規則不符）。
@@ -47,7 +49,7 @@
 - **P6 — 更強的輸入生成器（已完成，§16，負面結果）**：`ScholarGlobalGenerativeReplayEWC`（全域 per-task 邊際抽 on-manifold 輸入 + scholar 標註）**推翻 P5 的 on-manifold 歸因**——3-seed 全面更差（conflicting 0.428 < scholar-class 0.474；label 0.769 < 0.809），儘管 forgetting 最低（0.052），瓶頸是可塑性（diag 0.54→0.45）。per-class 集中回放比全域覆蓋更重要；殘留小差距更像真實樣本不可取代的價值（精確 per-class 聯合結構→正向後向遷移），非輸入分布失配。
 
 **下一個要做 / Todo**
-- **P2.7 — function-space / horizon regime 偵測器（接續 P2.6 的未竟目標）**：見下方 backlog。task-onset 權重梯度餘弦已證實無效，改用反事實 replay-accuracy 量測或 horizon 訊號。
+- **P2.8 — online function-space benefit detector（接續 P2.7 的限制）**：已知 horizon oracle 上界存在，但真正演算法不能偷看 stream 長度；下一步要用 replay-accuracy / diagonal harm 的反事實 probe，直接估計「開 DER++ 是否真的有益」。
 - **（可選）P6b — per-class autoregressive 生成器**：P6 證明「全域 on-manifold」方向錯；唯一還沒試的是 per-class **autoregressive**（抓類內位置相關）能否把 scholar-class 從 0.474 再推近 raw 0.486。但邊際空間極小（僅差 1.6% final/Joint），優先序低。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
@@ -106,18 +108,35 @@
 
 **結論**：機制完好，**task-onset 權重梯度餘弦不是有效的 regime 訊號**（多頭標籤排列把不同反傳誤差旋進共享層，污染梯度方向，使共享規則長流與真衝突都被判 conflicting）。P2.6 目標未達成，退回 backlog 成 P2.7。結果檔：`results_rtp_*.json`。
 
-### P2.7 — function-space / horizon regime detector（接續 P2.6 未竟目標）
-**要做的事情**：讓系統判斷目前 stream 是「共享規則長流（該開 DER++）」還是「真衝突/短流（該用 ReplayEWC）」，但**不要再用 task-onset 權重梯度餘弦**（P2.6 已證實無效），也不要再用 logit drift / label-loss（P2.3/P2.5 已證實是 reactive、假警報多）。
+### ✅/⚠️ P2.7 — Horizon oracle regime detector（已完成，§12.5，部分正面）
+**做完的事情**：實作 `HorizonDarkReplayEWC`，用已知/覆寫的 stream horizon 做 oracle gate：
+- 若 `horizon >= horizon_threshold`（預設 80），從一開始啟用 DER++，等價 `DarkReplayEWC α=0.5`。
+- 若 `horizon < horizon_threshold`，`_distill_age_scale=0`，等價 `ReplayEWC`。
+- CLI：`--horizon-threshold`、`--horizon-override`。`run.py` 也會記錄 `horizon/horizon_threshold/horizon_regime` diagnostics。
 
-- **為什麼**：full DER++ 在共享規則長流最強（130-task 0.893）但在真衝突/短流有害；ReplayEWC 安全但拿不到長流增益。需要一個能在線上、用**函數空間後果**判斷「開 DER++ 是否真的有益」的訊號。
-- **做法候選（依 P2.6 教訓更新）**：
-  - **反事實 replay-accuracy probe（首選）**：週期性做小型反事實量測——在一小批 replay 上比較「開 DER++ 蒸餾 vs 不開」對**舊任務 replay accuracy** 的影響，以及對**當前任務 diagonal** 的傷害。若舊任務有改善且新任務不受傷→開；否則→關。這是 function-space 後果量測，繞過 P2.6 的權重方向污染。
-  - **oracle validation 先做上界**：離線掃描「每段任務該開/關 DER++」的 schedule，確認存在「可學 schedule」能同時逼近 130-task DER++ 與 40-task ReplayEWC，再做線上 detector。若 oracle 都做不到，代表單一可切換 α 不夠，需要更細的 per-layer / per-task 蒸餾。
-  - **horizon 訊號**：估計剩餘 stream 長度 / 任務重複度；長流才值得 proactive consolidation。
-- **驗收**（同 P2.6，未變）：
+**標準驗收結果（3 seeds）**：
+- label_permuted 20-task × 4000：**0.873 ± 0.015**，`horizon_regime=short`、`alpha_mean=0`，貼近 ReplayEWC（短流保守）。
+- label_permuted 80-task × 4000：**0.868 ± 0.019**，`horizon_regime=long`、`alpha_mean=0.5`，等價 full DER++，高於 ReplayEWC 0.818。
+- label_permuted 130-task × 4000：**0.893 ± 0.019**，等價 full DER++，達成 ≥0.87 目標。
+- conflicting 40-task × 3000：**0.486 ± 0.002**，`alpha_mean=0`，等價 ReplayEWC，避開 DER++ 在真衝突時的傷害。
+
+**限制 / 新教訓**：
+- 這不是完整 detector，而是 oracle validation。它證明「可切換 schedule」存在：同一套 trainer 可以同時拿到短流/衝突安全性與長流 DER++ 增益。
+- 但 **horizon 長度本身不夠**：80-task × 2000 steps 下，Horizon/DarkReplayEWC **0.736** < ReplayEWC **0.788**。也就是「任務數長」還要搭配足夠訓練 budget / replay 品質，DER++ 才值得開。
+- 因此 P2.7 把問題縮小成：不要再問「能不能切換」，而是問「如何在線上估計 DER++ 的函數空間收益」。
+
+### P2.8 — online function-space benefit detector（下一步）
+**要做的事情**：真正線上化 P2.7，不偷看 `n_tasks`。用反事實 probe 直接估計「開 DER++ 是否改善舊任務、且不傷新任務」。
+
+- **為什麼**：P2.6 證明 task-onset 權重梯度餘弦無效；P2.7 證明 oracle schedule 存在，但 horizon 太粗。下一步需要 function-space 後果訊號，而不是權重空間或單純任務數。
+- **做法候選**：
+  - **replay-accuracy probe（首選）**：每隔固定步數，在小 replay batch 上做兩個虛擬更新（DER++ on/off），比較舊任務 replay accuracy/loss 改善量與當前 batch loss 傷害；若舊任務改善超過門檻且新任務傷害小，逐步提高 α。
+  - **budget-aware horizon gate**：把 horizon、每任務步數、buffer 每任務覆蓋率合成一個 maturity score，避免 80-task × 2000 這種「長但未成熟」反例。
+  - **hybrid policy**：horizon/budget 只當先驗，最終開關由 function-space probe 決定。
+- **驗收**：
   - label_permuted 130-task：接近 full DER++（目標 ≥0.87）。
-  - conflicting 40-task：接近 ReplayEWC（目標 final/Joint 不低於 ReplayEWC 2%）。
-  - label_permuted 20/80-task：不能明顯低於 ReplayEWC。
+  - conflicting 40-task：接近 ReplayEWC（final/Joint 不低於 ReplayEWC 2%）。
+  - label_permuted 20/80-task：不能明顯低於 ReplayEWC；且 80-task × 2000 不應重犯 Horizon oracle 的誤開問題。
 
 ### ✅ P3 — Task-free（無邊界）CL（已完成，§13）
 **做完的事情**：新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`（`trainers.py`）。`on_task_end` 改 no-op；Fisher/anchor 改由 `_online_consolidate_fisher` 每 `consolidate_every` 步從 reservoir buffer 取樣估計（多頭按 head 分組前傳），squared-grad 累加與 `fisher_decay` EMA 與邊界版一致，`lam` 可沿用。CLI：`--consolidate-every`、`--fisher-sample`。smoke test 三 mode 全過。
@@ -162,9 +181,9 @@
 
 **結論**：殘留缺口不是 on-manifold 與否的問題。scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw conflicting 有 +BWT、合成回放沒有）。P4–P6 總結：不存原始樣本可行且常足夠（長流甚至贏 raw），完全追平 raw 仍有一道由真實樣本聯合結構撐起的小硬牆。唯一未試：per-class autoregressive（見上方 Todo P6b，優先序低）。
 
-## 3. 建議順序與理由（P1/P2/P2.5/P3/P4/P5/P6 已完成；P2.6 做完但結論為負面）
+## 3. 建議順序與理由（P1/P2/P2.5/P3/P4/P5/P6/P2.7 已完成；P2.6 負面、P2.7 部分正面）
 
-1. **P2.7（function-space / horizon regime detector）** — 接續 P2.6 未竟目標（自動切換 DER++），但 P2.6 已證實 task-onset 權重梯度餘弦無效，要改用反事實 replay-accuracy probe，風險較高；建議**先用 oracle validation 確認可學 schedule 存在**再投入。這是目前 backlog 中最有開放價值的題目。
+1. **P2.8（online function-space benefit detector）** — P2.7 已用 horizon oracle 證明可切換 schedule 存在，但 horizon 太粗，80-task × 2000 steps 會誤開 DER++。下一步應直接量測「開 DER++ 後舊任務 replay accuracy 是否改善、當前任務是否受傷」，這是目前 backlog 中最有開放價值的題目。
 2. **（可選）P6b（per-class autoregressive 生成器）** — 邊際空間極小（scholar-class 距 raw 僅 1.6%），優先序低。
 
 ## 4. 慣例

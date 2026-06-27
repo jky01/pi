@@ -7,29 +7,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
+# Required local interpreter (system python/python3 lacks numpy here)
+PY=/Users/jackyyeh/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3
+
 # Run the full benchmark (saves results_<mode>.json)
-python run.py label_permuted
-python run.py input_permuted
+$PY run.py label_permuted
+$PY run.py input_permuted
 
 # Run specific methods / seeds / hyperparameters
-python run.py label_permuted --methods ReplayEWC HippocampalReplayEWC --seeds 0 1 --n-tasks 40
+$PY run.py label_permuted --methods ReplayEWC HippocampalReplayEWC --seeds 0 1 --n-tasks 40
 
 # Joint offline upper bound (ceiling for final_avg_acc; ignore its BWT/diagonal)
-python run.py label_permuted --methods Joint --output results_joint_label_permuted.json
+$PY run.py label_permuted --methods Joint --output results_joint_label_permuted.json
 
 # input_permuted with a per-task input adapter (breaks the single-head ~11% floor)
-python run.py input_permuted --methods Naive Joint --input-adapter --output results_adapter.json
+$PY run.py input_permuted --methods Naive Joint --input-adapter --output results_adapter.json
 
 # Generate summary stats and PNG figures from results
-python analyze.py label_permuted
-python analyze.py input_permuted
+$PY analyze.py label_permuted
+$PY analyze.py input_permuted
 
-# Smoke tests (all methods × both modes, tiny scale)
-python -m unittest test_smoke.py
+# Smoke tests (all methods × label/input/conflicting modes, tiny scale)
+$PY -m unittest test_smoke
 
 # Run a single (method, seed, hyperparams) combo — used for tuning
-python run_one_combo.py
-python tune_replay_ewc.py
+$PY run_one_combo.py
+$PY tune_replay_ewc.py
 ```
 
 ## Architecture
@@ -41,43 +44,42 @@ The project is a continual learning research benchmark with pure-numpy training 
 - **`label_permuted`** — same input encoding per task, but label→class mapping is randomly permuted per task. This is Task-IL; the model is multi-head.
 - **`input_permuted`** — label mapping is identity, but input features are permuted per task. This is Domain-IL; the model is single-head.
 - **`class_il`** — single head over a global label space of `10×n_tasks` fine-grained sum-buckets, **no task id at inference**. Each task owns a disjoint contiguous slice of sum-buckets (a distinct sum-range), built by scanning all windows and grouping by global bucket (`_build_class_il`). The honest hard test (report §11): the linear head suffers catastrophic recency bias (DER++ *hurts* here), but `NCMReplayEWC` (nearest-class-mean prototype readout) fixes it — **0.31 → 0.858, forgetting → 0.06**. Benchmark caps at ~200 classes (K=8 sum has only ~73 distinct values).
+- **`conflicting`** — multi-head Task-IL, but the underlying task rule rotates across sum / weighted sum / half-window sums / adjacent-product features. This is the main true-conflict benchmark (report §12): ReplayEWC is the safe backbone, while fixed DER++ can over-constrain learning.
 
 ### Model (`model.py`)
 `MLP`: pure numpy 2-hidden-layer network with manual `forward`/`backward`. Supports single-head or multi-head (one output head per task, shared hidden layers). `diagnostics()` computes `eff_rank_h1/h2` (effective rank via SVD entropy, measures representation collapse) and `dead_frac_h1/h2` (fraction of always-zero ReLU units). `label_permuted` → `multi_head=True`; `input_permuted` → `multi_head=False`.
 
 ### Trainer hierarchy (`trainers.py`)
-All trainers implement `train_step(X, Y, task_idx) -> (loss, acc)` and `on_task_end(task_X, task_Y, task_idx)`. Registered in `TRAINER_REGISTRY`:
+All trainers implement `train_step(X, Y, task_idx) -> (loss, acc)` and `on_task_end(task_X, task_Y, task_idx)`. Registered in `TRAINER_REGISTRY` (28 methods):
 
 ```
-NaiveTrainer                          # SGD lower bound
-JointTrainer                          # offline i.i.d. upper bound (unbounded buffer, breaks compute parity)
-ReplayTrainer                         # reservoir buffer, uniform sampling
-  TaskBalancedReplayTrainer           # per-task reservoir, balanced slots
-    ReplayContinualBackpropTrainer    # +continual backprop (neuron recycling)
-  BennaFusiReplayTrainer              # +Benna-Fusi complex synapses (instead of EWC)
-  ReplayEWCTrainer                    # +online EWC regularization
-    SustainableReplayEWCTrainer       # +Fisher-protected neuron recycling (plasticity w/o memory damage)
-    DarkReplayEWCTrainer              # +logit-consistency loss on replayed items
-      FunctionSpaceReplayTrainer      # +DER++ distillation +GPM gradient projection (toggleable ablation)
-    SurpriseReplayEWCTrainer          # +surprise-prioritized replay (top-K CE loss)
-      MarginSurpriseReplayEWCTrainer  # +low-margin boundary priority
-      HippocampalReplayEWCTrainer     # +episodic prototype memory at inference
-        NCMReplayEWCTrainer           # nearest-class-mean readout (iCaRL-style); solves Class-IL recency bias
-EWCTrainer                            # EWC only (no replay)
-ContinualBackpropTrainer              # neuron recycling only (no replay)
-BennaFusiTrainer                      # multi-timescale complex synapses, online (no replay/Fisher); --bf-dt knob
+Naive, Joint, EWC, Replay, ReplayEWC, DarkReplayEWC,
+AdaptiveDarkReplayEWC, PressureDarkReplayEWC,
+LookaheadDarkReplayEWC, RtpDarkReplayEWC, HorizonDarkReplayEWC,
+OnlineEWCReplay, OnlineDarkReplayEWC,
+GenerativeReplayEWC, NBGenerativeReplayEWC,
+ScholarGenerativeReplayEWC, ScholarGlobalGenerativeReplayEWC,
+SurpriseReplayEWC, MarginSurpriseReplayEWC, HippocampalReplayEWC,
+NCMReplayEWC, TaskBalancedReplay,
+ContinualBP, ReplayContinualBP, SustainableReplayEWC,
+BennaFusi, BennaFusiReplay, FunctionSpaceReplay
 ```
 
 The sustainable-learning investigation (report §9) established that **forgetting, not plasticity, is the bottleneck wherever replay is present** — the diagonal keeps rising to 250 tasks. So `SustainableReplayEWC` (Fisher-protected recycling) and `BennaFusi` (power-law forgetting) are both validated mechanisms that only pay off in the **replay-free** regime; with replay, Fisher-selective `ReplayEWC` dominates. `bf_dt` is the stability↔plasticity knob for Benna-Fusi.
 
 `FunctionSpaceReplayTrainer` (report §10) attacks forgetting in function space: Replay + DER++ logit distillation + GPM gradient projection, all toggleable (`use_gpm`, `dark_alpha`, `lam`). The ablation found **GPM is counterproductive here** — it protects against input-subspace shift, but these tasks have stationary inputs (label_permuted permutes labels; adapters restore canonical inputs), so GPM freezes the shared layers. **DER++ logit distillation is the win**: `DarkReplayEWC` (= Replay+EWC+distillation, `--dark-alpha 0.5`) drives 130-task retention to ~1.0 (BWT≈0), the project's best anti-forgetting result. Lesson: anchor the *function* (outputs), not weights or input subspaces.
 
+Adaptive/regime-gated distillation status (report §12):
+- `AdaptiveDarkReplayEWC` and `PressureDarkReplayEWC` are useful safety gates, but too reactive to recover full long-stream DER++ gains.
+- `RtpDarkReplayEWC` is a negative result: task-onset shared-gradient cosine almost always shuts DER++ off, so it fails on 130-task label_permuted.
+- `HorizonDarkReplayEWC` (P2.7) is an oracle validation: known horizon can choose ReplayEWC-like behavior for short/conflicting streams and DER++ for standard long streams, but horizon alone is too crude (80-task × 2000 steps is a counterexample). Next open direction: online function-space benefit probe.
+
 `HippocampalReplayEWCTrainer` overrides `loss_acc()` to blend MLP softmax with prototype-based episodic predictions at evaluation time (the buffer doubles as a hippocampal episodic memory). The blending weight is optionally uncertainty-gated by the MLP's top-2 margin.
 
 `JointTrainer` stores all seen samples and trains on i.i.d. mini-batches sampled from the union of all tasks. It deliberately breaks compute/memory parity, so it is only a ceiling — report its `final_avg_acc`, not its BWT/diagonal (it is not a sequential learner, so those metrics are artifacts). Run it explicitly via `--methods Joint`; it is not in `DEFAULT_METHODS`.
 
 ### Per-task input adapter (`model.py`, `--input-adapter`)
-For `input_permuted`, a single shared `W1` cannot invert 80 different input permutations. `MLP(input_adapter=True)` adds one identity-initialized `in_dim × in_dim` matrix per task (`self.adapters[task_idx]`), applied as `X @ adapter` before `W1`. Each task's adapter learns to map its permuted input back into the shared network's canonical space, so the shared layers only need to learn one `sum→bucket` function. Adapter-correct trainers: `Naive` and `Joint` (they forward each sample with its own `task_idx`). Replay-based trainers do **not** yet route replayed samples through the right adapter — adding that requires per-task grouping in the single-head replay path.
+For `input_permuted`, a single shared `W1` cannot invert 80 different input permutations. `MLP(input_adapter=True)` adds one identity-initialized `in_dim × in_dim` matrix per task (`self.adapters[task_idx]`), applied as `X @ adapter` before `W1`. Each task's adapter learns to map its permuted input back into the shared network's canonical space, so the shared layers only need to learn one `sum→bucket` function. Replay and memory paths are adapter-correct: replayed samples are grouped/routed by their stored `task_idx`, so old samples use the right adapter.
 
 `on_task_end` is where EWC computes Fisher diagonals and updates anchors; `HippocampalReplayEWC` also runs optional sleep-consolidation replay steps here.
 

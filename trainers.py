@@ -10,12 +10,15 @@
                             — DarkReplayEWC + gradient-conflict gated distillation。
 7. PressureDarkReplayEWCTrainer
                             — DarkReplayEWC + reliability × forgetting-pressure distillation。
-8. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
-9. MarginSurpriseReplayEWCTrainer
+8. HorizonDarkReplayEWCTrainer
+                            — oracle horizon-gated DER++：長流開 logits distillation，
+                              短流/衝突關閉，驗證 P2.7 regime 訊號需求。
+9. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
+10. MarginSurpriseReplayEWCTrainer
                             — ReplayEWC + loss/surprise + low-margin boundary replay。
-10. HippocampalReplayEWCTrainer
+11. HippocampalReplayEWCTrainer
                             — SurpriseReplayEWC + episodic prototype memory at inference。
-11. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
+12. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
                               重置「低效用、夠老」的死/低貢獻單元，其餘權重完全
                               不動——這是對話第一輪明確回答「不重置權重」的機制，
                               主打可塑性流失（失效 B），跟前兩者主打遺忘（失效 A）形成對照。

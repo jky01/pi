@@ -142,6 +142,10 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
         trainer_diagnostics["dark_effective_alpha_mean"] = float(np.mean(dark_alpha_trace))
         trainer_diagnostics["dark_effective_alpha_tail_mean"] = float(np.mean(dark_alpha_trace[-tail_n:]))
 
+    for attr in ["horizon", "horizon_threshold", "horizon_regime"]:
+        if hasattr(trainer, attr):
+            trainer_diagnostics[attr] = getattr(trainer, attr)
+
     for attr, out_key in [
         ("pressure_weight_trace", "pressure_dark_weight"),
         ("reliability_trace", "pressure_dark_reliability"),
