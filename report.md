@@ -2,7 +2,7 @@
 
 ## 0. 主要結果摘要（TL;DR）
 
-純 numpy 手刻的 80→64→64→10 MLP，在 pi 數位構造的 Permuted-Pi-Digits 長串流上測 15 種持續學習機制。三個分階段的主要結論：
+純 numpy 手刻的 80→64→64→10 MLP，在 pi 數位構造的 Permuted-Pi-Digits 長串流上測 15 種持續學習機制。主要結論：
 
 **(A) 兩種任務流、兩種瓶頸**（80 tasks，final average accuracy，3 seeds）
 
@@ -27,6 +27,8 @@
 遺忘是函數空間干擾，不是權重位移。實作可切換的 `FunctionSpaceReplay`（Replay + DER++ 蒸餾 + GPM 投影）做消融：GPM 因本 benchmark 輸入平穩而凍結共享層（不適配），但 **DER++ logit 蒸餾**有效——在 130-task 串流上把 final 從 ReplayEWC 的 0.815 抬到 **0.892**、**retention→1.01（淨遺忘≈0）**、BWT→0、方差砍 4 倍。**優勢隨串流變長而複利放大**：250 tasks 時領先從 +7.7 拉到 **+14.2 分**（0.680→0.822），retention 仍 0.97。
 
 **(E) 校正＋補強：機制隨設定而變**（§11）。拿掉 task ID 改測 **Class-IL**（單頭、200 類）後，Task-IL 的英雄 **DER++ 反轉成有害**（病灶＝線性頭 recency bias）。但把讀出換成 **NCM 原型分類器（`NCMReplayEWC`，iCaRL 式）**就把缺口幾乎補滿：**0.312 → 0.858、遺忘 0.50→0.06、retention >1.0**（超過線性頭 Joint 0.742）。**誠實答案**：Task-IL 與 Class-IL 在本 benchmark 都已有接近上界的配置；跨設定穩健的骨幹是 **replay + Fisher-EWC**，再依設定換對的讀出（Task-IL：head+DER++；Class-IL：無偏原型）。距「通用持續學習」仍有任務衝突 / 無 buffer / 無邊界 / 規模等硬牆（見 `NEXT_STEPS.md`）。
+
+**(F) 真衝突任務修正了「最終答案」**（§12）。新增 `conflicting` mode：task 輪換不同底層函數（sum / weighted sum / half-window sum / adjacent product），仍用多頭隔離 head，專測共享層衝突。40-task 結果：Joint 上界 **0.643**，ReplayEWC **0.486**（final/Joint 0.756），DER++ α=0.5 **0.449**（final/Joint 0.698）。DER++ 雖降低 forgetting（0.112→0.087），但 final 更差，表示函數錨定在底層規則真衝突時會過度保守。更新後的答案：**跨設定穩健骨幹是 replay + Fisher-EWC；DER++ / NCM / adapter / episodic readout 是依 regime 開關的模組，不是永遠打開的單一解。**
 
 ---
 
@@ -383,7 +385,34 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 
 **修正後的結論（回答「是不是找到持續學習演算法」）：在本 benchmark 上，Task-IL 與 Class-IL 都已有接近上界的配置**——Task-IL 用 Replay+EWC+DER++（retention~1.0），Class-IL 用 **Replay+EWC + NCM 原型讀出**（0.858、遺忘 0.06）。**但關鍵教訓是「對的機制隨設定而變」**：DER++ 在 Task-IL 是英雄、在 Class-IL 是負擔；真正跨設定穩健的是 replay + Fisher-EWC 當表徵學習骨幹，再依設定換上對的讀出（Task-IL 用 head + 蒸餾，Class-IL 用無偏原型）。距離「通用持續學習」仍有 §11.4 之後的硬牆（任務真正衝突、無 buffer、無邊界、規模）。
 
-## 12. 結論
+## 12. Conflicting-task benchmark：任務真的衝突時，DER++ 不再是萬用答案
+
+前面幾個強結果有一個共同前提：多數任務骨子裡共享同一個 `sum→bucket` 函數，差異主要由 head、adapter 或 readout 吸收。這很適合研究遺忘，但可能太友善。為了測試「學新任務會不會真的破壞舊共享層解」，我們新增 `conflicting` mode：仍是多頭 Task-IL，但每個 task 輪換不同底層函數：
+
+`sum / weighted_sum / first_half_sum / second_half_sum / adjacent_product_sum`
+
+每個函數都用自己的 calibration quantile 切成 10 類，因此類別分布近似平衡；輸出 head 仍按 task 隔離，所以主要壓力落在共享層是否能同時支援互相衝突的特徵需求。
+
+### 12.1 Scorecard：40 tasks × 3000 steps × 3 seeds
+
+| 方法 | final | final / Joint | BWT | mean forgetting | retention |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Naive | 0.245 ± 0.032 | 0.381 | -0.328 | 0.333 | 0.433 |
+| **ReplayEWC** | **0.486 ± 0.001** | **0.756** | -0.054 | 0.112 | 0.902 |
+| DarkReplayEWC α=0.1 | 0.463 ± 0.003 | 0.719 | -0.074 | 0.102 | 0.866 |
+| DarkReplayEWC α=0.25 | 0.458 ± 0.004 | 0.711 | -0.066 | 0.093 | 0.877 |
+| DarkReplayEWC α=0.5 | 0.449 ± 0.006 | 0.698 | -0.060 | **0.087** | 0.885 |
+| Joint（離線上界） | **0.643 ± 0.007** | 1.000 | — | — | — |
+
+三個結論：
+
+1. **conflicting benchmark 可學，但明顯比原始 Task-IL 硬。** Joint 上界只有 0.643，不再是 `label_permuted` 的 0.993。ReplayEWC 可達上界的 75.6%，說明 replay + Fisher-EWC 仍是穩健骨幹，但剩下 24% 的 joint gap 也顯示共享層衝突是真實存在的。
+2. **DER++ 在真衝突任務下出現穩定性–可塑性 tradeoff。** α 越大，mean forgetting 越低（0.112→0.087），但 final/Joint 越差（0.756→0.698）。這代表 logit 蒸餾確實保護舊函數，卻同時讓共享層不夠自由去學新底層規則；在原始 Task-IL 是英雄，在 conflicting mode 變成過度保守。
+3. **「可持續學習演算法」更像模組化 policy，而不是單一永遠開啟的 trainer。** 目前最穩的共同骨幹是 Replay + Fisher-EWC。DER++ 應該根據任務衝突程度調整強度，Class-IL 應改用 NCM readout，input-permuted 需要 adapter，episodic readout 只在部分 Task-IL 有利。下一步不是再宣稱某個方法全勝，而是做 adaptive gating：偵測新任務與舊函數是否衝突，再決定蒸餾/記憶/adapter 的權重。
+
+這一節把 §10 的結論校正得更精確：**Replay + Fisher-EWC + DER++** 是「共享底層函數、主要問題是遺忘」時的最強方案；若底層函數彼此衝突，DER++ 需要降權或自適應，否則會犧牲可塑性與 final/Joint ratio。
+
+## 13. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -395,6 +424,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 8.  **Benna-Fusi 複雜突觸：冪律遺忘有效，但棲位在 replay-free（§9.4）**：純 `BennaFusi` 把遺忘從 0.23 壓到 0.03，驗證冪律記憶有效；但它各向同性地拖住所有權重，在有 replay 時被 Fisher-selective 的 ReplayEWC 完全支配。它的真正價值是 replay-free / Fisher-free 的線上鞏固——80-task 下把 Naive 的 29% 翻倍到 53%、逼近 EWC 的 58% 且遺忘更低，且完全不存樣本、不算 Fisher。這把「該用哪種穩定機制」收斂成一條清楚的設計準則：能存樣本就用 replay(+EWC)，不能存樣本才換複雜突觸。
 9.  **直攻遺忘的答案：函數空間錨定（DER++ logit 蒸餾）（§10）**：遺忘是函數空間干擾。混合式 `FunctionSpaceReplay` 的消融顯示，**GPM 梯度投影不適配平穩輸入的本 benchmark（凍結共享層）**，但 **DER++ logit 蒸餾**有效——在 130-task 串流上把 final 從 0.815 抬到 **0.892**、淨遺忘 retention→**1.01**、BWT→0、方差砍 4 倍，且優勢隨串流變長複利放大（250 tasks 領先 +14.2 分、retention 仍 0.97）。**Replay + Fisher-EWC + DER++ 蒸餾**是本專案目前最有效、且抗遺忘隨串流增強的演算法，也是設計教訓：對「函數」做錨定（輸出/logits）比對「權重」或對「輸入子空間」做約束更貼合本問題的遺忘來源。
 10. **Class-IL 校正並隨後補強（§11）**。拿掉 task ID（單頭、200 類）後，Task-IL 的英雄 **DER++ 反轉成有害**（0.23 < 純 ReplayEWC 0.31），病灶是線性頭的 recency/magnitude bias。**把讀出換成 NCM 原型分類器（iCaRL 式，`NCMReplayEWC`）後，缺口幾乎補滿：0.31 → 0.858、遺忘 0.50 → 0.06、retention >1.0**（甚至超過線性頭 Joint 0.742）。關鍵教訓：**對的機制隨設定而變**——跨設定穩健的是 replay + Fisher-EWC 當表徵骨幹，再依設定換對的讀出（Task-IL：head + DER++ 蒸餾；Class-IL：無偏原型）。benchmark 的 Class-IL 規模上限 ~200 類（K=8 位數和僅 ~73 個相異值）。
+11. **Conflicting-task 校正了通用性判斷（§12）**。當 task 的底層函數真的不同，ReplayEWC 仍是最穩骨幹（final/Joint 0.756），但 DER++ α=0.5 反而降低 final/Joint 到 0.698；它降低 forgetting，卻阻礙學新衝突規則。這把「最終答案」從單一 trainer 改成一個設計原則：**replay + Fisher-EWC 是核心骨幹；DER++、NCM、adapter、episodic readout 是依 task regime 自適應開關的模組。**
 
 ---
 
@@ -413,6 +443,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 - `results_derpp_longstream_label_permuted.json`（130 tasks）/ `results_derpp_verylong_label_permuted.json`（250 tasks）：§10 函數空間 / DER++ 抗遺忘實驗。
 - `results_classil_label.json` / `results_classil_dark01.json`：§11 Class-IL（誠實硬測試）實驗。
 - `results_classil_ncm.json` / `results_classil_ncm_trainer.json`：§11.3 NCM 原型分類器解 Class-IL 缺口。
+- `results_conflicting_*.json`：§12 任務底層函數真衝突 benchmark 與 DER++ alpha sweep。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

@@ -49,6 +49,14 @@
   - ReplayEWC：**0.504 ± 0.007**，final/Joint **0.852**，BWT -0.005，forget 0.083，retention 0.992。
   - DarkReplayEWC（DER++ α=0.5）：**0.456 ± 0.004**，final/Joint **0.771**，BWT -0.035，forget 0.064，retention 0.932。
   初步結論：conflicting benchmark 可學但明顯更硬；DER++ 在原始 Task-IL 長流是英雄，但在底層函數真衝突時會拖累 final/Joint ratio。這支持「沒有單一全勝機制，應依任務衝突程度調整函數錨定強度」。
+- **40-task scorecard（3000 steps × 3 seeds，已寫入 `report.md` §12）**：
+  - Joint：**0.643 ± 0.007**。
+  - Naive：0.245 ± 0.032，final/Joint 0.381，forget 0.333。
+  - **ReplayEWC：0.486 ± 0.001，final/Joint 0.756，BWT -0.054，forget 0.112，retention 0.902。**
+  - DarkReplayEWC α=0.1：0.463 ± 0.003，final/Joint 0.719，forget 0.102。
+  - DarkReplayEWC α=0.25：0.458 ± 0.004，final/Joint 0.711，forget 0.093。
+  - DarkReplayEWC α=0.5：0.449 ± 0.006，final/Joint 0.698，forget 0.087。
+  結論：α 越大，forgetting 越低，但 final/Joint 越差。DER++ 在「共享底層函數」時是英雄，在「底層函數真衝突」時會過度錨定。下一步應做 **adaptive distillation strength / conflict detector**，而不是固定開 DER++。
 
 ### P3 — Task-free（無邊界）CL
 - **為什麼**：目前都靠 `on_task_end`（算 Fisher、更新 adapter/GPM 基、Class-IL 切片）——等於知道任務何時切換。真實串流沒有邊界。
