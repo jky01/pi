@@ -60,6 +60,8 @@
 
 **(U) P8c：放大到真 ResNet18——「持續變強」隨容量放大**（§21）。把 P8b 的 backbone 從小 CNN 換成 CIFAR-adapted ResNet18（~11M 參數、end-to-end、MPS GPU），探針/資料流不變。正向遷移**更大且累積更陡**：Δ@40 overall **+0.232**（小 CNN +0.174）、late(15-19) **+0.356**（小 CNN +0.282），continual late 絕對 5-way acc 衝到 **0.73–0.75**（fresh ~0.35），per-task Δ 單調爬升到 task18 **+0.412**。「持續變強」**不是小模型玩具效應，隨容量放大**。P7–P8c 總收束：抗遺忘是跨 benchmark/表徵/容量的真知識；累積學習可達、充要條件為「表徵持續建構 × 可塑性持續維持」且隨規模增強；剩下的硬牆是把這套累積搬到無 buffer / 開放世界 / 可塑性維持甜蜜點。結果檔 `results_backbone_transfer_resnet18_cifar100.json`。
 
+**(V) P8d：穩定–可塑性甜蜜點——DER++ 同時放大正向遷移與 retention**（§22）。把會動 ResNet18 的維持機制從 plain Replay 換成 DER++（replay CE + logit 蒸餾 α=0.5），同框架量兩軸。**DER++ 兩軸全勝、無 tradeoff**：正向遷移 Δ@40 **+0.268**（replay +0.180）、late +0.378（+0.292）；retention mean_final **0.641**（0.564）；兩者 mean_forgetting 皆為負＝**backward transfer**（舊任務後來變更好），DER++ 更明顯(-0.033)。logit 蒸餾**沒有可塑性稅**，反而把舊函數壓進更條件良好的共享表徵、讓新任務學更快——§10 的「最佳抗遺忘法」升級為「最佳累積學習法」。**「持續變強」配方至此完整**：表徵持續建構 × replay 保可塑性 × DER++ 函數蒸餾 × 隨容量放大，統一了 replay/§9/§10 三主線。結果檔 `results_p8d_{replay,derpp}_resnet18.json`。
+
 ---
 
 ## 1. 目的
@@ -1003,7 +1005,46 @@ replay 在早期 task 也會重播**當前 task 自己的樣本**，等於對當
 
 ---
 
-## 22. 結論
+## 22. 穩定–可塑性甜蜜點：DER++ 在會動的 backbone 上同時放大正向遷移與 retention（P8d）
+
+**為什麼**：P8b/P8c 用 plain Replay 維持可塑性就拿到隨容量放大的正向遷移。但「持續變強」與「持續不忘」是否能**同時**最大化？把 continual 的維持機制換成本專案驗證過的最佳抗遺忘法 **DER++（replay CE + logit 蒸餾，§10）**，會放大累積、還是因錨定舊函數而付出可塑性稅（拖慢新任務）？
+
+**做法**：與 P8c 同框架（ResNet18、Split-CIFAR-100、20 tasks、2 seeds、MPS），同一份程式同時量**兩個軸**：
+- **正向遷移**：task-k 受限 5-way 學習速度（continual vs fresh-from-scratch）。
+- **retention**：全程結束後用終態 continual 模型回評每個 task 的受限 5-way acc，對比剛學完時 → `mean_forgetting = diag − final`（負值＝舊任務後來變更好＝backward transfer）。
+對照 `--continual-mode replay` vs `derpp`（`--dark-alpha 0.5`）。
+
+### 22.1 結果：DER++ 兩個軸都更好，沒有 tradeoff
+
+| continual 機制 | 正向遷移 Δ@40 overall | 正向遷移 late(15-19) | mean_final（retention） | mean_forgetting |
+| :--- | :---: | :---: | :---: | :---: |
+| Replay | +0.180 | +0.292 | 0.564 | **-0.012** |
+| **DER++（α=0.5）** | **+0.268** | **+0.378** | **0.641** | **-0.033** |
+
+- **DER++ 正向遷移更強**：Δ@40 +0.268 > replay +0.180，late +0.378 > +0.292。logit 蒸餾**不但沒有拖慢**新任務學習，反而讓 continual 學新 task 更快（蒸餾把舊函數壓進一個更條件良好的共享表徵，新任務從中受益）。
+- **DER++ retention 更高**：mean_final 0.641 > 0.564。
+- **兩者 mean_forgetting 都是負的**＝**backward transfer**：舊任務在後續學習中**還變更好**（會動的 backbone + replay 把舊類的表徵越磨越利），DER++ 更明顯（-0.033）。
+
+**結論**：在會動的 backbone 上，穩定與可塑性**不是 tradeoff，而是同向**——DER++ 同時把正向遷移、retention、backward transfer 三者都推到比 plain replay 更好。函數空間蒸餾（§10 的 numpy 主結果）在這裡從「最佳抗遺忘法」升級成「最佳累積學習法」。
+
+### 22.2 收束：P8 系列把「持續變強」做成一條可放大的配方
+
+| 層級 | 機制 | 正向遷移 |
+| :--- | :--- | :--- |
+| 表徵 frozen（P10） | 任意 | ≈0（封頂，無可累積） |
+| 表徵會動 + Naive（P8b） | 無維持 | 負（loss of plasticity） |
+| 表徵會動 + Replay（P8b/P8c） | 保可塑性 | 正，隨容量放大 |
+| 表徵會動 + **DER++**（P8d） | 函數空間蒸餾 | **更強正向遷移 + 更高 retention + backward transfer** |
+
+**「持續變強」的配方至此清楚**：(1) 讓表徵持續被建構（非 frozen）；(2) 用 replay 維持可塑性、擋掉 naive 崩潰；(3) 用 DER++ 函數空間蒸餾，把累積同時推向正向遷移與抗遺忘的甜蜜點；(4) 隨模型容量放大。這條配方統一了本專案全部主線——replay（防遺忘）、§9（防可塑性流失）、§10（函數空間蒸餾）——並回答了最初的問題：**在這個 regime 下，系統確實會「越學越快、且越學越記得住」。**
+
+**限制 / 下一步**：仍依賴 replay buffer（剩下的真硬牆＝無 buffer 累積，P9）；絕對準確率受小規模/少步數所限（continual @80 ~0.61）；α 未掃描。
+
+**結果檔**：`results_p8d_replay_resnet18.json`、`results_p8d_derpp_resnet18.json`。
+
+---
+
+## 23. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -1031,6 +1072,7 @@ replay 在早期 task 也會重播**當前 task 自己的樣本**，等於對當
 24. **正向遷移量測：是「持續不忘」不是「持續變強」（§19，P10）**。到 P8 為止所有指標都是「別忘記」。P10 在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head，用 task-k 受限 5-way acc 隔離「新任務本身學多快」。結果：**每一個步數預算下持續模型都不比 fresh 快、反而略慢**（Δ@2/5/10/20 = -0.037/-0.022/-0.008/-0.013），且**不隨經驗增長**（early≈late）。Naive-continual 對照(隱藏層自由累積)Δ≈0，分離出因果：**主因是 frozen backbone 已封頂（沒有東西可累積），抗遺忘機制再加一層小幅可塑性稅**。量化結論：在**frozen regime** 下正向遷移/累積加速≈0；但這是結構性限制（見 P8b 修正），不是普世結論。
 25. **unfreeze backbone：「持續變強」在「會動的表徵 × 保住的可塑性」下出現（§20，P8b）**。P10 的零正向遷移有個結構性限制——frozen backbone 封頂、沒東西可累積。P8b 改用從零的小 CNN、backbone 跨 task 持續適應（torch + MPS），量「學新 task 的速度」。三 regime 對照給出充要條件：**frozen（不會動）→ Δ≈0；會動但 Naive（崩可塑性）→ Δ 負(-0.044，重現 loss of plasticity)；會動且 Replay（保可塑性）→ Δ 強正(+0.174)且隨經驗單調增長**（early +0.035 → late +0.282，per-task late 達 +0.30~+0.40，2 seeds 一致）。**模型學過越多、學新任務越快=持續變強。** 這修正了 P10 的悲觀結論：那道最遠的牆不是不可動，而是需要「表徵持續建構 × 可塑性持續維持」同時成立——也把本專案兩條主線（replay 防遺忘、§9 防可塑性流失）統一：在會動的表徵上 replay 同時擔起兩者，累積學習於是浮現。
 26. **放大到真 ResNet18：「持續變強」隨容量放大（§21，P8c）**。把 P8b 的 backbone 從小 CNN 換成 CIFAR-adapted ResNet18（~11M 參數、end-to-end、MPS GPU），探針/資料流不變。正向遷移**更大且累積增長更陡**：Δ@40 overall +0.232（小 CNN +0.174）、late(15-19) **+0.356**（小 CNN +0.282）、continual late 絕對 acc 衝到 **0.73–0.75**（fresh ~0.35）。per-task Δ 單調爬升到 task18 **+0.412**。caveat：early Δ 有一部分來自 replay 重用當前 task 資料，但跨 task 的乾淨訊號是 early→late 增長（+0.239），fresh 永遠拿不到。結論：**「持續變強」不是小模型玩具效應，隨容量放大**；P7–P8c 收束為——抗遺忘是跨 benchmark/表徵/容量的真知識，累積學習可達、其充要條件是「表徵持續建構 × 可塑性持續維持」且隨規模增強。
+27. **穩定–可塑性甜蜜點：DER++ 同時放大正向遷移與 retention（§22，P8d）**。把會動 ResNet18 的維持機制從 plain Replay 換成 DER++（replay CE + logit 蒸餾，α=0.5），同一框架量兩軸。DER++ **兩個軸都更好、無 tradeoff**：正向遷移 Δ@40 **+0.268**（replay +0.180）、late +0.378（+0.292）；retention mean_final **0.641**（0.564）；兩者 mean_forgetting 皆為負＝**backward transfer**（舊任務後來變更好），DER++ 更明顯(-0.033)。logit 蒸餾不但沒拖慢新任務（無可塑性稅），反而把舊函數壓進更條件良好的共享表徵、讓新任務學更快。**§10 的「最佳抗遺忘法」在會動 backbone 上升級成「最佳累積學習法」。** 「持續變強」配方至此完整：表徵持續建構 × replay 保可塑性 × DER++ 函數蒸餾 × 隨容量放大，統一了 replay/§9/§10 三條主線。剩下硬牆＝無 buffer 累積(P9)。
 
 ---
 
@@ -1069,6 +1111,7 @@ replay 在早期 task 也會重播**當前 task 自己的樣本**，等於對當
 - `run_backbone_transfer.py`：§20/§21 P8b/P8c unfreeze backbone（唯一用 torch 訓練 + MPS GPU 的實驗）——backbone 跨 task 持續適應，量正向遷移；支援 `--arch {smallcnn,resnet18}`、`--continual-mode {naive,replay}`、`--device {auto,cpu,mps}`。
 - `results_backbone_transfer_cifar100.json` / `results_backbone_transfer_replay_cifar100.json`：§20 P8b 結果（小 CNN，Naive 負遷移 / Replay 正遷移且隨經驗增長）。
 - `results_backbone_transfer_resnet18_cifar100.json`：§21 P8c 結果（真 ResNet18，正遷移更大且隨容量放大，late Δ@40 +0.356）。
+- `results_p8d_replay_resnet18.json` / `results_p8d_derpp_resnet18.json`：§22 P8d 結果（ResNet18，replay vs DER++，同時量正向遷移與 retention）——DER++ 兩軸全勝、皆 backward transfer。`run_backbone_transfer.py` 支援 `--continual-mode derpp --dark-alpha`。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

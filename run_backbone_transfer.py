@@ -98,58 +98,75 @@ def acc_5way(model, Xt, yt, task_classes):
 
 
 class ReservoirBuffer:
-    """跨 task 的 reservoir replay buffer（存原始 [0,1] 影像 + 全域標籤）。"""
+    """跨 task 的 reservoir replay buffer（存原始 [0,1] 影像 + 全域標籤 + 可選 logits，
+    後者供 DER++ logit 蒸餾用，於插入時記錄當下模型輸出）。"""
     def __init__(self, capacity, rng):
         self.cap = capacity
         self.rng = rng
         self.X = None
         self.y = None
+        self.Z = None  # stored logits (DER++)
         self.n_seen = 0
         self.size = 0
 
-    def add(self, xb, yb):
+    def add(self, xb, yb, zb=None):
         if self.X is None:
             self.X = torch.zeros((self.cap,) + xb.shape[1:], dtype=xb.dtype, device=xb.device)
             self.y = torch.zeros(self.cap, dtype=yb.dtype, device=xb.device)
+            if zb is not None:
+                self.Z = torch.zeros((self.cap,) + zb.shape[1:], dtype=zb.dtype, device=zb.device)
         for i in range(xb.shape[0]):
+            slot = -1
             if self.size < self.cap:
-                self.X[self.size] = xb[i]; self.y[self.size] = yb[i]; self.size += 1
+                slot = self.size; self.size += 1
             else:
                 j = self.rng.randint(0, self.n_seen + 1)
                 if j < self.cap:
-                    self.X[j] = xb[i]; self.y[j] = yb[i]
+                    slot = j
+            if slot >= 0:
+                self.X[slot] = xb[i]; self.y[slot] = yb[i]
+                if zb is not None and self.Z is not None:
+                    self.Z[slot] = zb[i]
             self.n_seen += 1
 
     def sample(self, m):
         m = min(m, self.size)
         idx = self.rng.randint(0, self.size, size=m)
-        return self.X[idx], self.y[idx]
+        z = self.Z[idx] if self.Z is not None else None
+        return self.X[idx], self.y[idx], z
 
 
-def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng, buffer=None):
+def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
+                mode="naive", buffer=None, dark_alpha=0.5):
+    """訓練一個 task 並記錄 task-k 受限 5-way acc 曲線。
+    mode: naive（純當前 batch）/ replay（+ reservoir CE）/ derpp（replay CE + logit 蒸餾）。"""
     n = X.shape[0]
     curve, s = {}, 0
     if 0 in CHECKPOINTS:
         curve[0] = acc_5way(model, Xt, yt, task_classes)
     todo = [c for c in CHECKPOINTS if c > 0]
+    use_buf = buffer is not None and mode in ("replay", "derpp")
     for ep in range(epochs):
         order = rng.permutation(n) if ep > 0 else np.arange(n)
         for i in range(0, n, batch):
             idx = order[i:i + batch]
             xb_raw = X[idx]; yb = y[idx]
-            if buffer is not None:
-                buffer.add(xb_raw, yb)  # 把當前樣本納入 reservoir
-                if buffer.size >= batch:
-                    rx, ry = buffer.sample(batch)
-                    xin = torch.cat([normalize(xb_raw), normalize(rx)], 0)
-                    yin = torch.cat([yb, ry], 0)
-                else:
-                    xin, yin = normalize(xb_raw), yb
-            else:
-                xin, yin = normalize(xb_raw), yb
+            cur_x = normalize(xb_raw); ncur = cur_x.shape[0]
             opt.zero_grad()
-            loss = F.cross_entropy(model(xin), yin)
+            if use_buf and buffer.size >= batch:
+                rx, ry, rz = buffer.sample(batch)
+                out = model(torch.cat([cur_x, normalize(rx)], 0))
+                loss = F.cross_entropy(out[:ncur], yb) + F.cross_entropy(out[ncur:], ry)
+                if mode == "derpp" and rz is not None:
+                    loss = loss + dark_alpha * F.mse_loss(out[ncur:], rz)
+                cur_logits = out[:ncur].detach()
+            else:
+                out = model(cur_x)
+                loss = F.cross_entropy(out, yb)
+                cur_logits = out.detach()
             loss.backward(); opt.step()
+            if use_buf:
+                buffer.add(xb_raw, yb, cur_logits if mode == "derpp" else None)
             s += 1
             if todo and s == todo[0]:
                 curve[s] = acc_5way(model, Xt, yt, task_classes)
@@ -163,12 +180,12 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng, buff
 
 def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
             lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
-            device="cpu", arch="smallcnn"):
+            device="cpu", arch="smallcnn", dark_alpha=0.5):
     torch.manual_seed(seed)
     Xtr, ytr, Xte, yte = load_cifar100_raw()
     rng = np.random.RandomState(seed)
     buffer = (ReservoirBuffer(buffer_cap, np.random.RandomState(7000 + seed))
-              if continual_mode == "replay" else None)
+              if continual_mode in ("replay", "derpp") else None)
 
     task_classes = [tuple(range(classes_per_task * t, classes_per_task * (t + 1)))
                     for t in range(n_tasks)]
@@ -184,24 +201,38 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
     cont_opt = torch.optim.SGD(cont.parameters(), lr=lr, momentum=0.9)
 
     per_task = []
+    test_sets = []  # 留到最後做 retention 評估（continual 終態 vs 剛學完）
     for k in range(n_tasks):
         X = torch.from_numpy(Xtr[tr_idx[k]]).to(device); y = torch.from_numpy(ytr[tr_idx[k]]).to(device)
         Xt = torch.from_numpy(Xte[te_idx[k]]).to(device); yt = torch.from_numpy(yte[te_idx[k]]).to(device)
         tcls = task_classes[k]
+        test_sets.append((Xt, yt, tcls))
 
         rng_c = np.random.RandomState(1000 + seed)
         cont_curve = train_curve(cont, cont_opt, X, y, Xt, yt, tcls, epochs, batch, rng_c,
-                                 buffer=buffer)
+                                 mode=continual_mode, buffer=buffer, dark_alpha=dark_alpha)
 
         fresh = make_model(arch, n_tasks * classes_per_task, width).to(device)
         fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
         rng_f = np.random.RandomState(1000 + seed)
-        fresh_curve = train_curve(fresh, fresh_opt, X, y, Xt, yt, tcls, epochs, batch, rng_f)
+        fresh_curve = train_curve(fresh, fresh_opt, X, y, Xt, yt, tcls, epochs, batch, rng_f,
+                                  mode="naive")
 
         per_task.append(dict(task=k, continual=cont_curve, fresh=fresh_curve))
         print(f"  seed{seed} task{k:>2}: cont@40={cont_curve.get(40, float('nan')):.3f} "
               f"fresh@40={fresh_curve.get(40, float('nan')):.3f}", flush=True)
-    return per_task
+
+    # retention：用終態 continual 模型回評每個 task 的受限 5-way acc，對比剛學完時。
+    maxc = max(CHECKPOINTS)
+    diag = [at(per_task[j]["continual"], maxc) for j in range(n_tasks)]
+    final = [acc_5way(cont, Xt, yt, tcls) for (Xt, yt, tcls) in test_sets]
+    forgetting = [diag[j] - final[j] for j in range(n_tasks)]
+    retention = dict(diag=diag, final=final,
+                     mean_forgetting=float(np.mean(forgetting)),
+                     mean_final=float(np.mean(final)))
+    print(f"  seed{seed} retention: mean_final={retention['mean_final']:.3f} "
+          f"mean_forgetting={retention['mean_forgetting']:.3f}", flush=True)
+    return dict(per_task=per_task, retention=retention)
 
 
 def at(curve, step):
@@ -234,7 +265,8 @@ def main():
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--width", type=int, default=64)
-    p.add_argument("--continual-mode", choices=["naive", "replay"], default="naive")
+    p.add_argument("--continual-mode", choices=["naive", "replay", "derpp"], default="naive")
+    p.add_argument("--dark-alpha", type=float, default=0.5, help="DER++ logit distillation weight")
     p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
     p.add_argument("--device", default="auto", help="auto | cpu | mps")
     p.add_argument("--output", default="results_backbone_transfer_cifar100.json")
@@ -243,13 +275,15 @@ def main():
     device = pick_device(args.device)
     print(f"device: {device}", flush=True)
 
-    all_seed = []
+    all_seed, retentions = [], []
     for seed in args.seeds:
-        all_seed.append(run_one(seed, args.n_tasks, args.classes_per_task,
-                                args.train_per_class, args.test_per_class,
-                                args.lr, args.epochs, args.batch, args.width,
-                                continual_mode=args.continual_mode, device=device,
-                                arch=args.arch))
+        res = run_one(seed, args.n_tasks, args.classes_per_task,
+                      args.train_per_class, args.test_per_class,
+                      args.lr, args.epochs, args.batch, args.width,
+                      continual_mode=args.continual_mode, device=device,
+                      arch=args.arch, dark_alpha=args.dark_alpha)
+        all_seed.append(res["per_task"])
+        retentions.append(res["retention"])
         print(f"seed {seed} done", flush=True)
 
     print(f"\n=== P8b/P8c forward transfer with ADAPTING backbone (arch={args.arch}, "
@@ -272,8 +306,17 @@ def main():
     for k, c, f, d in rows:
         print(f" {k:>3} | cont {c:.3f} | fresh {f:.3f} | Δ {d:+.3f}")
 
+    # retention（穩定–可塑性甜蜜點的另一軸）：continual 終態 vs 剛學完
+    mf = np.mean([r["mean_final"] for r in retentions])
+    mfg = np.mean([r["mean_forgetting"] for r in retentions])
+    print(f"\n=== Retention (continual={args.continual_mode}): "
+          f"mean_final {mf:.3f} | mean_forgetting {mfg:.3f} "
+          f"(forward-transfer Δ@40 overall {np.mean([d for *_, d in rows]):+.3f}) ===")
+
     with open(args.output, "w") as fp:
-        json.dump(dict(checkpoints=CHECKPOINTS,
+        json.dump(dict(checkpoints=CHECKPOINTS, continual_mode=args.continual_mode,
+                       arch=args.arch, dark_alpha=args.dark_alpha,
+                       retention=retentions,
                        per_seed=[[{"task": t["task"],
                                    "continual": {str(k): v for k, v in t["continual"].items()},
                                    "fresh": {str(k): v for k, v in t["fresh"].items()}}
