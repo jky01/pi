@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
 torch.set_num_threads(torch.get_num_threads())
 CHECKPOINTS = [0, 5, 10, 20, 40, 80, 160]
@@ -66,6 +67,23 @@ class SmallCNN(nn.Module):
     def forward(self, x):
         z = self.features(x).flatten(1)
         return self.head(z)
+
+
+def make_resnet18_cifar(n_classes):
+    """CIFAR-adapted ResNet18（從零）：把 7x7/stride2 stem 換成 3x3/stride1、移除 early
+    maxpool，否則 32x32 輸入會被過度下採樣。這是 CIFAR ResNet 的標準改法。"""
+    net = torchvision.models.resnet18(weights=None, num_classes=n_classes)
+    net.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    net.maxpool = nn.Identity()
+    return net
+
+
+def make_model(arch, n_classes, width):
+    if arch == "smallcnn":
+        return SmallCNN(n_classes=n_classes, width=width)
+    if arch == "resnet18":
+        return make_resnet18_cifar(n_classes)
+    raise ValueError(f"unknown arch: {arch}")
 
 
 def acc_5way(model, Xt, yt, task_classes):
@@ -145,7 +163,7 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng, buff
 
 def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
             lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
-            device="cpu"):
+            device="cpu", arch="smallcnn"):
     torch.manual_seed(seed)
     Xtr, ytr, Xte, yte = load_cifar100_raw()
     rng = np.random.RandomState(seed)
@@ -162,7 +180,7 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         tr = rng.permutation(tr)[:train_per_class * classes_per_task]
         tr_idx.append(tr); te_idx.append(te[:test_per_class * classes_per_task])
 
-    cont = SmallCNN(n_classes=n_tasks * classes_per_task, width=width).to(device)
+    cont = make_model(arch, n_tasks * classes_per_task, width).to(device)
     cont_opt = torch.optim.SGD(cont.parameters(), lr=lr, momentum=0.9)
 
     per_task = []
@@ -175,7 +193,7 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         cont_curve = train_curve(cont, cont_opt, X, y, Xt, yt, tcls, epochs, batch, rng_c,
                                  buffer=buffer)
 
-        fresh = SmallCNN(n_classes=n_tasks * classes_per_task, width=width).to(device)
+        fresh = make_model(arch, n_tasks * classes_per_task, width).to(device)
         fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
         rng_f = np.random.RandomState(1000 + seed)
         fresh_curve = train_curve(fresh, fresh_opt, X, y, Xt, yt, tcls, epochs, batch, rng_f)
@@ -217,6 +235,7 @@ def main():
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--width", type=int, default=64)
     p.add_argument("--continual-mode", choices=["naive", "replay"], default="naive")
+    p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
     p.add_argument("--device", default="auto", help="auto | cpu | mps")
     p.add_argument("--output", default="results_backbone_transfer_cifar100.json")
     args = p.parse_args()
@@ -229,10 +248,11 @@ def main():
         all_seed.append(run_one(seed, args.n_tasks, args.classes_per_task,
                                 args.train_per_class, args.test_per_class,
                                 args.lr, args.epochs, args.batch, args.width,
-                                continual_mode=args.continual_mode, device=device))
+                                continual_mode=args.continual_mode, device=device,
+                                arch=args.arch))
         print(f"seed {seed} done", flush=True)
 
-    print(f"\n=== P8b forward transfer with ADAPTING backbone (small CNN, "
+    print(f"\n=== P8b/P8c forward transfer with ADAPTING backbone (arch={args.arch}, "
           f"continual={args.continual_mode}) ===")
     print("task-k 5-way acc: continual (backbone adapts across tasks) vs fresh-from-scratch")
     for step in [10, 20, 40, 80]:

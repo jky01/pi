@@ -63,8 +63,11 @@
 
 - **P8b — backbone 也持續適應（已完成，§20，正面結果）**：用從零小 CNN、backbone 跨 task 持續適應（`run_backbone_transfer.py`，torch + MPS GPU），量「學新 task 的速度」。**三 regime 對照**：frozen(P10)→Δ≈0；會動但 **Naive→Δ 負(-0.044，重現 loss of plasticity)**；會動且 **Replay→Δ 強正(+0.174)且隨經驗單調增長**（early +0.035→late +0.282，per-task late +0.30~+0.40，2 seeds）。**「持續變強」終於出現,充要條件=表徵持續建構 × 可塑性持續維持。** 修正 P10 的悲觀結論。MPS micro-benchmark：小 CNN 訓練 CPU→MPS 約 5–6×（width64 batch32: 34.6→175 steps/s）。結果檔 `results_backbone_transfer_{cifar100,replay_cifar100}.json`。
 
+- **P8c — 放大到真 ResNet18（已完成，§21，正面結果）**：把 P8b backbone 換成 CIFAR-adapted ResNet18（~11M、end-to-end、MPS）。正向遷移**更大且累積更陡**：Δ@40 overall +0.232（小 CNN +0.174）、late +0.356（小 CNN +0.282）、continual late 絕對 acc 0.73–0.75。**「持續變強」隨容量放大**，非小模型玩具效應。`run_backbone_transfer.py` 加 `--arch {smallcnn,resnet18}`。結果檔 `results_backbone_transfer_resnet18_cifar100.json`。
+
 **下一個要做 / Todo**
-- **P8c — 放大 P8b（最高優先，GPU 已接好）**：P8b 用小 CNN 證明了正向遷移存在但規模小（continual ~0.45–0.55 @ few steps）。下一步在已接好的 MPS 上換**真 ResNet18 end-to-end**（更大模型 + 更多 seed + 更長 stream），檢驗：(a) 正向遷移幅度是否隨容量/規模持續放大；(b) 把可塑性維持機制從 plain Replay 換成 DER++/EWC/ContinualBP，是否再放大累積；(c) 量正向遷移與抗遺忘是否能同時最大化（穩定–可塑性的甜蜜點）。`run_backbone_transfer.py` 已支援 `--device mps`，主要工作是換 backbone 與加 trainer 變體。
+- **P8d — 換更強的可塑性維持機制（最高優先，承 P8c）**：P8b/P8c 用 plain Replay 維持可塑性就拿到正向遷移。下一步把 continual 的維持機制換成 **DER++（logit 蒸餾）/ EWC / ContinualBP**，檢驗：(a) 是否再放大累積（更陡 early→late）；(b) 量正向遷移與抗遺忘能否同時最大化（穩定–可塑性甜蜜點）。工程上在 `run_backbone_transfer.py` 的 continual 路徑加 trainer 變體即可，GPU 已接好。
+- **P9 — 無 buffer 下的累積（承 P8c 的硬牆）**：P8b/P8c 的正向遷移仍靠 replay buffer。把累積搬到無 buffer（純原型 / 生成式 / 參數隔離）下還撐不撐得住，是剩下的真硬牆。先在 frozen 特徵（`run_features.py`）試，再考慮 backbone 也動的版本。
 - **P9 — frozen-feature 下拔掉 replay buffer（次優先）**：在 Split-CIFAR-100 frozen 特徵上測無 buffer 的抗遺忘（純原型 NCM class means / 生成式回放搬到特徵空間），看能保住 P8 的 0.530 多少。`run_features.py` 已可直接掛新 trainer。注意：P4–P6 已大致確立 buffer-free 的結論，此項較偏工程驗證、資訊量中等。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
@@ -213,10 +216,10 @@
 
 **結論**：殘留缺口不是 on-manifold 與否的問題。scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw conflicting 有 +BWT、合成回放沒有）。P4–P6 總結：不存原始樣本可行且常足夠（長流甚至贏 raw），完全追平 raw 仍有一道由真實樣本聯合結構撐起的小硬牆。唯一未試：per-class autoregressive（見上方 Todo P6b，優先序低）。
 
-## 3. 建議順序與理由（P1–P8、P8b、P10 已完成；P2.6/P2.9 負面；P2.10/P6b 已停損）
+## 3. 建議順序與理由（P1–P8、P8b、P8c、P10 已完成；P2.6/P2.9 負面；P2.10/P6b 已停損）
 
-1. **P8c（放大 P8b：真 ResNet18 end-to-end + 更強可塑性維持）** — P8b 證明「持續變強」存在但規模小；GPU 已接好，放大是檢驗「正向遷移是否隨規模/更強機制持續放大」的關鍵，資訊量最高。
-2. **P9（frozen-feature 下拔 buffer）** — 攻「無 buffer」硬牆、`run_features.py` 已就緒；但 P4–P6 已大致確立 buffer-free 結論，偏工程驗證。
+1. **P8d（更強可塑性維持：DER++/EWC/ContinualBP on adapting backbone）** — P8c 已證明正向遷移隨容量放大；下一個自然問題是「維持可塑性的機制能否再放大累積、並同時最大化抗遺忘」。GPU 已接好，工程量小（在 continual 路徑加 trainer 變體）。
+2. **P9（無 buffer 下的累積）** — 攻最後的真硬牆：把正向遷移搬到無 buffer。`run_features.py` 已就緒可先試 frozen 版。
 - ~~P2.10（自動 DER++ gating）~~ / ~~P6b（per-class autoregressive）~~ — **已停損**。
 
 ## 4. 慣例

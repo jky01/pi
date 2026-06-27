@@ -58,6 +58,8 @@
 
 **(T) P8b：unfreeze backbone——「持續變強」在「會動的表徵 × 保住的可塑性」下終於出現**（§20）。P10 的零遷移是 frozen regime 的結構性限制。P8b 改用從零小 CNN、backbone 跨 task 持續適應（torch + MPS GPU，唯一的 GPU 工作負載），用 task-k 受限 5-way acc 量「學新 task 的速度」。**三 regime 對照給出充要條件**：frozen(不會動)→ Δ≈0；會動但 **Naive(崩可塑性)→ Δ 負(-0.044，重現 loss of plasticity)**；會動且 **Replay(保可塑性)→ Δ 強正(+0.174)且隨經驗單調增長**（early +0.035 → late **+0.282**，per-task late 達 +0.30~+0.40，2 seeds 一致）。**模型學過越多、學新任務越快——這就是「持續變強」。** 修正 P7–P10 的悲觀結論：那道最遠的牆不是不可動，而是需要**表徵持續建構 × 可塑性持續維持**同時成立；缺一不可（frozen→零、naive→負、replay→正）。這也統一了本專案兩條長期主線——replay 防遺忘、§9 防可塑性流失——在會動的表徵上 replay 同時擔起兩者，累積學習於是浮現。結果檔 `results_backbone_transfer_{cifar100,replay_cifar100}.json`。
 
+**(U) P8c：放大到真 ResNet18——「持續變強」隨容量放大**（§21）。把 P8b 的 backbone 從小 CNN 換成 CIFAR-adapted ResNet18（~11M 參數、end-to-end、MPS GPU），探針/資料流不變。正向遷移**更大且累積更陡**：Δ@40 overall **+0.232**（小 CNN +0.174）、late(15-19) **+0.356**（小 CNN +0.282），continual late 絕對 5-way acc 衝到 **0.73–0.75**（fresh ~0.35），per-task Δ 單調爬升到 task18 **+0.412**。「持續變強」**不是小模型玩具效應，隨容量放大**。P7–P8c 總收束：抗遺忘是跨 benchmark/表徵/容量的真知識；累積學習可達、充要條件為「表徵持續建構 × 可塑性持續維持」且隨規模增強；剩下的硬牆是把這套累積搬到無 buffer / 開放世界 / 可塑性維持甜蜜點。結果檔 `results_backbone_transfer_resnet18_cifar100.json`。
+
 ---
 
 ## 1. 目的
@@ -957,7 +959,51 @@ per-task Δ@40 幾乎單調爬升：early tasks ≈0（task0 -0.011、task2 +0.0
 
 ---
 
-## 21. 結論
+## 21. 放大到真 ResNet18：「持續變強」隨容量放大（P8c）
+
+**為什麼**：P8b 用從零小 CNN 證明了正向遷移（會動的表徵 × 保住的可塑性），但規模小（continual 絕對 acc ~0.45）。P8c 檢驗這個累積效應在**真 ResNet18（~11M 參數，end-to-end 訓練）**上是放大、持平、還是被更大模型的過擬合/不穩定稀釋。
+
+**做法**：與 P8b 完全相同的探針與資料流（Split-CIFAR-100，20 tasks×5 類，replay-continual，2 seeds），只把 backbone 從 SmallCNN 換成 **CIFAR-adapted ResNet18**（標準改法：7×7/stride2 stem → 3×3/stride1、移除 early maxpool，否則 32×32 輸入被過度下採樣）。全程在 **MPS GPU** 上訓練（小 CNN 實測 CPU→MPS ~5–6×；ResNet18 端到端更依賴 GPU）。
+
+### 21.1 結果：正向遷移更大、絕對學習速度更高，累積增長更陡
+
+| 步數預算 | 持續模型 5-way acc | fresh | Δ overall | early(0-4) → late(15-19) | 趨勢 |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| @10 | 0.323 | 0.207 | +0.115 | +0.041 → +0.125 | GROWS |
+| @20 | 0.435 | 0.232 | +0.203 | +0.026 → **+0.339** | GROWS |
+| @40 | 0.585 | 0.353 | **+0.232** | +0.117 → **+0.356** | GROWS |
+| @80 | 0.656 | 0.469 | +0.187 | +0.071 → +0.267 | GROWS |
+
+per-task Δ@40 隨累積經驗單調爬升：early tasks ~+0.1，到 late tasks 達 task17 **+0.368**、task18 **+0.412**、task19 +0.360。continual 在 late tasks 的絕對 5-way acc 衝到 **0.73–0.75**（40 步內），fresh 只有 ~0.31–0.39。
+
+**與小 CNN（P8b）對照——容量放大了「持續變強」：**
+
+| backbone | Δ@40 overall | late Δ@40 | continual 絕對 acc@40 |
+| :--- | :---: | :---: | :---: |
+| SmallCNN（P8b） | +0.174 | +0.282 | ~0.45 |
+| **ResNet18（P8c）** | **+0.232** | **+0.356** | **~0.585（late 0.73–0.75）** |
+
+更大的容量 → **更大的正向遷移 + 更高的絕對新任務學習速度 + 更陡的累積增長**。「持續變強」不是小模型的玩具效應，它隨容量放大。
+
+### 21.2 一個誠實的 caveat 與它為何不推翻結論
+
+replay 在早期 task 也會重播**當前 task 自己的樣本**，等於對當前資料多走幾遍，所以 early Δ（ResNet18 +0.117 @40）有一部分來自「資料重用」而非跨 task 累積。但**跨 task 累積的乾淨訊號是 early→late 的增長**（+0.239 @40）：把 early 那段當基線扣掉，late 仍多出一大截，且只能來自「backbone 跨越前面 ~95 類累積的通用表徵」。fresh 每個 task 都從零、永遠拿不到這個增長，正是對照所在。
+
+### 21.3 P7–P8c 的總收束
+
+整條外部效度 + 現代化弧線收束成一個正面而精確的結論：
+
+1. **抗遺忘工具箱（replay + Fisher-EWC + DER++/NCM）是跨 benchmark、跨表徵、跨容量的真知識**（§17/§18：MNIST、Split-CIFAR-100 frozen 特徵都守住）。
+2. **「持續變強」（正向遷移 / 知識複利）並非不可達**，其充要條件是**表徵持續建構 × 可塑性持續維持**同時成立（§20：frozen→零、naive→負、replay→正），且**隨模型容量放大**（§21：ResNet18 > SmallCNN）。
+3. 這統一了本專案兩條長期主線——replay 防遺忘、§9 防可塑性流失——**在會動的表徵上，replay 同時擔起兩者，累積學習於是浮現並隨規模增強。**
+
+**離真正的持續學習還有多遠**：抗遺忘已是扎實的真知識；「持續變強」已被證明可達且可隨容量放大，但仍在**有 replay buffer + 清楚 task 切片**的設定下。真正剩下的硬牆是**把這套累積搬到無 buffer、開放世界、以及把可塑性維持機制做到甜蜜點**（下一步 P8d/P9）。
+
+**結果檔**：`results_backbone_transfer_resnet18_cifar100.json`；程式 `run_backbone_transfer.py --arch resnet18 --device mps`。
+
+---
+
+## 22. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -983,7 +1029,8 @@ per-task Δ@40 幾乎單調爬升：early tasks ≈0（task0 -0.011、task2 +0.0
 22. **外部效度驗證：核心機制守住、戲劇性數字是 pi 特例（§17，P7）**。把結論搬到 CL 社群的標準 benchmark：**Permuted-MNIST（多頭 Task-IL）上 DER++ 函數錨定完整守住**——0.912 > ReplayEWC 0.896、BWT→0、retention 0.998，且優勢隨串流長度複利（與 pi 一致）。**Split-MNIST class-IL 上 NCM「降低遺忘」的方向成立**（forgetting 最低 0.028、retention 最高 0.977），**但 pi 的「線性頭災難性崩潰、DER++ 反轉成有害、NCM 是唯一解」被推翻為 200 類特例**——標準 10 類下線性頭 0.926 不崩、DER++ 0.952 反而最佳。教訓：**replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出是跨 benchmark 的真知識；但具體數字的戲劇性與「某機制必然反轉」的強論斷會隨類別數/串流長度/buffer 比例而變，不能外推。** 這也驗證了停掉 P2.5–P2.10 自動 gating 微調的判斷（那條線在 pi 特性上精雕、外部效度低）。下一個現代化方向是 frozen pretrained feature + CL 讀出（P8，需先接特徵抽取器）。
 23. **Frozen pretrained 特徵上的 Class-IL：NCM 的價值隨類別數放大、強表徵不抹平工具箱（§18，P8）**。用 frozen ImageNet ResNet18 特徵跑標準 **Split-CIFAR-100**（20 tasks×5 類、單頭、無 task id）：Naive 仍崩到 **0.063**（強表徵不會自己解掉持續學習）、線性頭 ReplayEWC **0.471（forget 0.440）**、DER++ **0.495**、**NCMReplayEWC 0.530（forget 0.198、retention 0.743）**。三個 benchmark 合看，class-IL 的「線性頭→NCM」改善隨全域類別數單調放大（MNIST 10 類微弱、CIFAR-100 100 類大、pi ~200 類戲劇性），**證明 pi 的「NCM 是 class-IL 英雄」不是特例而是類別數的函數**；無偏原型讀出是跨 benchmark、跨表徵都成立的修法。同時回答「離真正 CL 多遠」：**強表徵把規模/表徵這道牆推近一步，但牆沒倒**——53% final、且這還是在 frozen 強特徵＋有 buffer＋清楚 task 切片的**最有利設定**下；真正的硬牆（無 buffer、開放世界、正向遷移/累積）一個都還沒碰。
 24. **正向遷移量測：是「持續不忘」不是「持續變強」（§19，P10）**。到 P8 為止所有指標都是「別忘記」。P10 在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head，用 task-k 受限 5-way acc 隔離「新任務本身學多快」。結果：**每一個步數預算下持續模型都不比 fresh 快、反而略慢**（Δ@2/5/10/20 = -0.037/-0.022/-0.008/-0.013），且**不隨經驗增長**（early≈late）。Naive-continual 對照(隱藏層自由累積)Δ≈0，分離出因果：**主因是 frozen backbone 已封頂（沒有東西可累積），抗遺忘機制再加一層小幅可塑性稅**。量化結論：在**frozen regime** 下正向遷移/累積加速≈0；但這是結構性限制（見 P8b 修正），不是普世結論。
-25. **unfreeze backbone：「持續變強」在「會動的表徵 × 保住的可塑性」下出現（§20，P8b）**。P10 的零正向遷移有個結構性限制——frozen backbone 封頂、沒東西可累積。P8b 改用從零的小 CNN、backbone 跨 task 持續適應（torch + MPS），量「學新 task 的速度」。三 regime 對照給出充要條件：**frozen（不會動）→ Δ≈0；會動但 Naive（崩可塑性）→ Δ 負(-0.044，重現 loss of plasticity)；會動且 Replay（保可塑性）→ Δ 強正(+0.174)且隨經驗單調增長**（early +0.035 → late +0.282，per-task late 達 +0.30~+0.40，2 seeds 一致）。**模型學過越多、學新任務越快=持續變強。** 這修正了 P10 的悲觀結論：那道最遠的牆不是不可動，而是需要「表徵持續建構 × 可塑性持續維持」同時成立——也把本專案兩條主線（replay 防遺忘、§9 防可塑性流失）統一：在會動的表徵上 replay 同時擔起兩者，累積學習於是浮現。下一步可在已接好的 MPS GPU 上放大（真 ResNet18 end-to-end）。
+25. **unfreeze backbone：「持續變強」在「會動的表徵 × 保住的可塑性」下出現（§20，P8b）**。P10 的零正向遷移有個結構性限制——frozen backbone 封頂、沒東西可累積。P8b 改用從零的小 CNN、backbone 跨 task 持續適應（torch + MPS），量「學新 task 的速度」。三 regime 對照給出充要條件：**frozen（不會動）→ Δ≈0；會動但 Naive（崩可塑性）→ Δ 負(-0.044，重現 loss of plasticity)；會動且 Replay（保可塑性）→ Δ 強正(+0.174)且隨經驗單調增長**（early +0.035 → late +0.282，per-task late 達 +0.30~+0.40，2 seeds 一致）。**模型學過越多、學新任務越快=持續變強。** 這修正了 P10 的悲觀結論：那道最遠的牆不是不可動，而是需要「表徵持續建構 × 可塑性持續維持」同時成立——也把本專案兩條主線（replay 防遺忘、§9 防可塑性流失）統一：在會動的表徵上 replay 同時擔起兩者，累積學習於是浮現。
+26. **放大到真 ResNet18：「持續變強」隨容量放大（§21，P8c）**。把 P8b 的 backbone 從小 CNN 換成 CIFAR-adapted ResNet18（~11M 參數、end-to-end、MPS GPU），探針/資料流不變。正向遷移**更大且累積增長更陡**：Δ@40 overall +0.232（小 CNN +0.174）、late(15-19) **+0.356**（小 CNN +0.282）、continual late 絕對 acc 衝到 **0.73–0.75**（fresh ~0.35）。per-task Δ 單調爬升到 task18 **+0.412**。caveat：early Δ 有一部分來自 replay 重用當前 task 資料，但跨 task 的乾淨訊號是 early→late 增長（+0.239），fresh 永遠拿不到。結論：**「持續變強」不是小模型玩具效應，隨容量放大**；P7–P8c 收束為——抗遺忘是跨 benchmark/表徵/容量的真知識，累積學習可達、其充要條件是「表徵持續建構 × 可塑性持續維持」且隨規模增強。
 
 ---
 
@@ -1019,8 +1066,9 @@ per-task Δ@40 幾乎單調爬升：early tasks ≈0（task0 -0.011、task2 +0.0
 - `results_feature_split_cifar100.json`：§18 Split-CIFAR-100 結果——NCM 在 100 類重新成為最大抗遺忘槓桿（forget 0.440→0.198），證明 NCM 價值隨類別數放大。
 - `run_forward_transfer.py`：§19 P10 正向遷移量測——比較持續模型 vs fresh-from-scratch 學新 task 的速度（task-k 受限 5-way acc），隔離表徵的累積效益。
 - `results_forward_transfer_cifar100.json` / `results_forward_transfer_naive_cifar100.json`：§19 結果（ReplayEWC 主結果 + Naive 對照）——frozen regime 下正向遷移≈0、不隨經驗增長，主因 frozen backbone 封頂。
-- `run_backbone_transfer.py`：§20 P8b unfreeze backbone（唯一用 torch 訓練 + MPS GPU 的實驗）——從零小 CNN 跨 task 持續適應，量正向遷移；支援 `--continual-mode {naive,replay}`、`--device {auto,cpu,mps}`。
-- `results_backbone_transfer_cifar100.json` / `results_backbone_transfer_replay_cifar100.json`：§20 結果（Naive 負遷移 / Replay 正遷移且隨經驗增長）——「持續變強」需要會動的表徵 × 保住的可塑性。
+- `run_backbone_transfer.py`：§20/§21 P8b/P8c unfreeze backbone（唯一用 torch 訓練 + MPS GPU 的實驗）——backbone 跨 task 持續適應，量正向遷移；支援 `--arch {smallcnn,resnet18}`、`--continual-mode {naive,replay}`、`--device {auto,cpu,mps}`。
+- `results_backbone_transfer_cifar100.json` / `results_backbone_transfer_replay_cifar100.json`：§20 P8b 結果（小 CNN，Naive 負遷移 / Replay 正遷移且隨經驗增長）。
+- `results_backbone_transfer_resnet18_cifar100.json`：§21 P8c 結果（真 ResNet18，正遷移更大且隨容量放大，late Δ@40 +0.356）。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。
