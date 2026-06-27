@@ -15,6 +15,13 @@
 - 長串流受 `pi_digits_600000.txt` 600k 位數限制：`n_tasks*(steps+test) ≲ 560k`。
 - 結果分析：`$PY analyze.py <mode>`，或直接讀 `results_*.json`（`run.summarize` 算 final/bwt/forget/retention）。
 
+### 0.1 在另一台機器接續（含 NVIDIA CUDA GPU，如 RTX 2070）
+- **遷移方式＝git**：`git clone https://github.com/jky01/pi.git` 後 `git checkout p8-pretrained-cl`（最新進度在這條 branch）。`pi_digits_600000.txt` 已在 repo 內；大檔（`mnist.npz`/`cifar100_resnet18.npz`/`cifar_data/`）是 gitignore、**會自動重新下載/重生**，不必搬。
+- **環境**：新機自建 venv，`pip install numpy torch torchvision`（裝 **CUDA build** 的 torch，非 CPU build）。把上面寫死的 mac 直譯器路徑換成新機的 `python`。
+- **資料重生**：`python mnist_data.py`（自動下載 MNIST）、`python extract_features.py`（自動下載 CIFAR-100 + ResNet18 權重並抽特徵）。
+- **用 GPU 跑（唯一 torch 訓練實驗）**：`python run_backbone_transfer.py --device cuda ...`（或 `--device auto`，會自動選 cuda）。`pick_device` 已支援 `cuda > mps > cpu`；其餘 numpy 實驗不吃 GPU。
+- **接手脈絡**：先讀本檔 + `report.md` §0（TL;DR）+ §17–§23（P7–P9 現代化弧線）。`report.md` 是完整研究日誌，整段對話的結論都已落在裡面——新開的 cold-start session 讀這幾份即可無縫接續。
+
 ## 1. 已確立的結論（不要重做，直接引用 report.md）
 
 - **瓶頸是遺忘、不是可塑性流失**：有 replay 時對角線到 250 tasks 仍上升（§9）。

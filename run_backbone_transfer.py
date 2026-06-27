@@ -34,7 +34,11 @@ STD = torch.tensor([0.2673, 0.2564, 0.2762]).view(1, 3, 1, 1)
 
 def pick_device(name):
     if name == "auto":
-        return "mps" if torch.backends.mps.is_available() else "cpu"
+        if torch.cuda.is_available():      # NVIDIA GPU (e.g. RTX 2070)
+            return "cuda"
+        if torch.backends.mps.is_available():  # Apple Silicon GPU
+            return "mps"
+        return "cpu"
     return name
 
 
@@ -301,7 +305,7 @@ def main():
     p.add_argument("--dark-alpha", type=float, default=0.5, help="DER++ logit distillation weight")
     p.add_argument("--lwf-lambda", type=float, default=1.0, help="LwF (buffer-free) distillation weight")
     p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
-    p.add_argument("--device", default="auto", help="auto | cpu | mps")
+    p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
     p.add_argument("--output", default="results_backbone_transfer_cifar100.json")
     args = p.parse_args()
 
