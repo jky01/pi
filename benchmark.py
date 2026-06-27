@@ -76,6 +76,36 @@ class PermutedPiDigitsStream:
         qs = np.linspace(0, 1, n_classes + 1)[1:-1]
         self.thresholds = np.quantile(calib_sums, qs)
 
+        if mode == "class_il":
+            self._build_class_il(K, n_classes, n_tasks, steps_per_task, test_per_task, calib_sums)
+
+    def _build_class_il(self, K, n_classes, n_tasks, steps_per_task, test_per_task, calib_sums):
+        """Well-posed Class-IL: a global label is the fine-grained (equal-frequency) bucket
+        of the window sum, so it is an unambiguous function of the input (no task id needed).
+        Task t owns a disjoint, contiguous slice of those global buckets — i.e. a distinct
+        sum-range — so tasks are naturally input-distinguishable. We scan the whole stream,
+        assign each window to its global bucket, and hand each task the windows in its slice."""
+        n_global = n_classes * n_tasks
+        qs_g = np.linspace(0, 1, n_global + 1)[1:-1]
+        self.global_thresholds = np.quantile(calib_sums, qs_g)
+        scan_n = len(self.digits) - K
+        sums = _windows_sum(self.digits, K, 0, scan_n)
+        gbin = np.searchsorted(self.global_thresholds, sums, side="right")  # 0..n_global-1
+        self.class_il_train_idx = []
+        self.class_il_test_idx = []
+        need = steps_per_task + test_per_task
+        for t in range(n_tasks):
+            lo, hi = n_classes * t, n_classes * (t + 1)
+            starts = np.where((gbin >= lo) & (gbin < hi))[0]
+            if len(starts) < need:
+                raise ValueError(
+                    f"class_il task {t}: 只有 {len(starts)} 個窗口，需要 {need}。"
+                    f" K={K} 的位數和只有 ~{9*K+1} 個相異值，無法切成 {n_global} 個非空細桶"
+                    f"（尾端桶被掏空）。請降低 n_tasks 或調大 K（distinct sums ≫ n_classes*n_tasks）。")
+            # train from the front, test from the tail (far apart → minimal window overlap)
+            self.class_il_train_idx.append(starts[:steps_per_task])
+            self.class_il_test_idx.append(starts[-test_per_task:])
+
     def _bucket(self, sums: np.ndarray) -> np.ndarray:
         return np.searchsorted(self.thresholds, sums, side="right").astype(np.int64)
 
@@ -96,13 +126,31 @@ class PermutedPiDigitsStream:
         Y = self.permutations[task_idx][base_class]
         return X, Y
 
+    def _make_xy_idx(self, starts: np.ndarray):
+        """Class-IL: build (x_onehot, global_label) from arbitrary window start indices.
+        Label is the global fine-grained bucket of the window sum — no permutation, no task id."""
+        K = self.K
+        n = len(starts)
+        window_mat = np.stack([self.digits[s:s + K] for s in starts])
+        X = np.zeros((n, 10 * K), dtype=np.float32)
+        rows = np.repeat(np.arange(n), K)
+        cols_k = np.tile(np.arange(K), n)
+        X3 = X.reshape(n, K, 10)
+        X3[rows, cols_k, window_mat.reshape(-1)] = 1.0
+        Y = np.searchsorted(self.global_thresholds, window_mat.sum(axis=1), side="right").astype(np.int64)
+        return X, Y
+
     def get_train_batch_stream(self, task_idx: int):
         """回傳該 task 訓練段的全部 (x, y)，依序（線上單次通過）。"""
+        if self.mode == "class_il":
+            return self._make_xy_idx(self.class_il_train_idx[task_idx])
         start = self.train_starts[task_idx]
         return self._make_xy(start, self.steps_per_task, task_idx)
 
     def get_test_set(self, task_idx: int):
         """回傳該 task 的固定測試集（訓練時沒看過的窗口）。"""
+        if self.mode == "class_il":
+            return self._make_xy_idx(self.class_il_test_idx[task_idx])
         start = self.test_starts[task_idx]
         return self._make_xy(start, self.test_per_task, task_idx)
 

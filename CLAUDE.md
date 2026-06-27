@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Research log & roadmap:** `report.md` is the running findings log (§0 has a TL;DR). **`NEXT_STEPS.md` lists the unfinished work** (rationale + planned approach + the correct numpy Python interpreter path) — read it first to resume the ongoing research. Established results not to re-derive are summarized there.
+
 ## Commands
 
 ```bash
@@ -38,6 +40,7 @@ The project is a continual learning research benchmark with pure-numpy training 
 `PermutedPiDigitsStream` reads `pi_digits_600000.txt` and constructs a stream of tasks. Each task is a sliding-window classification problem: predict which of 10 equal-frequency buckets the sum of K consecutive π digits falls into. Bucket thresholds are calibrated on a held-out tail segment (not train/test data). Two modes:
 - **`label_permuted`** — same input encoding per task, but label→class mapping is randomly permuted per task. This is Task-IL; the model is multi-head.
 - **`input_permuted`** — label mapping is identity, but input features are permuted per task. This is Domain-IL; the model is single-head.
+- **`class_il`** — single head over a global label space of `10×n_tasks` fine-grained sum-buckets, **no task id at inference**. Each task owns a disjoint contiguous slice of sum-buckets (a distinct sum-range), built by scanning all windows and grouping by global bucket (`_build_class_il`). The honest hard test (report §11): the linear head suffers catastrophic recency bias (DER++ *hurts* here), but `NCMReplayEWC` (nearest-class-mean prototype readout) fixes it — **0.31 → 0.858, forgetting → 0.06**. Benchmark caps at ~200 classes (K=8 sum has only ~73 distinct values).
 
 ### Model (`model.py`)
 `MLP`: pure numpy 2-hidden-layer network with manual `forward`/`backward`. Supports single-head or multi-head (one output head per task, shared hidden layers). `diagnostics()` computes `eff_rank_h1/h2` (effective rank via SVD entropy, measures representation collapse) and `dead_frac_h1/h2` (fraction of always-zero ReLU units). `label_permuted` → `multi_head=True`; `input_permuted` → `multi_head=False`.
@@ -59,6 +62,7 @@ ReplayTrainer                         # reservoir buffer, uniform sampling
     SurpriseReplayEWCTrainer          # +surprise-prioritized replay (top-K CE loss)
       MarginSurpriseReplayEWCTrainer  # +low-margin boundary priority
       HippocampalReplayEWCTrainer     # +episodic prototype memory at inference
+        NCMReplayEWCTrainer           # nearest-class-mean readout (iCaRL-style); solves Class-IL recency bias
 EWCTrainer                            # EWC only (no replay)
 ContinualBackpropTrainer              # neuron recycling only (no replay)
 BennaFusiTrainer                      # multi-timescale complex synapses, online (no replay/Fisher); --bf-dt knob

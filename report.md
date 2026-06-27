@@ -24,7 +24,9 @@
 
 **(D) 直攻遺忘的最終演算法：Replay + Fisher-EWC + DER++ logit 蒸餾**（§10）
 
-遺忘是函數空間干擾，不是權重位移。實作可切換的 `FunctionSpaceReplay`（Replay + DER++ 蒸餾 + GPM 投影）做消融：GPM 因本 benchmark 輸入平穩而凍結共享層（不適配），但 **DER++ logit 蒸餾**有效——在 130-task 串流上把 final 從 ReplayEWC 的 0.815 抬到 **0.892**、**retention→1.01（淨遺忘≈0）**、BWT→0、方差砍 4 倍。**優勢隨串流變長而複利放大**：250 tasks 時領先從 +7.7 拉到 **+14.2 分**（0.680→0.822），retention 仍 0.97。這是目前最有效、且抗遺忘能力隨串流增強的「持續學習」配置。
+遺忘是函數空間干擾，不是權重位移。實作可切換的 `FunctionSpaceReplay`（Replay + DER++ 蒸餾 + GPM 投影）做消融：GPM 因本 benchmark 輸入平穩而凍結共享層（不適配），但 **DER++ logit 蒸餾**有效——在 130-task 串流上把 final 從 ReplayEWC 的 0.815 抬到 **0.892**、**retention→1.01（淨遺忘≈0）**、BWT→0、方差砍 4 倍。**優勢隨串流變長而複利放大**：250 tasks 時領先從 +7.7 拉到 **+14.2 分**（0.680→0.822），retention 仍 0.97。
+
+**(E) 校正＋補強：機制隨設定而變**（§11）。拿掉 task ID 改測 **Class-IL**（單頭、200 類）後，Task-IL 的英雄 **DER++ 反轉成有害**（病灶＝線性頭 recency bias）。但把讀出換成 **NCM 原型分類器（`NCMReplayEWC`，iCaRL 式）**就把缺口幾乎補滿：**0.312 → 0.858、遺忘 0.50→0.06、retention >1.0**（超過線性頭 Joint 0.742）。**誠實答案**：Task-IL 與 Class-IL 在本 benchmark 都已有接近上界的配置；跨設定穩健的骨幹是 **replay + Fisher-EWC**，再依設定換對的讀出（Task-IL：head+DER++；Class-IL：無偏原型）。距「通用持續學習」仍有任務衝突 / 無 buffer / 無邊界 / 規模等硬牆（見 `NEXT_STEPS.md`）。
 
 ---
 
@@ -325,7 +327,63 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 
 **這就是直接回答「找一個有效抗遺忘、達到持續學習的演算法」：Replay + Fisher-selective EWC + DER++ logit 蒸餾**。它在 130-task 串流上把淨遺忘壓到接近零（retention 1.01），是本專案目前最接近「持續學習」定義的配置。GPM 則被本 benchmark 的平穩輸入結構排除——這本身是一條清楚的設計教訓：input-subspace 投影只在輸入真的漂移時才該用。
 
-## 11. 結論
+### 10.3 正向遷移（可累積）：表徵層有、學習速度沒有
+
+報告 §1.1 的第三個目標是「可累積（過去幫助未來）」。用現有資料檢驗（250 tasks）：
+
+| | 串流早段 → 晚段 |
+| :--- | :--- |
+| 每任務最終準確率 A[t,t]（DER++） | 0.69 → 0.81 → 0.88 → 0.92 → **0.94** |
+| 學習速度（first-batch acc） | 0.15 → 0.15 → 0.20 → 0.17 → 0.18（**持平**） |
+
+- **表徵層正向遷移：有。** 同樣 2000 步預算下，晚段任務的最終準確率明顯更高（0.69→0.94）——累積的共享表徵確實幫了新任務；DER++ 因 retention 更好，累積得比 ReplayEWC 更乾淨（rise 0.69→0.94 vs 0.72→0.90）。
+- **學習速度遷移：沒有。** first-batch 準確率全程持平（~0.15–0.20），晚段任務並沒有學得更快，沒有「learning to learn」。好處只體現在 asymptote（每個任務的 head 都是新的，前幾批還是得從頭訓）。
+
+所以第三個目標**部分達成**：累積到更好的*表徵*（拉高新任務的天花板），但沒有更快的*習得過程*。嚴格分離「正向遷移」與「網路單純成熟」的對照是「task-N-在串流中 vs task-N-單獨訓練」——in-stream 的 0.94 遠高於單一任務新網路的 ~0.70，已是強證據，但該對照可把它釘死。
+
+## 11. 誠實的硬測試：Class-IL（不給任務 ID）
+
+§5–§10 的好結果幾乎都在 Task-IL（label_permuted，多頭、測試時用 task ID 選 head）。對話 §4 明講 **Class-IL（不給 task ID、單頭、在不斷增長的全域類別空間上分類）才是誠實的硬測試**。本節把這個拐杖拿掉。
+
+### 11.1 一個良好定義的 Class-IL benchmark（sum-slice）
+
+第一版嘗試「permute 輸入 + offset 標籤」是**退化的**：單一 permuted 輸入無法可靠辨識自己屬於哪個任務，全域標籤本質上模糊，連 Joint 上界都卡在 8%。改用 **sum-slice 設計**：把 sum 切成 `10×n_tasks` 個等頻細桶，task t 擁有一段連續的細桶（＝一段不重疊的 sum 範圍）。於是每個輸入的全域標籤是 sum 的確定性函數（無歧義、不需 task ID），而不同任務的輸入分布天然可區分（低 sum vs 高 sum）。
+
+### 11.2 結果：Task-IL 的勝利不遷移（20 tasks＝200 classes，3 seeds）
+
+| 方法 | final | forget | retention |
+| :--- | :---: | :---: | :---: |
+| Naive | 0.005 | 0.760 | 0.006 |
+| **Joint（上界）** | **0.742** | — | — |
+| Replay | 0.157 | 0.632 | 0.208 |
+| **ReplayEWC** | **0.312** | 0.503 | 0.406 |
+| DarkReplayEWC（DER++, α=0.5） | 0.232 | 0.584 | 0.300 |
+| DarkReplayEWC（DER++, α=0.1） | 0.273 | 0.542 | 0.354 |
+
+三個關鍵發現：
+
+1. **Class-IL 殘酷得多。** 最佳法只有 0.312，離線上界卻有 0.742——差距 0.43，遺忘嚴重（retention 0.41）。對比 Task-IL（DER++ 幾乎貼到上界、retention 1.0），同一個 benchmark 換成不給 task ID 就幾乎是另一個問題。Naive 直接崩到 chance（recency bias：只有最新類別拿到正梯度）。
+2. **DER++ 反轉成「有害」。** 在 Task-IL 是最佳加成（+7~14 分），在 Class-IL 卻**低於**純 ReplayEWC（α=0.5→0.232、α=0.1→0.273，都 < 0.312），而且 α 越小越好（越接近關掉蒸餾）。機制上：Class-IL 的單頭必須持續**重塑**輸出幾何以塞進新類別，而 logit 蒸餾把輸出錨向寫入當下的舊 logits（那時新類別還「不存在」），等於鎖死舊的類別邊界、加重 recency bias。Task-IL 每個 task 各有 head，蒸餾只穩定自己的 head、沒有跨類別競爭，所以才有益。
+3. **EWC 才是跨 regime 穩健的核心。** ReplayEWC（0.312）遠勝純 Replay（0.157）——Fisher 選擇性權重保護在 Task-IL 與 Class-IL 都有效；DER++ 只在 Task-IL 有效。
+
+### 11.3 解法：NCM 原型分類器把 Class-IL 缺口幾乎補滿
+
+§11.2 指出問題在線性頭的 recency / magnitude bias。直接換掉讀出方式：**不用線性頭，改用「特徵空間最近類別原型（nearest-class-mean, cosine）」分類**，對所有看過的全域類別、不給 task id——這就是 iCaRL 的核心。表徵仍由 replay + EWC 學習；prototypes 從 buffer 算（類別平衡、無偏）。實作為 `NCMReplayEWC`（= HippocampalReplayEWC 的純 NCM 設定）。
+
+| Class-IL, 200 classes, 3 seeds | final | forget | retention |
+| :--- | :---: | :---: | :---: |
+| ReplayEWC（線性頭） | 0.312 | 0.503 | 0.406 |
+| Joint（線性頭，上界） | 0.742 | 0.116 | — |
+| **NCMReplayEWC（原型讀出）** | **0.858 ± 0.003** | **0.060** | **1.07** |
+
+- **缺口幾乎補滿**：0.312 → **0.858**，遺忘從 0.50 砍到 0.06，retention >1.0（BWT 甚至為正）。而且 3 seeds 方差極小（±0.003）。
+- **甚至超過線性頭的 Joint 上界（0.742）**：因為線性 softmax 在 200 類上本身就受 recency/magnitude bias 拖累，而 NCM 在這個由 sum 結構化、近似一維有序的特徵流形上幾乎是最優讀出（公平的上界應是 Joint+NCM）。
+- **這正好對映 §11.2 的機制診斷**：Class-IL 的病灶是「讀出層的偏置」，不是表徵本身——replay+EWC 學到的表徵其實夠好，換成無偏讀出就解放了。也解釋了為何 DER++（鎖死線性頭的輸出幾何）在這裡有害。
+- **benchmark 的規模上限**：K=8 的位數和只有 ~73 個相異值，無法切成 >~200 個非空細桶（400 類時尾端桶被掏空）。所以 200 類（20 tasks）是本 benchmark Class-IL 的天然上限；要更大需調大 K。這是 benchmark 限制、不是方法限制。
+
+**修正後的結論（回答「是不是找到持續學習演算法」）：在本 benchmark 上，Task-IL 與 Class-IL 都已有接近上界的配置**——Task-IL 用 Replay+EWC+DER++（retention~1.0），Class-IL 用 **Replay+EWC + NCM 原型讀出**（0.858、遺忘 0.06）。**但關鍵教訓是「對的機制隨設定而變」**：DER++ 在 Task-IL 是英雄、在 Class-IL 是負擔；真正跨設定穩健的是 replay + Fisher-EWC 當表徵學習骨幹，再依設定換上對的讀出（Task-IL 用 head + 蒸餾，Class-IL 用無偏原型）。距離「通用持續學習」仍有 §11.4 之後的硬牆（任務真正衝突、無 buffer、無邊界、規模）。
+
+## 12. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -336,6 +394,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 7.  **可永續學習的瓶頸是遺忘、不是可塑性流失（§9）**：把串流拉到 250 個任務，有 replay 的方法對角線不降反升，可塑性根本不綁定；專門維護可塑性的 `SustainableReplayEWC` 雖然完成設計目標（dead-unit≈0、effective rank 最高、且修好了 ReplayContinualBP 的記憶損傷），卻換不到準確率，因為這個 regime 本來就不缺可塑性。要再提升「可永續性」應主攻遺忘（更強記憶/正則、Benna-Fusi、generative replay）；可塑性注入要見效得換到無 replay 的 regime。
 8.  **Benna-Fusi 複雜突觸：冪律遺忘有效，但棲位在 replay-free（§9.4）**：純 `BennaFusi` 把遺忘從 0.23 壓到 0.03，驗證冪律記憶有效；但它各向同性地拖住所有權重，在有 replay 時被 Fisher-selective 的 ReplayEWC 完全支配。它的真正價值是 replay-free / Fisher-free 的線上鞏固——80-task 下把 Naive 的 29% 翻倍到 53%、逼近 EWC 的 58% 且遺忘更低，且完全不存樣本、不算 Fisher。這把「該用哪種穩定機制」收斂成一條清楚的設計準則：能存樣本就用 replay(+EWC)，不能存樣本才換複雜突觸。
 9.  **直攻遺忘的答案：函數空間錨定（DER++ logit 蒸餾）（§10）**：遺忘是函數空間干擾。混合式 `FunctionSpaceReplay` 的消融顯示，**GPM 梯度投影不適配平穩輸入的本 benchmark（凍結共享層）**，但 **DER++ logit 蒸餾**有效——在 130-task 串流上把 final 從 0.815 抬到 **0.892**、淨遺忘 retention→**1.01**、BWT→0、方差砍 4 倍，且優勢隨串流變長複利放大（250 tasks 領先 +14.2 分、retention 仍 0.97）。**Replay + Fisher-EWC + DER++ 蒸餾**是本專案目前最有效、且抗遺忘隨串流增強的演算法，也是設計教訓：對「函數」做錨定（輸出/logits）比對「權重」或對「輸入子空間」做約束更貼合本問題的遺忘來源。
+10. **Class-IL 校正並隨後補強（§11）**。拿掉 task ID（單頭、200 類）後，Task-IL 的英雄 **DER++ 反轉成有害**（0.23 < 純 ReplayEWC 0.31），病灶是線性頭的 recency/magnitude bias。**把讀出換成 NCM 原型分類器（iCaRL 式，`NCMReplayEWC`）後，缺口幾乎補滿：0.31 → 0.858、遺忘 0.50 → 0.06、retention >1.0**（甚至超過線性頭 Joint 0.742）。關鍵教訓：**對的機制隨設定而變**——跨設定穩健的是 replay + Fisher-EWC 當表徵骨幹，再依設定換對的讀出（Task-IL：head + DER++ 蒸餾；Class-IL：無偏原型）。benchmark 的 Class-IL 規模上限 ~200 類（K=8 位數和僅 ~73 個相異值）。
 
 ---
 
@@ -352,6 +411,8 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 - `results_longstream_*.json`（130 tasks）/ `results_verylong_*.json`（250 tasks）/ `results_longstream_sustainable.json`：§9 可永續學習長串流探針數據。
 - `results_bennafusi_dt0*_label_permuted.json`：§9.4 Benna-Fusi 複雜突觸 replay-free 定位實驗。
 - `results_derpp_longstream_label_permuted.json`（130 tasks）/ `results_derpp_verylong_label_permuted.json`（250 tasks）：§10 函數空間 / DER++ 抗遺忘實驗。
+- `results_classil_label.json` / `results_classil_dark01.json`：§11 Class-IL（誠實硬測試）實驗。
+- `results_classil_ncm.json` / `results_classil_ncm_trainer.json`：§11.3 NCM 原型分類器解 Class-IL 缺口。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

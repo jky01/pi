@@ -934,6 +934,30 @@ class HippocampalReplayEWCTrainer(SurpriseReplayEWCTrainer):
             self.replay_batch = original_replay_batch
 
 
+class NCMReplayEWCTrainer(HippocampalReplayEWCTrainer):
+    """Class-IL nearest-class-mean (iCaRL 風格) 訓練器。
+
+    表徵由 replay + EWC 學習；分類**不用線性輸出頭**，改用「特徵空間最近類別原型（cosine）」
+    讀出，對所有看過的全域類別、不給 task id。動機：Class-IL 的單一線性頭有嚴重的 recency /
+    magnitude bias（新類別 logit 天生偏大→蓋過舊類別），但用 buffer 算出的 class prototypes 是
+    類別平衡、無偏的，因此幾乎消除遺忘。這是 HippocampalReplayEWC 在 Class-IL 下的純 NCM 設定
+    （memory_alpha=1、不 gating、不 task-filter）。"""
+    name = "NCMReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, candidate_mult: int = 8,
+                 memory_temperature: float = 0.1, memory_min_examples: int = 3):
+        super().__init__(
+            model, lr=lr, capacity=capacity, replay_batch=replay_batch, seed=seed,
+            lam=lam, fisher_batches=fisher_batches, fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm, candidate_mult=candidate_mult,
+            memory_alpha=1.0, memory_temperature=memory_temperature,
+            memory_min_examples=memory_min_examples, memory_task_filter=False,
+            memory_gate=False, sleep_steps=0)
+
+
 class ContinualBackpropTrainer:
     """簡化版 continual backprop（Dohare et al.）：
     每個隱藏單元維護一個 utility（效用，貢獻度的指數移動平均）與 age（自上次重置後的步數）。
@@ -1466,6 +1490,7 @@ TRAINER_REGISTRY = {
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "HippocampalReplayEWC": HippocampalReplayEWCTrainer,
+    "NCMReplayEWC": NCMReplayEWCTrainer,
     "TaskBalancedReplay": TaskBalancedReplayTrainer,
     "ContinualBP": ContinualBackpropTrainer,
     "ReplayContinualBP": ReplayContinualBackpropTrainer,
