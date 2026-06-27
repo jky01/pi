@@ -39,6 +39,12 @@ $PY tune_replay_ewc.py
 # reuses the MLP and every trainer. Validates which pi-digit findings transfer.
 $PY run_mnist.py permuted --methods Naive ReplayEWC DarkReplayEWC --seeds 0 1 2  # Permuted-MNIST Task-IL
 $PY run_mnist.py split --methods Naive ReplayEWC DarkReplayEWC NCMReplayEWC --seeds 0 1 2  # Split-MNIST class-IL
+
+# Frozen pretrained features + Class-IL on Split-CIFAR-100 (report §18 / P8).
+# extract_features.py is the ONLY step that uses torch (frozen ImageNet ResNet18 ->
+# cifar100_resnet18.npz, gitignored); run_features.py then trains a small head in pure numpy.
+$PY extract_features.py                       # one-time: cache CIFAR-100 ResNet18 features
+$PY run_features.py --methods Naive ReplayEWC DarkReplayEWC NCMReplayEWC --seeds 0 1 2
 ```
 
 ## Architecture

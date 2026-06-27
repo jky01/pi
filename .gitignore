@@ -2,3 +2,5 @@
 _bintest.bin
 __pycache__
 mnist.npz
+cifar100_resnet18.npz
+cifar_data/

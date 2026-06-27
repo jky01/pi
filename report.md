@@ -50,7 +50,9 @@
 
 **(P) P6：on-manifold（全域）輸入生成器假設被推翻（負面結果）**（§16）。P5 把殘留缺口歸因於因子化輸入離流形。P6 改用全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform 數位＝on-manifold）+ scholar 標註（`ScholarGlobalGenerativeReplayEWC`）。3-seed 反而**全面更差**：conflicting 0.428 < scholar-class 0.474 < raw 0.486、label 0.769 < scholar-class 0.809，**儘管 forgetting 最低**（0.052）——瓶頸是可塑性（diag 0.54→0.45）。把 teacher 均勻蒸餾到整個輸入空間是過強的全域正則、稀釋類界訊號；per-class 集中回放比全域覆蓋更重要。修正歸因：殘留小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移），非輸入分布失配。
 
-**(Q) P7：把核心結論搬到標準 MNIST benchmark 做外部效度驗證**（§17）。純 numpy 載入真實 MNIST（`mnist_data.py` / `mnist_benchmark.py` / `run_mnist.py`，介面與 pi stream 一致、重用全部 trainers）。**Permuted-MNIST（多頭 Task-IL，20 tasks×3 seeds）：DER++ 函數錨定完整守住**——DarkReplayEWC **0.912** > ReplayEWC 0.896 > Naive 0.840，BWT→**-0.002**、retention **0.998**，幅度隨串流長度複利（與 pi 一致）。**Split-MNIST class-IL（5 tasks、10 類、無 task id）：NCM「降低遺忘」方向成立**（forgetting 最低 0.028、retention 最高 0.977），**但 pi 的「線性頭崩潰＋DER++ 反轉成有害＋NCM 唯一解」被推翻為 200 類特例**——標準 10 類下線性頭 ReplayEWC 0.926 不崩、DER++ **0.952** 反而最佳。教訓：**replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出是跨 benchmark 真知識；戲劇性數字與「某機制必然反轉」的強論斷則隨類別數/串流長度/buffer 比例而變，不可外推。** 同時驗證了停掉 P2.5–P2.10 自動 gating（在 pi 特性上精雕、外部效度低）的判斷。下一步現代化方向：frozen pretrained feature + CL 讀出（P8，需先接特徵抽取器）。
+**(Q) P7：把核心結論搬到標準 MNIST benchmark 做外部效度驗證**（§17）。純 numpy 載入真實 MNIST（`mnist_data.py` / `mnist_benchmark.py` / `run_mnist.py`，介面與 pi stream 一致、重用全部 trainers）。**Permuted-MNIST（多頭 Task-IL，20 tasks×3 seeds）：DER++ 函數錨定完整守住**——DarkReplayEWC **0.912** > ReplayEWC 0.896 > Naive 0.840，BWT→**-0.002**、retention **0.998**，幅度隨串流長度複利（與 pi 一致）。**Split-MNIST class-IL（5 tasks、10 類、無 task id）：NCM「降低遺忘」方向成立**（forgetting 最低 0.028、retention 最高 0.977），**但 pi 的「線性頭崩潰＋DER++ 反轉成有害＋NCM 唯一解」被推翻為 200 類特例**——標準 10 類下線性頭 ReplayEWC 0.926 不崩、DER++ **0.952** 反而最佳。教訓：**replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出是跨 benchmark 真知識；戲劇性數字與「某機制必然反轉」的強論斷則隨類別數/串流長度/buffer 比例而變，不可外推。** 同時驗證了停掉 P2.5–P2.10 自動 gating（在 pi 特性上精雕、外部效度低）的判斷。
+
+**(R) P8：frozen pretrained 特徵上的 Class-IL（Split-CIFAR-100）**（§18）。用 frozen ImageNet ResNet18 抽 CIFAR-100 特徵（`extract_features.py`，唯一用 torch 的一步），在特徵上維持純 numpy 訓練小 head，跑標準 **Split-CIFAR-100**（20 tasks×5 類、單頭、無 task id、3 seeds）。**Naive 仍崩到 0.063**（強表徵不會自己解掉 CL）、線性頭 ReplayEWC **0.471（forget 0.440）**、DER++ **0.495**、**NCMReplayEWC 0.530（forget 0.198、retention 0.743）**。三 benchmark 合看，class-IL「線性頭→NCM」的改善**隨全域類別數單調放大**（MNIST 10 類微弱 → CIFAR-100 100 類大 → pi ~200 類戲劇性）——**pi 的「NCM 是 class-IL 英雄」不是特例，而是類別數的函數**，無偏原型讀出是跨 benchmark/跨表徵的修法。對「離真正 CL 多遠」：**強表徵把規模/表徵這道牆推近一步、但牆沒倒**（53% final 且這是 frozen 特徵＋有 buffer＋清楚切片的最有利設定；無 buffer/開放世界/正向遷移的硬牆未碰）。下一步 P9（拔 buffer）或 P10（量正向遷移）。
 
 ---
 
@@ -818,7 +820,52 @@ Naive 崩到 0.198（≈10 類 class-IL 的純亂猜上界），證明這是一�
 
 ---
 
-## 18. 結論
+## 18. Frozen pretrained 特徵上的 Class-IL：Split-CIFAR-100（P8）
+
+**為什麼**：§17 把結論搬到標準 MNIST，但仍是「2 層 MLP 硬學 raw pixel」。當代 CL 的真正戰場是 **pretrained / foundation model**——表徵不是從零學，而是來自一個強而通用的 frozen backbone。這帶來一個關鍵且未答的問題：**當輸入是強特徵時，本專案的抗遺忘工具箱（NCM 原型、DER++ 函數錨定）會變得更有用，還是被表徵本身的強度邊緣化？**（文獻裡兩種都發生過：夠強的 frozen 特徵 + 簡單 NCM 有時讓花俏 CL 方法顯得多餘。）
+
+**做法**：用 frozen ImageNet **ResNet18** 對 CIFAR-100 抽 512 維 penultimate 特徵（`extract_features.py`，唯一用到 torch 的一步，特徵快取成 `cifar100_resnet18.npz`）。在 frozen 特徵上仍維持純 numpy，訓練一個小 MLP head（512→256→256→100），介面與 pi/MNIST stream 一致（`feature_benchmark.py` / `run_features.py`），重用全部 trainers。設置為標準 **Split-CIFAR-100**：20 tasks × 5 類、單頭、推論不給 task id（真 Class-IL），3 seeds、每 task 5 epochs。
+
+### 18.1 結果：強表徵讓問題可學，但**沒有抹平**讀出選擇的決定性
+
+| 方法 | final_avg_acc | mean_forgetting | retention |
+| :--- | :---: | :---: | :---: |
+| Naive | 0.063 ± 0.002 | 0.922 | 0.067 |
+| ReplayEWC（線性頭） | 0.471 ± 0.006 | 0.440 | 0.531 |
+| DarkReplayEWC (DER++ α=0.5) | 0.495 ± 0.016 | 0.382 | 0.577 |
+| **NCMReplayEWC（原型讀出）** | **0.530 ± 0.004** | **0.198** | **0.743** |
+
+- **Naive 仍崩到 0.063**（100 類純亂猜≈0.01，6% 代表幾乎只剩最後一個 task）——即使有強特徵，class-IL 的災難性遺忘照樣存在；**強表徵不會自己解掉持續學習**。
+- **線性頭 recency bias 嚴重**：ReplayEWC forget **0.440**。
+- **NCM 是最大單一槓桿**：把 forgetting 從 0.440 砍到 **0.198**（不到一半）、final 0.471→**0.530**、retention 0.531→**0.743**。**讀出選擇（線性 vs 無偏原型）在強特徵上依然決定性。**
+- **DER++ 在此沒有反轉成有害**（0.495 > 0.471），但增益小、且修不掉核心遺忘（仍 0.382）。
+
+### 18.2 三個 benchmark 合起來：NCM 的價值隨類別數單調放大
+
+把 class-IL 的「線性頭 vs NCM」放在一起看，pi 與標準 benchmark 的張力被完全調和：
+
+| benchmark | 全域類別數 | 線性頭 ReplayEWC | NCM | NCM 對 forgetting 的幫助 |
+| :--- | :---: | :---: | :---: | :--- |
+| Split-MNIST | 10 | 0.926 | 0.941 | 微弱（forget 0.075→0.028） |
+| Split-CIFAR-100（frozen ResNet18） | 100 | 0.471 | **0.530** | 大（forget 0.440→0.198） |
+| pi class_il | ~200 | 0.31 | **0.858** | 戲劇性（forget 0.50→0.06） |
+
+**結論**：pi 上「NCM 是 class-IL 遺忘的英雄」**不是 pi 特例，而是類別數的函數**——Split-MNIST（10 類）太簡單看不出，到了標準的 Split-CIFAR-100（100 類、真 pretrained 特徵）NCM 又重新變成最大槓桿。**線性分類頭的 recency/magnitude bias 隨全域類別數放大，無偏原型讀出是跨 benchmark、跨表徵都成立的修法。** 而 pi 上「DER++ 必反轉成有害」仍是 pi 特例（CIFAR-100 上 DER++ 小幅有益）。
+
+### 18.3 回答「離真正的持續學習還有多遠」
+
+P8 直接驗證了之前的判斷：**強表徵把牆 #1（規模/表徵）推近了一步，但牆本身沒倒。** 兩件事同時成立：
+
+1. **抗遺忘工具箱是真知識、且在現代 regime 仍有效**：frozen ResNet 特徵 + 無偏原型讀出，把一個 Naive 會崩到 6% 的 100 類 class-IL 拉到 53%、retention 0.74。
+2. **但這仍只是「抗遺忘」**：53% final（forgetting 0.20）離 joint/上界還很遠，且這是在**最有利的設定**下（frozen 強特徵、有 replay buffer、清楚的 task 切片）。真正的持續學習硬牆——**無 buffer、開放世界非平穩、正向遷移/累積（越學越快）**——P8 一個都還沒碰。
+
+**限制與下一步**：(a) 只測了 frozen backbone，沒測 backbone 也持續適應（會引入表徵漂移，是 LLM 持續微調的真實難點）；(b) 仍重度依賴 replay buffer；(c) 沒有正向遷移量測。下一個有意義的方向是 **P9：在這個 frozen-feature regime 下拔掉 replay buffer**（測無 buffer 的原型/生成式回放能撐住多少），或 **P10：量測正向遷移**（早學的 task 是否讓晚學的 task 學得更快，而不只是別忘記）。
+
+**結果檔**：`results_feature_split_cifar100.json`；特徵抽取 `extract_features.py`（→ `cifar100_resnet18.npz`，已 gitignore）。
+
+---
+
+## 19. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -842,6 +889,7 @@ Naive 崩到 0.198（≈10 類 class-IL 的純亂猜上界），證明這是一�
 20. **rule-agnostic 生成回放：teacher 蒸餾補上 conflicting，自分類器則失敗（§15，P5）**。為讓條件自動對齊任務規則：`NBGenerativeReplayEWC`（從儲存 categorical 自建 NB 分類器 rejection）**失敗**（conflicting 0.418、label 退步到 0.521——因子化邊際做的分類器太弱）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher、對合成輸入做 soft-logit 蒸餾，generative DER++）**成功補上 conflicting 缺口**——0.474（final/Joint 0.628 vs raw 0.644，差 1.6%）且遺忘最低 0.082，因為 teacher 編碼每任務真實規則（含交互）能正確標註；label_permuted ≈ raw（0.809）但不及 sum-match 峰值。結論：**沒有單一 buffer-free 生成器全勝**（已知簡單統計量→sum-match；規則複雜/未知→scholar）。
 21. **on-manifold 輸入生成器假設被推翻；殘留缺口是真實樣本的不可取代價值（§16，P6，負面結果）**。P5 把缺口歸因於因子化輸入離流形。P6 改從全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform＝on-manifold）+ scholar 標註，但 3-seed **全面更差**（conflicting 0.428、label 0.769），儘管 forgetting 最低（0.052）——把 teacher 均勻蒸餾到整個輸入空間是過強全域正則、犧牲可塑性（diag 0.54→0.45），且稀釋類界訊號。**per-class 集中回放比全域 on-manifold 覆蓋更重要。** 修正 P5 歸因：scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw 在 conflicting 有 +BWT 而合成回放沒有），不是可被更好輸入模型補上的失配。整個 P4–P6 的總結論：**「不存原始樣本」可行且常常足夠（label_permuted 長流甚至贏 raw），但要完全追平 raw replay 仍有一道由真實樣本聯合結構撐起的小硬牆。**
 22. **外部效度驗證：核心機制守住、戲劇性數字是 pi 特例（§17，P7）**。把結論搬到 CL 社群的標準 benchmark：**Permuted-MNIST（多頭 Task-IL）上 DER++ 函數錨定完整守住**——0.912 > ReplayEWC 0.896、BWT→0、retention 0.998，且優勢隨串流長度複利（與 pi 一致）。**Split-MNIST class-IL 上 NCM「降低遺忘」的方向成立**（forgetting 最低 0.028、retention 最高 0.977），**但 pi 的「線性頭災難性崩潰、DER++ 反轉成有害、NCM 是唯一解」被推翻為 200 類特例**——標準 10 類下線性頭 0.926 不崩、DER++ 0.952 反而最佳。教訓：**replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出是跨 benchmark 的真知識；但具體數字的戲劇性與「某機制必然反轉」的強論斷會隨類別數/串流長度/buffer 比例而變，不能外推。** 這也驗證了停掉 P2.5–P2.10 自動 gating 微調的判斷（那條線在 pi 特性上精雕、外部效度低）。下一個現代化方向是 frozen pretrained feature + CL 讀出（P8，需先接特徵抽取器）。
+23. **Frozen pretrained 特徵上的 Class-IL：NCM 的價值隨類別數放大、強表徵不抹平工具箱（§18，P8）**。用 frozen ImageNet ResNet18 特徵跑標準 **Split-CIFAR-100**（20 tasks×5 類、單頭、無 task id）：Naive 仍崩到 **0.063**（強表徵不會自己解掉持續學習）、線性頭 ReplayEWC **0.471（forget 0.440）**、DER++ **0.495**、**NCMReplayEWC 0.530（forget 0.198、retention 0.743）**。三個 benchmark 合看，class-IL 的「線性頭→NCM」改善隨全域類別數單調放大（MNIST 10 類微弱、CIFAR-100 100 類大、pi ~200 類戲劇性），**證明 pi 的「NCM 是 class-IL 英雄」不是特例而是類別數的函數**；無偏原型讀出是跨 benchmark、跨表徵都成立的修法。同時回答「離真正 CL 多遠」：**強表徵把規模/表徵這道牆推近一步，但牆沒倒**——53% final、且這還是在 frozen 強特徵＋有 buffer＋清楚 task 切片的**最有利設定**下；真正的硬牆（無 buffer、開放世界、正向遷移/累積）一個都還沒碰。下一步 P9（拔掉 buffer）或 P10（量正向遷移）。
 
 ---
 
@@ -873,6 +921,8 @@ Naive 崩到 0.198（≈10 類 class-IL 的純亂猜上界），證明這是一�
 - `results_p6_scholar_global_{conflicting_40,label_permuted}.json`：§16 P6 全域 on-manifold 輸入生成器（負面結果——比 per-class scholar 更差）。
 - `mnist_data.py` / `mnist_benchmark.py` / `run_mnist.py`：§17 P7 標準 benchmark 外部效度驗證——純 numpy 載入真實 MNIST，建立與 pi stream 同介面的 `MNISTStream`（Permuted-MNIST 多頭 Task-IL、Split-MNIST class-IL），重用全部 trainers。
 - `results_mnist_permuted.json` / `results_mnist_split.json`：§17 驗證結果——DER++ 函數錨定守住（Permuted-MNIST），NCM 方向守住但「DER++ 反轉」被推翻為 200 類特例（Split-MNIST）。
+- `extract_features.py` / `feature_benchmark.py` / `run_features.py`：§18 P8 frozen pretrained 特徵上的 Class-IL——用 frozen ImageNet ResNet18 抽 CIFAR-100 特徵（唯一用 torch 的一步，輸出 `cifar100_resnet18.npz`，已 gitignore），在特徵上維持純 numpy 訓練小 head，重用全部 trainers。
+- `results_feature_split_cifar100.json`：§18 Split-CIFAR-100 結果——NCM 在 100 類重新成為最大抗遺忘槓桿（forget 0.440→0.198），證明 NCM 價值隨類別數放大。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。
