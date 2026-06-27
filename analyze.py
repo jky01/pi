@@ -293,8 +293,8 @@ def main():
     mode = "label_permuted"
     if len(sys.argv) > 1:
         mode = sys.argv[1]
-    if mode not in ["label_permuted", "input_permuted"]:
-        raise ValueError("Mode must be 'label_permuted' or 'input_permuted'")
+    if mode not in ["label_permuted", "input_permuted", "class_il", "conflicting"]:
+        raise ValueError("Mode must be 'label_permuted', 'input_permuted', 'class_il', or 'conflicting'")
 
     results = load_results(mode)
     methods = [m for m in PREFERRED_METHODS if m in results and len(results[m]) > 0]

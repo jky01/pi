@@ -27,7 +27,7 @@ class TestSmoke(unittest.TestCase):
         lr = 0.1
         
         methods = list(TRAINER_REGISTRY.keys())
-        modes = ["label_permuted", "input_permuted"]
+        modes = ["label_permuted", "input_permuted", "conflicting"]
         
         for mode in modes:
             for method in methods:

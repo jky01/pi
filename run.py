@@ -61,7 +61,7 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
     # Extract mode to configure model_kwargs
     mode = stream_kwargs.get("mode", "label_permuted")
     model_kwargs = dict(model_kwargs)
-    model_kwargs["multi_head"] = (mode == "label_permuted")
+    model_kwargs["multi_head"] = (mode in ("label_permuted", "conflicting"))
     model_kwargs["n_tasks"] = stream_kwargs.get("n_tasks", 80)
     # Class-IL: single head over a global, disjoint label space (n_classes * n_tasks),
     # no task id at inference. The 10-bucket base classes become 10*n_tasks global classes.
@@ -156,7 +156,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Run the Permuted-Pi-Digits continual-learning benchmark.")
     parser.add_argument("mode", nargs="?", default="label_permuted",
-                        choices=["label_permuted", "input_permuted", "class_il"])
+                        choices=["label_permuted", "input_permuted", "class_il", "conflicting"])
     parser.add_argument("--methods", nargs="+", default=DEFAULT_METHODS,
                         choices=sorted(TRAINER_REGISTRY),
                         help="Methods to run. Defaults to all core and improved methods.")

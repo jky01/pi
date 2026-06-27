@@ -20,9 +20,21 @@ Permuted-Pi-Digits：用 pi 數位序列建構的持續學習 (continual learnin
   網路必須持續學會新的輸出映射，而舊映射會被新映射蓋過，同時拷問可塑性流失
   （新 task 學不學得動）與遺忘（舊 task 還記不記得）。
 
+- conflicting 模式：仍是多頭 Task-IL，但每個 task 輪換不同的底層 input->class 函數
+  （sum、weighted sum、半窗 sum、相鄰乘積等），讓共享層真的面對相互衝突的特徵需求。
+
 - 每個 task 區塊額外保留一段「測試窗口」，訓練時不會看到，用來算 accuracy matrix。
 """
 import numpy as np
+
+
+CONFLICTING_RULES = (
+    "sum",
+    "weighted_sum",
+    "first_half_sum",
+    "second_half_sum",
+    "adjacent_product_sum",
+)
 
 
 def _windows_sum(digits: np.ndarray, K: int, start_idx: int, n: int) -> np.ndarray:
@@ -54,6 +66,13 @@ class PermutedPiDigitsStream:
             # For input_permuted, input dimensions are permuted, and labels are NOT permuted (use identity)
             self.input_permutations = [rng.permutation(10 * K) for _ in range(n_tasks)]
             self.permutations = [np.arange(n_classes) for _ in range(n_tasks)]
+        elif mode == "conflicting":
+            # Multi-head Task-IL, but the underlying input->class rule changes by task.
+            # Keep label ids unpermuted so the measured conflict comes from shared features,
+            # not from output remapping.
+            self.input_permutations = None
+            self.permutations = [np.arange(n_classes) for _ in range(n_tasks)]
+            self.conflict_rule_ids = [t % len(CONFLICTING_RULES) for t in range(n_tasks)]
         else:
             self.input_permutations = None
 
@@ -76,8 +95,38 @@ class PermutedPiDigitsStream:
         qs = np.linspace(0, 1, n_classes + 1)[1:-1]
         self.thresholds = np.quantile(calib_sums, qs)
 
+        if mode == "conflicting":
+            calib_windows = self._window_matrix(calib_start, calib_n)
+            self.conflict_thresholds = []
+            for rule_id in range(len(CONFLICTING_RULES)):
+                scores = self._conflicting_scores(calib_windows, rule_id)
+                self.conflict_thresholds.append(np.quantile(scores, qs))
+
         if mode == "class_il":
             self._build_class_il(K, n_classes, n_tasks, steps_per_task, test_per_task, calib_sums)
+
+    def _window_matrix(self, start_idx: int, n: int) -> np.ndarray:
+        return np.stack([self.digits[start_idx + i: start_idx + i + self.K] for i in range(n)])
+
+    def _conflicting_scores(self, window_mat: np.ndarray, rule_id: int) -> np.ndarray:
+        rule = CONFLICTING_RULES[rule_id % len(CONFLICTING_RULES)]
+        K = window_mat.shape[1]
+        if rule == "sum":
+            return window_mat.sum(axis=1)
+        if rule == "weighted_sum":
+            weights = np.arange(1, K + 1, dtype=np.float64)
+            return window_mat @ weights
+        if rule == "first_half_sum":
+            split = max(1, K // 2)
+            return window_mat[:, :split].sum(axis=1)
+        if rule == "second_half_sum":
+            split = max(1, K // 2)
+            return window_mat[:, split:].sum(axis=1)
+        if rule == "adjacent_product_sum":
+            if K < 2:
+                return window_mat[:, 0]
+            return (window_mat[:, :-1] * window_mat[:, 1:]).sum(axis=1)
+        raise ValueError(f"unknown conflicting rule: {rule}")
 
     def _build_class_il(self, K, n_classes, n_tasks, steps_per_task, test_per_task, calib_sums):
         """Well-posed Class-IL: a global label is the fine-grained (equal-frequency) bucket
@@ -109,10 +158,14 @@ class PermutedPiDigitsStream:
     def _bucket(self, sums: np.ndarray) -> np.ndarray:
         return np.searchsorted(self.thresholds, sums, side="right").astype(np.int64)
 
+    def _conflicting_bucket(self, scores: np.ndarray, task_idx: int) -> np.ndarray:
+        rule_id = self.conflict_rule_ids[task_idx]
+        return np.searchsorted(self.conflict_thresholds[rule_id], scores, side="right").astype(np.int64)
+
     def _make_xy(self, start_idx: int, n: int, task_idx: int):
         """從數位序列位置 start_idx 開始，產生 n 筆 (x_onehot, y) 樣本（滑動窗口，step=1）。"""
         K = self.K
-        window_mat = np.stack([self.digits[start_idx + i: start_idx + i + K] for i in range(n)])
+        window_mat = self._window_matrix(start_idx, n)
         X = np.zeros((n, 10 * K), dtype=np.float32)
         rows = np.repeat(np.arange(n), K)
         cols_k = np.tile(np.arange(K), n)
@@ -122,7 +175,11 @@ class PermutedPiDigitsStream:
         if self.mode == "input_permuted":
             X = X[:, self.input_permutations[task_idx]]
 
-        base_class = self._bucket(window_mat.sum(axis=1))
+        if self.mode == "conflicting":
+            rule_id = self.conflict_rule_ids[task_idx]
+            base_class = self._conflicting_bucket(self._conflicting_scores(window_mat, rule_id), task_idx)
+        else:
+            base_class = self._bucket(window_mat.sum(axis=1))
         Y = self.permutations[task_idx][base_class]
         return X, Y
 
