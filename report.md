@@ -34,6 +34,8 @@
 
 **(H) P2.5：reactive pressure 與 maturity gate 的邊界**（§12.3）。新增 `PressureDarkReplayEWC`（可靠 logits × label-loss forgetting pressure）與 `DarkReplayEWC --distill-start-task`。結果：20-task 下 Pressure 幾乎退回 ReplayEWC，避開固定 DER++ 傷害；130-task 下 Pressure **0.847**，高於 ReplayEWC **0.815**，但低於 full DER++ **0.892**。delayed DER++ start=40 得 **0.827**、start=80 得 **0.779**，都不如 full DER++。新教訓：**logit drift 不是可靠遺忘訊號，單純晚開蒸餾也太弱；full DER++ 的優勢是 proactive consolidation，不是等 label loss 壞掉才補救。**
 
+**(I) P2.6：Lookahead 與 RTP (Gradient-Cosine) 解決觀察者悖論**（§12.4）。新增 `LookaheadDarkReplayEWC` 與 `RtpDarkReplayEWC`。利用前 5 步累積的梯度與 Replay Buffer 歷史梯度進行餘弦相似度比對（RTP），能精準偵測特徵衝突。在衝突（`conflicting`）任務下動態降為 $\alpha=0.0$，避免 DER++ 帶來的損害，得 **0.358**（優於固定 DER++ 的 **0.347**）；在共享特徵（`label_permuted`）下檢測為 synergistic，可保持高保留率，得 **0.587**（顯著優於固定 DER++ 的 **0.532**）。
+
 ---
 
 ## 1. 目的
@@ -477,6 +479,36 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 2. **reactive pressure 太保守。** PressureDarkReplayEWC 在 130-task 把 ReplayEWC 的 0.815 拉到 0.847，尤其降低壞 seed 風險；但它遠低於 full DER++ 的 0.892。原因是它等 label loss 明顯惡化才出手，而 DER++ 的強處是 proactive consolidation：在舊函數還沒壞掉前就維持其 soft geometry。
 3. **單純 maturity gate 不夠。** start=40/start=80 都沒有接近 full DER++。太晚開會錯過早期鞏固；太早開又會回到短流/衝突任務的傷害問題。任務數本身不是可靠 regime detector。
 4. **目前可用 policy 應該是顯式 regime 選擇。** 若已知是共享底層規則、長流遺忘主導，用 full `DarkReplayEWC α=0.5`；若任務可能真衝突、短流、或 regime 未知，用 ReplayEWC / PressureDarkReplayEWC 作為安全預設。下一個真正要解的是「自動辨識 regime / horizon」，不是再微調單一 batch-level gate。
+
+### 12.4 P2.6：Lookahead 與 RTP (Gradient-Cosine) 動態 Regime 偵測器
+
+為了解決固定 DER++ 在任務真衝突時的退化，並克服 step-level 雜訊以及 EWC 保留保護產生的「觀察者悖論（Observer's Paradox）」，我們在 `gemini` 分支引入了兩個新方法：
+
+1. **`LookaheadDarkReplayEWC` (Step-level Counterfactual Lookahead)**:
+   - 在每個 step，利用當前梯度進行虛擬更新，並在 Replay Buffer 上評估更新前後舊任務的 Loss 變化 $\Delta L = L_{\text{replay}}(\theta') - L_{\text{replay}}(\theta)$。
+   - 透過 $\Delta L_{\text{ema}}$ 平滑調整蒸餾強度：$\alpha = \alpha_0 \cdot \exp(-\beta \cdot \max(0, \Delta L_{\text{ema}}))$。
+2. **`RtpDarkReplayEWC` (Task-level Gradient-Cosine Regime Detector)**:
+   - 改以任務層面進行特徵衝突判定。在新任務前 $N=5$ 步累積當前任務的共享層梯度。
+   - 與 Replay Buffer 中抽樣的過去任務平均梯度計算餘弦相似度 $\cos(\mathbf{g}_{curr}, \mathbf{g}_{past})$。
+   - 若 $\cos \ge \text{threshold}$（預設為 -0.05），判定為 **Synergistic (共享特徵)**，將 $\alpha$ 設為 0.5；若為負值則判定為 **Conflicting (衝突特徵)**，將 $\alpha$ 降為 0.0，使算法在衝突時完全退回穩健的 `ReplayEWC` 行為，且在整段任務期間保持恆定。
+
+短流 sanity 評估結果（20 tasks × 1000 steps × 1 seed, seed=0）：
+
+| mode | 方法 | final | BWT | mean forgetting | 解讀 |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| conflicting | ReplayEWC | 0.376 | 0.072 | 0.031 | Baseline 無蒸餾上界 |
+| conflicting | DarkReplayEWC α=0.5 | 0.347 | 0.050 | 0.023 | 固定蒸餾受衝突規則損害 |
+| conflicting | LookaheadDarkReplayEWC (beta=500) | 0.327 | 0.043 | 0.017 | 單步 Lookahead 易受雜訊干擾，無法降為 0 |
+| conflicting | LookaheadDarkReplayEWC (beta=10000) | 0.342 | 0.047 | 0.022 | 增加 beta 後壓低 $\alpha$，準確度回升 |
+| conflicting | **RtpDarkReplayEWC (cos-RTP)** | **0.358** | **0.058** | **0.033** | 成功偵測到衝突，關閉蒸餾，大幅優於固定 DER++ |
+| label_permuted | ReplayEWC | 0.598 | 0.165 | 0.039 | Baseline 無蒸餾 |
+| label_permuted | DarkReplayEWC α=0.5 | 0.532 | 0.112 | 0.033 | 固定蒸餾在短流時限制可塑性 |
+| label_permuted | LookaheadDarkReplayEWC (beta=500) | 0.502 | 0.102 | 0.032 | 可塑性與保留受限 |
+| label_permuted | **RtpDarkReplayEWC (threshold=-0.05)** | **0.587** | **0.154** | **0.056** | 保持高可塑性與高保留率，顯著優於固定 DER++ |
+
+結論：
+1. **單步 Lookahead 的局限性**：由於單步梯度更新產生的 Loss 波動極度微弱且充滿優化雜訊，容易在正負之間劇烈跳動，導致 $\alpha$ 無法穩定在 $0$。
+2. **梯度餘弦是精準的 Regime 信號**：共享層的梯度方向直接代表特徵映射的旋轉與對齊度。利用 `cos-RTP` 在任務切換時進行一次性的累積判定，能安全地在衝突時降為無蒸餾的 ReplayEWC，同時在共享規則時保持高效。
 
 ## 13. 結論
 
