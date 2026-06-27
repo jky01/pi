@@ -1910,9 +1910,9 @@ class SlowBenefitDarkReplayEWCTrainer(BenefitDarkReplayEWCTrainer):
     """Multi-step function-space benefit detector for DER++ distillation (P2.9).
 
     P2.8 used a single reversible update, which was safe but too short-sighted
-    to see DER++'s slow proactive consolidation. This variant evaluates the same
-    DER++ on/off counterfactual after several virtual replay/current updates in
-    a restored shadow state, then reuses the P2.8 EMA controller.
+    to see DER++'s slow proactive consolidation. This variant replays a short
+    recent-batch window in a restored shadow state, compares DER++ on/off after
+    that local rollout, then reuses the P2.8 EMA controller.
     """
     name = "SlowBenefitDarkReplayEWC"
 
@@ -1952,6 +1952,17 @@ class SlowBenefitDarkReplayEWCTrainer(BenefitDarkReplayEWCTrainer):
             benefit_min_old=benefit_min_old,
         )
         self.slow_rollout_steps = max(1, int(slow_rollout_steps))
+        self.slow_recent_batches = []
+        self._slow_window_task = None
+
+    def train_step(self, X, Y, task_idx: int = None):
+        if task_idx != self._slow_window_task:
+            self.slow_recent_batches = []
+            self._slow_window_task = task_idx
+        self.slow_recent_batches.append((X.copy(), Y.copy(), task_idx))
+        if len(self.slow_recent_batches) > self.slow_rollout_steps:
+            self.slow_recent_batches = self.slow_recent_batches[-self.slow_rollout_steps:]
+        return super().train_step(X, Y, task_idx)
 
     def _virtual_metrics(self, alpha, current_grads, X, Y, sample, task_idx, old_subset):
         snap = self._snapshot_model()
@@ -1960,12 +1971,15 @@ class SlowBenefitDarkReplayEWCTrainer(BenefitDarkReplayEWCTrainer):
         try:
             self._probe_alpha_override = float(alpha)
             self._suppress_alpha_trace = True
-            for _ in range(self.slow_rollout_steps):
-                cache = self.model.forward(X, task_idx)
-                grads = self.model.backward(cache, Y, task_idx)
-                grads = self._mix_dark_replay_grads(grads, *sample, task_idx)
-                ewc_grads = self._ewc_grad(task_idx)
-                self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
+            rollout_batches = self.slow_recent_batches[-self.slow_rollout_steps:]
+            if len(rollout_batches) == 0:
+                rollout_batches = [(X, Y, task_idx)]
+            for step_X, step_Y, step_task in rollout_batches:
+                cache = self.model.forward(step_X, step_task)
+                grads = self.model.backward(cache, step_Y, step_task)
+                grads = self._mix_dark_replay_grads(grads, *sample, step_task)
+                ewc_grads = self._ewc_grad(step_task)
+                self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=step_task)
 
             old_X, old_Y, old_tasks, old_logits = old_subset
             old_loss, old_acc = self._routed_loss_acc(old_X, old_Y, old_tasks)
