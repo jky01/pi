@@ -30,6 +30,8 @@
 
 **(F) 真衝突任務修正了「最終答案」**（§12）。新增 `conflicting` mode：task 輪換不同底層函數（sum / weighted sum / half-window sum / adjacent product），仍用多頭隔離 head，專測共享層衝突。40-task 結果：Joint 上界 **0.643**，ReplayEWC **0.486**（final/Joint 0.756），DER++ α=0.5 **0.449**（final/Joint 0.698）。DER++ 雖降低 forgetting（0.112→0.087），但 final 更差，表示函數錨定在底層規則真衝突時會過度保守。更新後的答案：**跨設定穩健骨幹是 replay + Fisher-EWC；DER++ / NCM / adapter / episodic readout 是依 regime 開關的模組，不是永遠打開的單一解。**
 
+**(G) 初步 adaptive distillation 結果**（§12.2）。新增 `AdaptiveDarkReplayEWC`：用共享層梯度 cosine 的 EMA 當 conflict detector，只有偵測到正向對齊時才開 DER++ 蒸餾；另讓 `DarkReplayEWC` 支援高信心/正確 logits 才蒸餾。20-task sanity 顯示：在 `conflicting` 下 adaptive 會把 α 降到 0，final 回到 ReplayEWC 的 **0.384**，避免固定 DER++ 的 **0.305** 傷害；confidence gate 也把固定 DER++ 拉到 **0.371**。但同一個梯度訊號在短流 `label_permuted` 也偏負，adaptive 會退回 ReplayEWC，尚未做到「共享規則長流時自動打開 DER++」。因此目前 adaptive gate 是安全閥，不是完整解。
+
 ---
 
 ## 1. 目的
@@ -412,6 +414,34 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 
 這一節把 §10 的結論校正得更精確：**Replay + Fisher-EWC + DER++** 是「共享底層函數、主要問題是遺忘」時的最強方案；若底層函數彼此衝突，DER++ 需要降權或自適應，否則會犧牲可塑性與 final/Joint ratio。
 
+### 12.2 初步修正：conflict-aware / confidence-gated distillation
+
+依 §12.1 的負結果，新增兩個很小的機制：
+
+- `AdaptiveDarkReplayEWC`：繼承 `DarkReplayEWC`，但用共享層梯度 cosine 的 EMA 當 conflict detector。若 replay distillation 與目前 regime 沒有正向對齊，`dark_alpha` 退到 `dark_alpha_min`（預設 0）；只有正向對齊時才逐步打開 DER++。
+- `DarkReplayEWC` 新增 confidence gate：可選擇只蒸餾「寫入 buffer 當下高信心、且 argmax 與真標籤一致」的 stored logits，避免把早期尚未學好的輸出幾何固化。
+
+20 tasks × 1000 steps × 2 seeds sanity 結果如下（短流，只作方向判斷，不取代 §12.1 的正式 40-task scorecard）：
+
+| mode | 方法 | final | BWT | mean forgetting | 解讀 |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| conflicting | ReplayEWC | **0.384 ± 0.008** | 0.075 | 0.030 | 穩健骨幹 |
+| conflicting | DarkReplayEWC α=0.5 | 0.305 ± 0.002 | 0.028 | **0.024** | 降遺忘但嚴重犧牲 final |
+| conflicting | AdaptiveDarkReplayEWC | **0.384 ± 0.008** | 0.075 | 0.030 | α 平均降到 0，成功退回 ReplayEWC |
+| conflicting | DarkReplayEWC + confidence gate | 0.371 ± 0.007 | 0.064 | 0.029 | 減少傷害，但仍低於 ReplayEWC |
+| label_permuted | ReplayEWC | **0.602 ± 0.004** | 0.149 | 0.046 | 短流下已很好 |
+| label_permuted | DarkReplayEWC α=0.5 | 0.470 ± 0.005 | 0.078 | **0.029** | 短流蒸餾太早、太強，降低 final |
+| label_permuted | AdaptiveDarkReplayEWC | 0.601 ± 0.004 | 0.148 | 0.044 | 同樣退回 ReplayEWC |
+| label_permuted | DarkReplayEWC + confidence gate | 0.550 ± 0.011 | 0.100 | 0.041 | 比固定 DER++ 好，但未超過 ReplayEWC |
+
+這一步的結論很重要但偏保守：
+
+1. **gradient-conflict gate 是有效安全閥。** 在 `conflicting` 下，它把 DER++ 自動關掉，避免固定蒸餾造成的 final collapse。這符合「機制應依 regime 開關」的主結論。
+2. **current-vs-dark 梯度 cosine 不是完整 regime detector。** 它在短流 `label_permuted` 也偏負，因此會把 DER++ 關掉；可是 §10 已證明長流 `label_permuted` 中 DER++ α=0.5 會大幅改善 130/250-task retention。也就是說，這個訊號能避免明顯傷害，卻還不能判斷「何時值得開蒸餾」。
+3. **confidence gate 支持「可靠記憶才鞏固」的腦啟發假設。** 只蒸餾高信心/正確 logits 可把 `conflicting` 的固定 DER++ 從 0.305 拉到 0.371、`label_permuted` 從 0.470 拉到 0.550。它沒有超過 ReplayEWC，但說明 DER++ 的一部分傷害來自固化低品質舊 logits。
+
+下一步不應再只調單一 α；更值得做的是 **雙條件蒸餾 policy**：先用 confidence/reliability 過濾可鞏固記憶，再用長期遺忘壓力或任務相似度訊號決定是否打開蒸餾。若做不到，就保持 `ReplayEWC` 為預設核心，DER++ 只在已知共享規則、長流遺忘主導的設定中手動開啟。
+
 ## 13. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
@@ -425,6 +455,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 9.  **直攻遺忘的答案：函數空間錨定（DER++ logit 蒸餾）（§10）**：遺忘是函數空間干擾。混合式 `FunctionSpaceReplay` 的消融顯示，**GPM 梯度投影不適配平穩輸入的本 benchmark（凍結共享層）**，但 **DER++ logit 蒸餾**有效——在 130-task 串流上把 final 從 0.815 抬到 **0.892**、淨遺忘 retention→**1.01**、BWT→0、方差砍 4 倍，且優勢隨串流變長複利放大（250 tasks 領先 +14.2 分、retention 仍 0.97）。**Replay + Fisher-EWC + DER++ 蒸餾**是本專案目前最有效、且抗遺忘隨串流增強的演算法，也是設計教訓：對「函數」做錨定（輸出/logits）比對「權重」或對「輸入子空間」做約束更貼合本問題的遺忘來源。
 10. **Class-IL 校正並隨後補強（§11）**。拿掉 task ID（單頭、200 類）後，Task-IL 的英雄 **DER++ 反轉成有害**（0.23 < 純 ReplayEWC 0.31），病灶是線性頭的 recency/magnitude bias。**把讀出換成 NCM 原型分類器（iCaRL 式，`NCMReplayEWC`）後，缺口幾乎補滿：0.31 → 0.858、遺忘 0.50 → 0.06、retention >1.0**（甚至超過線性頭 Joint 0.742）。關鍵教訓：**對的機制隨設定而變**——跨設定穩健的是 replay + Fisher-EWC 當表徵骨幹，再依設定換對的讀出（Task-IL：head + DER++ 蒸餾；Class-IL：無偏原型）。benchmark 的 Class-IL 規模上限 ~200 類（K=8 位數和僅 ~73 個相異值）。
 11. **Conflicting-task 校正了通用性判斷（§12）**。當 task 的底層函數真的不同，ReplayEWC 仍是最穩骨幹（final/Joint 0.756），但 DER++ α=0.5 反而降低 final/Joint 到 0.698；它降低 forgetting，卻阻礙學新衝突規則。這把「最終答案」從單一 trainer 改成一個設計原則：**replay + Fisher-EWC 是核心骨幹；DER++、NCM、adapter、episodic readout 是依 task regime 自適應開關的模組。**
+12. **Adaptive distillation 的第一版是安全閥，不是完整解（§12.2）**。`AdaptiveDarkReplayEWC` 能在 conflicting 下自動把蒸餾降到 0，回到 ReplayEWC、避開固定 DER++ 傷害；confidence gate 也能減少固化低品質 logits 的副作用。但目前梯度 cosine 訊號在短流 `label_permuted` 也偏負，無法自動重現長流 DER++ 的優勢。下一步要找更好的「何時開蒸餾」訊號，而不是只調 α。
 
 ---
 
@@ -444,6 +475,7 @@ logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention �
 - `results_classil_label.json` / `results_classil_dark01.json`：§11 Class-IL（誠實硬測試）實驗。
 - `results_classil_ncm.json` / `results_classil_ncm_trainer.json`：§11.3 NCM 原型分類器解 Class-IL 缺口。
 - `results_conflicting_*.json`：§12 任務底層函數真衝突 benchmark 與 DER++ alpha sweep。
+- `results_*adaptive*_sanity.json`、`results_*confidence_dark*_sanity.json`、`results_*dark_baseline_sanity.json`：§12.2 adaptive/confidence-gated distillation 的短流 sanity。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

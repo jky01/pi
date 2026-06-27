@@ -22,6 +22,7 @@
 - **Benna-Fusi / SustainableReplayEWC**：機制有效但只在 **replay-free** regime 才有價值；有 replay 時被 Fisher-EWC 支配（§9.4）。
 - **GPM 梯度投影不適配本 benchmark**（輸入平穩→凍結共享層）；函數空間錨定要用「輸出蒸餾」不是「輸入子空間投影」（§10.1）。
 - **Class-IL（誠實硬測試，§11）**：拿掉 task id 後線性頭因 recency bias 崩壞（**DER++ 反轉成有害**）。**已解：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 0.31→0.858、遺忘 0.50→0.06、retention>1.0**（§11.3）。教訓：表徵骨幹用 replay+EWC，讀出依設定換（Task-IL：head+DER++；Class-IL：無偏原型）。benchmark Class-IL 上限 ~200 類（K=8 位數和僅 ~73 相異值）。
+- **Adaptive distillation 初步結果（§12.2）**：`AdaptiveDarkReplayEWC` 可在 conflicting 下自動把 α 降到 0，退回 ReplayEWC、避免固定 DER++ 傷害；confidence gate 可減少低品質 logits 的副作用。但目前梯度 cosine 只能當安全閥，還不能自動判斷何時該在長流共享規則下打開 DER++。
 - **正向遷移**：表徵層有（晚段任務最終準確率更高），學習速度沒有（§10.3）。
 
 ## 2. Backlog（依優先序；每項含 為什麼 / 做法 / 驗收）
@@ -57,6 +58,10 @@
   - DarkReplayEWC α=0.25：0.458 ± 0.004，final/Joint 0.711，forget 0.093。
   - DarkReplayEWC α=0.5：0.449 ± 0.006，final/Joint 0.698，forget 0.087。
   結論：α 越大，forgetting 越低，但 final/Joint 越差。DER++ 在「共享底層函數」時是英雄，在「底層函數真衝突」時會過度錨定。下一步應做 **adaptive distillation strength / conflict detector**，而不是固定開 DER++。
+- **adaptive/confidence-gated distillation sanity（20 tasks × 1000 steps × 2 seeds，已寫入 `report.md` §12.2）**：
+  - conflicting：ReplayEWC **0.384 ± 0.008**；固定 DarkReplayEWC α=0.5 **0.305 ± 0.002**；`AdaptiveDarkReplayEWC` **0.384 ± 0.008**（α 平均降到 0）；confidence-gated DarkReplayEWC **0.371 ± 0.007**。
+  - label_permuted：ReplayEWC **0.602 ± 0.004**；固定 DarkReplayEWC α=0.5 **0.470 ± 0.005**；`AdaptiveDarkReplayEWC` **0.601 ± 0.004**；confidence-gated DarkReplayEWC **0.550 ± 0.011**。
+  - 結論：gradient-conflict gate 是有效安全閥，可避免 DER++ 在真衝突下傷害模型；confidence gate 支持「可靠記憶才鞏固」的假設。但 current-vs-dark 梯度 cosine 在短流 label_permuted 也偏負，不能當完整 regime detector。下一步不要只調 α，應找 **何時開蒸餾** 的訊號（長期遺忘壓力、任務相似度、reliability × drift policy）。
 
 ### P3 — Task-free（無邊界）CL
 - **為什麼**：目前都靠 `on_task_end`（算 Fisher、更新 adapter/GPM 基、Class-IL 切片）——等於知道任務何時切換。真實串流沒有邊界。

@@ -108,11 +108,40 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
         diag = model.diagnostics(X[:200], t)
         diagnostics_over_time.append(dict(task=t, **diag))
 
+    trainer_diagnostics = {}
+    if hasattr(trainer, "alpha_trace") and len(trainer.alpha_trace) > 0:
+        alpha_trace = np.array(trainer.alpha_trace, dtype=np.float64)
+        conflict_trace = np.array(getattr(trainer, "conflict_trace", []), dtype=np.float64)
+        tail_n = min(200, len(alpha_trace))
+        trainer_diagnostics["adaptive_dark_alpha_mean"] = float(np.mean(alpha_trace))
+        trainer_diagnostics["adaptive_dark_alpha_tail_mean"] = float(np.mean(alpha_trace[-tail_n:]))
+        trainer_diagnostics["adaptive_dark_alpha_min"] = float(np.min(alpha_trace))
+        trainer_diagnostics["adaptive_dark_alpha_max"] = float(np.max(alpha_trace))
+        if len(conflict_trace) > 0:
+            trainer_diagnostics["adaptive_conflict_mean"] = float(np.mean(conflict_trace))
+            trainer_diagnostics["adaptive_conflict_tail_mean"] = float(np.mean(conflict_trace[-tail_n:]))
+            trainer_diagnostics["adaptive_conflict_min"] = float(np.min(conflict_trace))
+            trainer_diagnostics["adaptive_conflict_max"] = float(np.max(conflict_trace))
+        conflict_ema_trace = np.array(getattr(trainer, "conflict_ema_trace", []), dtype=np.float64)
+        if len(conflict_ema_trace) > 0:
+            trainer_diagnostics["adaptive_conflict_ema_mean"] = float(np.mean(conflict_ema_trace))
+            trainer_diagnostics["adaptive_conflict_ema_tail_mean"] = float(np.mean(conflict_ema_trace[-tail_n:]))
+        for attr, out_key in [
+            ("current_replay_ce_cos_trace", "adaptive_current_replay_ce_cos"),
+            ("current_dark_cos_trace", "adaptive_current_dark_cos"),
+            ("ce_dark_cos_trace", "adaptive_ce_dark_cos"),
+        ]:
+            vals = np.array(getattr(trainer, attr, []), dtype=np.float64)
+            if len(vals) > 0:
+                trainer_diagnostics[f"{out_key}_mean"] = float(np.mean(vals))
+                trainer_diagnostics[f"{out_key}_tail_mean"] = float(np.mean(vals[-tail_n:]))
+
     return dict(
         method=method_name,
         seed=seed,
         acc_matrix=acc_matrix.tolist(),
         diagnostics=diagnostics_over_time,
+        trainer_diagnostics=trainer_diagnostics,
         plasticity_first_batch_acc=plasticity_first_batch_acc,
         n_tasks=n_tasks,
         mode=mode,
@@ -181,6 +210,18 @@ def main():
                         help="Override EWC regularizer gradient clipping norm.")
     parser.add_argument("--dark-alpha", type=float, default=None,
                         help="Override logit-consistency strength for DarkReplayEWC.")
+    parser.add_argument("--dark-confidence-threshold", type=float, default=None,
+                        help="Only distill stored logits above this target confidence; lower-confidence samples get downweighted.")
+    parser.add_argument("--dark-require-correct", action="store_true",
+                        help="Only distill stored logits whose argmax matched the sample label when saved.")
+    parser.add_argument("--dark-alpha-min", type=float, default=None,
+                        help="Minimum logit-consistency strength for AdaptiveDarkReplayEWC.")
+    parser.add_argument("--conflict-margin", type=float, default=None,
+                        help="Positive shared-gradient cosine needed for AdaptiveDarkReplayEWC to reach maximum distillation.")
+    parser.add_argument("--alpha-smoothing", type=float, default=None,
+                        help="EMA smoothing factor for AdaptiveDarkReplayEWC's distillation strength.")
+    parser.add_argument("--conflict-ema-decay", type=float, default=None,
+                        help="EMA decay for AdaptiveDarkReplayEWC's stream-level conflict estimate.")
     parser.add_argument("--replay-weight", type=float, default=None,
                         help="Override replay/current gradient mixing weight for replay methods that support it.")
     parser.add_argument("--candidate-mult", type=int, default=None,
@@ -253,6 +294,18 @@ def main():
         trainer_kwargs["grad_clip_norm"] = args.ewc_grad_clip
     if args.dark_alpha is not None:
         trainer_kwargs["dark_alpha"] = args.dark_alpha
+    if args.dark_confidence_threshold is not None:
+        trainer_kwargs["dark_confidence_threshold"] = args.dark_confidence_threshold
+    if args.dark_require_correct:
+        trainer_kwargs["dark_require_correct"] = True
+    if args.dark_alpha_min is not None:
+        trainer_kwargs["dark_alpha_min"] = args.dark_alpha_min
+    if args.conflict_margin is not None:
+        trainer_kwargs["conflict_margin"] = args.conflict_margin
+    if args.alpha_smoothing is not None:
+        trainer_kwargs["alpha_smoothing"] = args.alpha_smoothing
+    if args.conflict_ema_decay is not None:
+        trainer_kwargs["conflict_ema_decay"] = args.conflict_ema_decay
     if args.replay_weight is not None:
         trainer_kwargs["replay_weight"] = args.replay_weight
     if args.candidate_mult is not None:

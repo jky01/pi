@@ -6,12 +6,14 @@
 3. ReplayTrainer            — Experience Replay，小型 reservoir buffer（重播派代表）。
 4. ReplayEWCTrainer         — Replay + online EWC，結合樣本重播與參數保護。
 5. DarkReplayEWCTrainer     — ReplayEWC + logits consistency（DER/SER 系列方向）。
-6. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
-7. MarginSurpriseReplayEWCTrainer
+6. AdaptiveDarkReplayEWCTrainer
+                            — DarkReplayEWC + gradient-conflict gated distillation。
+7. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
+8. MarginSurpriseReplayEWCTrainer
                             — ReplayEWC + loss/surprise + low-margin boundary replay。
-8. HippocampalReplayEWCTrainer
+9. HippocampalReplayEWCTrainer
                             — SurpriseReplayEWC + episodic prototype memory at inference。
-9. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
+10. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
                               重置「低效用、夠老」的死/低貢獻單元，其餘權重完全
                               不動——這是對話第一輪明確回答「不重置權重」的機制，
                               主打可塑性流失（失效 B），跟前兩者主打遺忘（失效 A）形成對照。
@@ -450,7 +452,8 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
                  replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
                  fisher_batches: int = 30, fisher_decay: float = 0.9,
                  grad_clip_norm: float = 50.0, dark_alpha: float = 0.1,
-                 replay_weight: float = 0.5):
+                 replay_weight: float = 0.5, dark_confidence_threshold: float = 0.0,
+                 dark_require_correct: bool = False):
         super().__init__(
             model,
             lr=lr,
@@ -464,6 +467,8 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
         )
         self.dark_alpha = dark_alpha
         self.replay_weight = replay_weight
+        self.dark_confidence_threshold = float(np.clip(dark_confidence_threshold, 0.0, 1.0))
+        self.dark_require_correct = bool(dark_require_correct)
         self.buf_logits = []
 
     @staticmethod
@@ -500,10 +505,29 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
         rlogits = np.stack([self.buf_logits[i] for i in idx])
         return rX, rY, rtasks, rlogits
 
-    def _dark_grads(self, cache, target_logits, task_idx):
+    @staticmethod
+    def _target_probs(logits):
+        z = logits - logits.max(axis=1, keepdims=True)
+        e = np.exp(z)
+        return e / e.sum(axis=1, keepdims=True)
+
+    def _dark_grads(self, cache, target_logits, task_idx, labels=None):
         n, out_dim = target_logits.shape
         dlogits = 2.0 * (cache["logits"] - target_logits) / max(1, n * out_dim)
+        if self.dark_confidence_threshold > 0.0 or self.dark_require_correct:
+            target_probs = self._target_probs(target_logits)
+            confidence = target_probs.max(axis=1)
+            weights = np.ones(n, dtype=np.float64)
+            if self.dark_confidence_threshold > 0.0:
+                denom = max(1e-12, 1.0 - self.dark_confidence_threshold)
+                weights *= np.clip((confidence - self.dark_confidence_threshold) / denom, 0.0, 1.0)
+            if self.dark_require_correct and labels is not None:
+                weights *= (target_probs.argmax(axis=1) == labels).astype(np.float64)
+            dlogits = dlogits * weights[:, None]
         return self.model.backward_from_logits_grad(cache, dlogits, task_idx)
+
+    def _effective_dark_alpha(self, current_grads, ce_grads, dark_grads):
+        return self.dark_alpha
 
     def _mix_dark_replay_grads(self, grads, rX, rY, rtasks, rlogits, task_idx):
         replay_weight = self.replay_weight
@@ -521,8 +545,9 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
 
                 sub_cache = self.model.forward(sub_X, t)
                 ce_grads = self.model.backward(sub_cache, sub_Y, t)
-                dark_grads = self._dark_grads(sub_cache, sub_logits, t)
-                sub_grads = self._add_grads(ce_grads, dark_grads, self.dark_alpha)
+                dark_grads = self._dark_grads(sub_cache, sub_logits, t, sub_Y)
+                alpha = self._effective_dark_alpha(grads, ce_grads, dark_grads)
+                sub_grads = self._add_grads(ce_grads, dark_grads, alpha)
 
                 weight = len(sub_idx) / len(rtasks)
                 for k in ["W1", "b1", "W2", "b2"]:
@@ -563,8 +588,9 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
                 sub_idx = [i for i, val in enumerate(rtasks) if val == t]
                 sub_cache = self.model.forward(rX[sub_idx], t)
                 ce_grads = self.model.backward(sub_cache, rY[sub_idx], t)
-                dark_grads = self._dark_grads(sub_cache, rlogits[sub_idx], t)
-                sub_grads = self._add_grads(ce_grads, dark_grads, self.dark_alpha)
+                dark_grads = self._dark_grads(sub_cache, rlogits[sub_idx], t, rY[sub_idx])
+                alpha = self._effective_dark_alpha(grads, ce_grads, dark_grads)
+                sub_grads = self._add_grads(ce_grads, dark_grads, alpha)
                 weight = len(sub_idx) / len(rtasks)
                 for k in shared_keys:
                     rgrads_accum[k] += weight * sub_grads[k]
@@ -583,8 +609,9 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
 
         rcache = self.model.forward(rX)
         ce_grads = self.model.backward(rcache, rY)
-        dark_grads = self._dark_grads(rcache, rlogits, None)
-        rgrads = self._add_grads(ce_grads, dark_grads, self.dark_alpha)
+        dark_grads = self._dark_grads(rcache, rlogits, None, rY)
+        alpha = self._effective_dark_alpha(grads, ce_grads, dark_grads)
+        rgrads = self._add_grads(ce_grads, dark_grads, alpha)
         return {k: current_weight * grads[k] + replay_weight * rgrads[k] for k in grads}
 
     def train_step(self, X, Y, task_idx: int = None):
@@ -600,6 +627,114 @@ class DarkReplayEWCTrainer(ReplayEWCTrainer):
         self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
         self._reservoir_insert(X, Y, task_idx)
         return loss, acc
+
+
+class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
+    """DarkReplayEWC with gradient-conflict gated logit distillation.
+
+    Fixed DER++ can over-anchor old functions when the incoming task truly needs
+    different shared features. This variant keeps ReplayEWC as the backbone, but
+    lowers the dark-logit weight when the replay distillation gradient opposes
+    either the current-task gradient or the replay label gradient on shared layers.
+    """
+    name = "AdaptiveDarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, dark_alpha_min: float = 0.0,
+                 conflict_margin: float = 0.2, alpha_smoothing: float = 0.2,
+                 conflict_ema_decay: float = 0.95, dark_confidence_threshold: float = 0.0,
+                 dark_require_correct: bool = False):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            dark_alpha=dark_alpha,
+            replay_weight=replay_weight,
+            dark_confidence_threshold=dark_confidence_threshold,
+            dark_require_correct=dark_require_correct,
+        )
+        self.dark_alpha_max = float(dark_alpha)
+        self.dark_alpha_min = float(dark_alpha_min)
+        self.conflict_margin = max(1e-6, float(conflict_margin))
+        self.alpha_smoothing = float(np.clip(alpha_smoothing, 0.0, 1.0))
+        self.conflict_ema_decay = float(np.clip(conflict_ema_decay, 0.0, 0.999))
+        self.conflict_ema = None
+        self.adaptive_dark_alpha = None
+        self.alpha_trace = []
+        self.conflict_trace = []
+        self.conflict_ema_trace = []
+        self.current_replay_ce_cos_trace = []
+        self.current_dark_cos_trace = []
+        self.ce_dark_cos_trace = []
+
+    @staticmethod
+    def _shared_cosine(a, b):
+        keys = [k for k in ("W1", "b1", "W2", "b2") if k in a and k in b]
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+        for k in keys:
+            av = a[k]
+            bv = b[k]
+            dot += float(np.sum(av * bv))
+            norm_a += float(np.sum(av * av))
+            norm_b += float(np.sum(bv * bv))
+        denom = np.sqrt(norm_a) * np.sqrt(norm_b)
+        if denom <= 1e-12:
+            return 0.0
+        return float(np.clip(dot / denom, -1.0, 1.0))
+
+    def _alpha_from_conflict(self, conflict_score):
+        if conflict_score <= 0.0:
+            scale = 0.0
+        elif conflict_score >= self.conflict_margin:
+            scale = 1.0
+        else:
+            scale = conflict_score / self.conflict_margin
+        return self.dark_alpha_min + (self.dark_alpha_max - self.dark_alpha_min) * scale
+
+    def _effective_dark_alpha(self, current_grads, ce_grads, dark_grads):
+        current_replay_ce_cos = self._shared_cosine(current_grads, ce_grads)
+        current_dark_cos = self._shared_cosine(current_grads, dark_grads)
+        ce_dark_cos = self._shared_cosine(ce_grads, dark_grads)
+        conflict_score = min(current_dark_cos, ce_dark_cos)
+        if self.conflict_ema is None:
+            self.conflict_ema = conflict_score
+        else:
+            d = self.conflict_ema_decay
+            self.conflict_ema = d * self.conflict_ema + (1.0 - d) * conflict_score
+        target_alpha = self._alpha_from_conflict(self.conflict_ema)
+
+        if self.adaptive_dark_alpha is None:
+            alpha = target_alpha
+        else:
+            s = self.alpha_smoothing
+            alpha = (1.0 - s) * self.adaptive_dark_alpha + s * target_alpha
+        self.adaptive_dark_alpha = float(alpha)
+
+        self.alpha_trace.append(float(alpha))
+        self.conflict_trace.append(float(conflict_score))
+        self.conflict_ema_trace.append(float(self.conflict_ema))
+        self.current_replay_ce_cos_trace.append(float(current_replay_ce_cos))
+        self.current_dark_cos_trace.append(float(current_dark_cos))
+        self.ce_dark_cos_trace.append(float(ce_dark_cos))
+        if len(self.alpha_trace) > 2000:
+            self.alpha_trace = self.alpha_trace[-1000:]
+            self.conflict_trace = self.conflict_trace[-1000:]
+            self.conflict_ema_trace = self.conflict_ema_trace[-1000:]
+            self.current_replay_ce_cos_trace = self.current_replay_ce_cos_trace[-1000:]
+            self.current_dark_cos_trace = self.current_dark_cos_trace[-1000:]
+            self.ce_dark_cos_trace = self.ce_dark_cos_trace[-1000:]
+        return float(alpha)
 
 
 class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
@@ -1487,6 +1622,7 @@ TRAINER_REGISTRY = {
     "Replay": ReplayTrainer,
     "ReplayEWC": ReplayEWCTrainer,
     "DarkReplayEWC": DarkReplayEWCTrainer,
+    "AdaptiveDarkReplayEWC": AdaptiveDarkReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "HippocampalReplayEWC": HippocampalReplayEWCTrainer,
