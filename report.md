@@ -22,6 +22,10 @@
 - `BennaFusi`（複雜突觸，冪律遺忘）驗證有效（forget 0.23→0.03），但被 Fisher-selective EWC 支配；其棲位在 **replay-free**：80-task 下把 Naive 29%→53%、逼近 EWC 58% 且不存樣本、不算 Fisher。
 - **設計準則**：能存樣本就用 replay(+EWC)；不能存樣本才換複雜突觸；可塑性注入只在完全沒有 replay 時才有意義。
 
+**(D) 直攻遺忘的最終演算法：Replay + Fisher-EWC + DER++ logit 蒸餾**（§10）
+
+遺忘是函數空間干擾，不是權重位移。實作可切換的 `FunctionSpaceReplay`（Replay + DER++ 蒸餾 + GPM 投影）做消融：GPM 因本 benchmark 輸入平穩而凍結共享層（不適配），但 **DER++ logit 蒸餾**有效——在 130-task 串流上把 final 從 ReplayEWC 的 0.815 抬到 **0.892**、**retention→1.01（淨遺忘≈0）**、BWT→0、方差砍 4 倍。**優勢隨串流變長而複利放大**：250 tasks 時領先從 +7.7 拉到 **+14.2 分**（0.680→0.822），retention 仍 0.97。這是目前最有效、且抗遺忘能力隨串流增強的「持續學習」配置。
+
 ---
 
 ## 1. 目的
@@ -279,7 +283,49 @@
 
 結論：Benna-Fusi 驗證了冪律遺忘確實有效，但在本 benchmark「有 replay」的主線上，Fisher-selective EWC 是更有效率的權重穩定機制；Benna-Fusi 的價值在**無法存樣本、也不想算 Fisher 的純線上場景**。
 
-## 10. 結論
+## 10. 直攻遺忘：函數空間抗遺忘與混合式訓練器
+
+§9 確立「瓶頸是遺忘」後，本節直接針對遺忘做演算法設計。核心理念（呼應對話 §11 的 functional regularization）：**遺忘是函數空間的干擾，不是權重空間的位移**——權重在舊任務的零空間裡大動也不會遺忘，在敏感方向小動卻會災難性遺忘。EWC 只是這件事的對角近似（忽略參數相關性），Benna-Fusi 更只是各向同性，所以都留有上界差距。我們實作 `FunctionSpaceReplay`，把三個直攻函數空間的機制疊在一起並可切換：
+
+1. **Replay**（覆蓋）。
+2. **DER++ logit 蒸餾**（函數軟錨）：回放時用 MSE 把現在對舊樣本的輸出拉回寫入當下的 logits，保住整個 softmax 幾何。
+3. **GPM 梯度投影**（子空間硬鎖）：維護每個共享層「舊任務輸入子空間」的正交基 M，把共享層梯度投影到 M 的正交補（`G ← G − M(MᵀG)`），使舊輸入的輸出數學上不被擾動。
+
+### 10.1 消融：GPM 不適配本 benchmark，但 DER++ 有效（40 tasks，label_permuted）
+
+| 配置 | final | retention | forget | diag_last |
+| :--- | :---: | :---: | :---: | :---: |
+| ReplayEWC（baseline） | 0.818 | 1.016 | 0.102 | 0.873 |
+| Replay only | 0.824 | 1.023 | 0.090 | 0.864 |
+| +DER++（dark） | 0.804 | 1.042 | **0.047** | 0.844 |
+| +GPM（dark+gpm） | **0.370** | 0.906 | 0.069 | **0.404** |
+
+- **GPM 崩盤**（final 0.80→0.37、diag 0.84→0.40），這是有原理的負結果：GPM 防的是**輸入分布漂移**，但本 benchmark 的輸入是**平穩的**（label_permuted 漂的是標籤、由 head 處理；input_permuted 由 adapter 還原成正則輸入）。於是 task 0 之後 GPM 基就吃掉幾乎整個輸入子空間、**凍結共享層**→可塑性崩潰。函數空間的「原則」對，但 input-subspace 投影對平穩輸入是錯的工具。
+- **DER++（logit 蒸餾）有效**：把 forgetting 從 0.090 砍到 0.047、retention 拉到 1.042。在 40 tasks 因為遺忘還沒累積，final 沒動；但這個遺忘削減會在長串流上複利放大。
+
+### 10.2 在長串流上，DER++ 幾乎消滅淨遺忘（130 tasks，label_permuted，2 seeds）
+
+把有效配置（Replay + Fisher-EWC + DER++ logit 蒸餾，α=0.5，GPM 關閉）＝ `DarkReplayEWC` 拉到 130 個任務：
+
+| 130 tasks | final | forget | retention | BWT |
+| :--- | :---: | :---: | :---: | :---: |
+| ReplayEWC | 0.815 ± 0.074 | 0.130 | 0.921 | −0.07 |
+| **DarkReplayEWC (+DER++)** | **0.892 ± 0.019** | **0.043** | **1.01** | **≈ 0** |
+
+logit 蒸餾把 final 抬 **+7.7 分**、forgetting 砍到 **1/3**、retention 推到 **~1.0（淨遺忘幾乎為零）**、BWT→0，並把 seed 間方差砍掉 **4 倍**（0.074→0.019，更可靠）。報告早期短流 sweep（80 tasks、α=0.1）曾認為 DarkReplayEWC 沒贏 ReplayEWC——本節證明那是因為**遺忘未累積且蒸餾太弱**；長串流＋α=0.5 後，函數錨定的優勢清楚顯現。
+
+再把串流拉到 **250 tasks × 2000 steps（3 seeds）**確認可永續性：
+
+| 250 tasks | final | forget | retention | diag_last |
+| :--- | :---: | :---: | :---: | :---: |
+| ReplayEWC | 0.680 ± 0.051 | 0.206 | 0.823 | 0.912 |
+| **DarkReplayEWC (+DER++)** | **0.822 ± 0.015** | **0.077** | **0.972** | 0.949 |
+
+**優勢隨串流長度複利放大**：130 tasks 領先 +7.7 分、250 tasks 拉開到 **+14.2 分**；遺忘累積得越多，蒸餾擋掉的越多，而 diag_last 0.949 顯示可塑性毫髮無傷。retention 在 250 個任務後仍維持 **0.97**——這正是「可永續持續學習」的定義：抗遺忘能力**隨串流變長而變強**。
+
+**這就是直接回答「找一個有效抗遺忘、達到持續學習的演算法」：Replay + Fisher-selective EWC + DER++ logit 蒸餾**。它在 130-task 串流上把淨遺忘壓到接近零（retention 1.01），是本專案目前最接近「持續學習」定義的配置。GPM 則被本 benchmark 的平穩輸入結構排除——這本身是一條清楚的設計教訓：input-subspace 投影只在輸入真的漂移時才該用。
+
+## 11. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -289,6 +335,7 @@
 6.  **轉接器把 input_permuted 從不可能變成可解**：給每個 task 一個輸入轉接器後，瓶頸從「結構不可學」轉成「一般的穩定性–可塑性問題」；接好 adapter 的 ReplayEWC 把 final average accuracy 從 12% 抬到 54.7%（上界 81.1%）。值得注意的是此 regime 下 **ReplayEWC 反而勝過 Surprise/Hippocampal**，與 `label_permuted` 的排名相反——說明前沿機制的優劣會隨任務結構翻轉，沒有單一全勝的方法。下一步是更大 buffer / 更強 shared-layer 保護來收掉剩下的 55%→81% 遺忘缺口，以及把 adapter 推向 learned router / modularity。
 7.  **可永續學習的瓶頸是遺忘、不是可塑性流失（§9）**：把串流拉到 250 個任務，有 replay 的方法對角線不降反升，可塑性根本不綁定；專門維護可塑性的 `SustainableReplayEWC` 雖然完成設計目標（dead-unit≈0、effective rank 最高、且修好了 ReplayContinualBP 的記憶損傷），卻換不到準確率，因為這個 regime 本來就不缺可塑性。要再提升「可永續性」應主攻遺忘（更強記憶/正則、Benna-Fusi、generative replay）；可塑性注入要見效得換到無 replay 的 regime。
 8.  **Benna-Fusi 複雜突觸：冪律遺忘有效，但棲位在 replay-free（§9.4）**：純 `BennaFusi` 把遺忘從 0.23 壓到 0.03，驗證冪律記憶有效；但它各向同性地拖住所有權重，在有 replay 時被 Fisher-selective 的 ReplayEWC 完全支配。它的真正價值是 replay-free / Fisher-free 的線上鞏固——80-task 下把 Naive 的 29% 翻倍到 53%、逼近 EWC 的 58% 且遺忘更低，且完全不存樣本、不算 Fisher。這把「該用哪種穩定機制」收斂成一條清楚的設計準則：能存樣本就用 replay(+EWC)，不能存樣本才換複雜突觸。
+9.  **直攻遺忘的答案：函數空間錨定（DER++ logit 蒸餾）（§10）**：遺忘是函數空間干擾。混合式 `FunctionSpaceReplay` 的消融顯示，**GPM 梯度投影不適配平穩輸入的本 benchmark（凍結共享層）**，但 **DER++ logit 蒸餾**有效——在 130-task 串流上把 final 從 0.815 抬到 **0.892**、淨遺忘 retention→**1.01**、BWT→0、方差砍 4 倍，且優勢隨串流變長複利放大（250 tasks 領先 +14.2 分、retention 仍 0.97）。**Replay + Fisher-EWC + DER++ 蒸餾**是本專案目前最有效、且抗遺忘隨串流增強的演算法，也是設計教訓：對「函數」做錨定（輸出/logits）比對「權重」或對「輸入子空間」做約束更貼合本問題的遺忘來源。
 
 ---
 
@@ -297,13 +344,14 @@
 - `pi_digits.py`：產生/快取 pi 小數位序列。
 - `benchmark.py`：Permuted-Pi-Digits 串流（支持多頭 `label_permuted` 和單頭 `input_permuted`）。
 - `model.py`：支持多頭選擇、per-task 輸入轉接器（`input_adapter`）與可塑性診斷的 numpy MLP 實現。
-- `trainers.py`：15 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
+- `trainers.py`：16 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**、**FunctionSpaceReplay（Replay + DER++ 蒸餾 + GPM 投影，可切換）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
 - `run.py` / `run_one_combo.py`：主實驗腳本（命令行選模式、方法、seed、任務數；`--input-adapter` 開啟輸入轉接器，`--joint-batch/--joint-steps` 控制上界）。
 - `analyze.py`：彙整多 seed 實驗結果，輸出 JSON 與畫圖；缺 matplotlib 時用 Pillow 輸出圖表並產生 summary JSON。
 - `results_label_permuted.json` / `results_input_permuted.json`：9 種主方法的原始數據。
 - `results_joint_*.json`：Joint 離線上界。`results_naiveadapter_*.json` / `results_jointadapter_*.json` / `results_adapter_replay_*.json`：輸入轉接器系列實驗。
 - `results_longstream_*.json`（130 tasks）/ `results_verylong_*.json`（250 tasks）/ `results_longstream_sustainable.json`：§9 可永續學習長串流探針數據。
 - `results_bennafusi_dt0*_label_permuted.json`：§9.4 Benna-Fusi 複雜突觸 replay-free 定位實驗。
+- `results_derpp_longstream_label_permuted.json`（130 tasks）/ `results_derpp_verylong_label_permuted.json`（250 tasks）：§10 函數空間 / DER++ 抗遺忘實驗。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

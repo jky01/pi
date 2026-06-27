@@ -1281,6 +1281,117 @@ class SustainableReplayEWCTrainer(ReplayEWCTrainer):
         return loss, acc
 
 
+class FunctionSpaceReplayTrainer(DarkReplayEWCTrainer):
+    """混合式函數空間抗遺忘訓練器：從三個角度同時逼網路「不要改變舊任務的函數」。
+
+    1. Experience Replay（覆蓋）——讓網路持續看到舊任務輸入（繼承自 ReplayTrainer）。
+    2. DER++ logit 蒸餾（函數軟錨）——回放時除了 CE，還用 MSE 把現在對舊樣本的輸出拉回
+       它寫入 buffer 當下的 logits，保住整個 softmax 幾何（繼承自 DarkReplayEWC 的 dark 項）。
+    3. GPM 梯度投影（參數子空間硬鎖）——維護每個共享層「舊任務輸入子空間」的正交基 M，
+       把共享層梯度投影到 M 的正交補：G ← G − M(MᵀG)。因為某層輸出=W·x，更新若與舊輸入
+       正交，舊任務的激活與輸出在數學上不被擾動。基在每個 task 結束時用該層輸入的 SVD 增量更新。
+
+    預設關掉 EWC（lam=0）：GPM 是更鋒利的權重保護，與 EWC 在舊子空間方向上會互相抵銷，
+    故由 GPM 取代之。三個元件都可切換，方便做 Replay→+DER++→+GPM 的消融。只投影共享層
+    （W1/W2，單頭再加 W3）；heads/adapters 是 task-specific，不投影也不互相干擾。
+    """
+    name = "FunctionSpaceReplay"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 0.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, use_gpm: bool = True,
+                 gpm_threshold: float = 0.97, gpm_max_rank: int = None,
+                 gpm_samples: int = 1000):
+        super().__init__(model, lr=lr, capacity=capacity, replay_batch=replay_batch,
+                         seed=seed, lam=lam, fisher_batches=fisher_batches,
+                         fisher_decay=fisher_decay, grad_clip_norm=grad_clip_norm,
+                         dark_alpha=dark_alpha, replay_weight=replay_weight)
+        self.use_gpm = bool(use_gpm)
+        self.gpm_threshold = float(gpm_threshold)
+        self.gpm_samples = int(gpm_samples)
+        # 只保護共享權重矩陣；多頭時 W3 是 per-head（不共享），不投影。
+        self.gpm_keys = ["W1", "W2"] + ([] if model.multi_head else ["W3"])
+        self.gpm_max_rank = gpm_max_rank if gpm_max_rank is not None else max(model.dims)
+        self.gpm_bases = {k: None for k in self.gpm_keys}
+
+    @staticmethod
+    def _merge_extra(grads, extra):
+        for k, v in extra.items():
+            grads[k] = grads[k] + v if k in grads else v
+        return grads
+
+    def _project_shared_grads(self, grads):
+        """把共享層梯度投影到舊任務輸入子空間的正交補：G ← G − M(MᵀG)。"""
+        for k in self.gpm_keys:
+            M = self.gpm_bases.get(k)
+            if M is None or M.shape[1] == 0 or k not in grads:
+                continue
+            G = grads[k]
+            grads[k] = G - M @ (M.T @ G)
+        return grads
+
+    def _update_gpm_basis(self, task_X, task_idx):
+        """task 結束後，用該層輸入的 SVD 增量擴充正交基（GPM, Saha et al. 2021）。"""
+        m = self.model
+        n = len(task_X)
+        if n > self.gpm_samples:
+            sel = self.rng.choice(n, size=self.gpm_samples, replace=False)
+            task_X = task_X[sel]
+        cache = m.forward(task_X, task_idx)
+        # 每個共享層「看到的輸入」：W1<-X_in（adapter 後）、W2<-a1、W3<-a2
+        layer_in = {"W1": cache["X_in"], "W2": cache["a1"]}
+        if not m.multi_head:
+            layer_in["W3"] = cache["a2"]
+        for k in self.gpm_keys:
+            A = np.asarray(layer_in[k], dtype=np.float64)        # (n_samples, d)
+            total = float((A ** 2).sum())
+            if total < 1e-12:
+                continue
+            M = self.gpm_bases.get(k)
+            A_res = A - (A @ M) @ M.T if (M is not None and M.shape[1] > 0) else A
+            try:
+                _, S, Vt = np.linalg.svd(A_res, full_matrices=False)
+            except np.linalg.LinAlgError:
+                continue
+            captured = total - float((A_res ** 2).sum())          # energy already in M
+            cum = captured
+            new_dirs = []
+            for i in range(len(S)):
+                if cum / total >= self.gpm_threshold:
+                    break
+                new_dirs.append(Vt[i])                            # d-dim feature direction
+                cum += float(S[i] ** 2)
+            if not new_dirs:
+                continue
+            new = np.stack(new_dirs, axis=1)                      # (d, k)
+            M = np.concatenate([M, new], axis=1) if (M is not None and M.shape[1] > 0) else new
+            Q, _ = np.linalg.qr(M)                                # re-orthonormalize
+            self.gpm_bases[k] = Q[:, :min(Q.shape[1], self.gpm_max_rank)]
+
+    def train_step(self, X, Y, task_idx: int = None):
+        loss, acc = self.model.loss_acc(X, Y, task_idx)
+        cache = self.model.forward(X, task_idx)
+        grads = self.model.backward(cache, Y, task_idx)
+
+        sample = self._sample_replay()
+        if sample is not None:
+            grads = self._mix_dark_replay_grads(grads, *sample, task_idx)
+
+        grads = self._merge_extra(grads, self._ewc_grad(task_idx))
+        if self.use_gpm:
+            grads = self._project_shared_grads(grads)
+        self.model.sgd_step(grads, self.lr, task_idx=task_idx)
+        self._reservoir_insert(X, Y, task_idx)
+        return loss, acc
+
+    def on_task_end(self, task_X, task_Y, task_idx: int = None):
+        super().on_task_end(task_X, task_Y, task_idx)
+        if self.use_gpm:
+            self._update_gpm_basis(task_X, task_idx)
+
+
 def _benna_fusi_init(model, keys, levels, g0):
     """每個權重一條 N 級鏈：capacity C_k=2^k（容量幾何遞增）、conductance g_k=g0·2^-k
     （管徑幾何遞減）。隱藏變數 u_2..u_N 以目前可見權重初始化（加入瞬間鏈一致、不擾動函數）。"""
@@ -1361,4 +1472,5 @@ TRAINER_REGISTRY = {
     "SustainableReplayEWC": SustainableReplayEWCTrainer,
     "BennaFusi": BennaFusiTrainer,
     "BennaFusiReplay": BennaFusiReplayTrainer,
+    "FunctionSpaceReplay": FunctionSpaceReplayTrainer,
 }

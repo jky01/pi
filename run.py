@@ -218,6 +218,10 @@ def main():
                         help="Benna-Fusi base conductance (coupling strength of the fastest variable).")
     parser.add_argument("--bf-dt", type=float, default=None,
                         help="Benna-Fusi relaxation step size: stability<->plasticity knob (higher = more stable).")
+    parser.add_argument("--gpm-off", action="store_true",
+                        help="Disable GPM gradient projection in FunctionSpaceReplay (leaves replay + DER++).")
+    parser.add_argument("--gpm-threshold", type=float, default=None,
+                        help="GPM explained-variance threshold for old-task subspace basis (higher = more protection, less plasticity).")
     parser.add_argument("--output", default=None,
                         help="Output JSON path. Defaults to results_<mode>.json in the project folder.")
     args = parser.parse_args()
@@ -283,6 +287,10 @@ def main():
         trainer_kwargs["bf_g0"] = args.bf_g0
     if args.bf_dt is not None:
         trainer_kwargs["bf_dt"] = args.bf_dt
+    if args.gpm_off:
+        trainer_kwargs["use_gpm"] = False
+    if args.gpm_threshold is not None:
+        trainer_kwargs["gpm_threshold"] = args.gpm_threshold
 
     stream_kwargs_template = dict(
         digits_file="pi_digits_600000.txt",

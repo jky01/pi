@@ -55,6 +55,7 @@ ReplayTrainer                         # reservoir buffer, uniform sampling
   ReplayEWCTrainer                    # +online EWC regularization
     SustainableReplayEWCTrainer       # +Fisher-protected neuron recycling (plasticity w/o memory damage)
     DarkReplayEWCTrainer              # +logit-consistency loss on replayed items
+      FunctionSpaceReplayTrainer      # +DER++ distillation +GPM gradient projection (toggleable ablation)
     SurpriseReplayEWCTrainer          # +surprise-prioritized replay (top-K CE loss)
       MarginSurpriseReplayEWCTrainer  # +low-margin boundary priority
       HippocampalReplayEWCTrainer     # +episodic prototype memory at inference
@@ -64,6 +65,8 @@ BennaFusiTrainer                      # multi-timescale complex synapses, online
 ```
 
 The sustainable-learning investigation (report §9) established that **forgetting, not plasticity, is the bottleneck wherever replay is present** — the diagonal keeps rising to 250 tasks. So `SustainableReplayEWC` (Fisher-protected recycling) and `BennaFusi` (power-law forgetting) are both validated mechanisms that only pay off in the **replay-free** regime; with replay, Fisher-selective `ReplayEWC` dominates. `bf_dt` is the stability↔plasticity knob for Benna-Fusi.
+
+`FunctionSpaceReplayTrainer` (report §10) attacks forgetting in function space: Replay + DER++ logit distillation + GPM gradient projection, all toggleable (`use_gpm`, `dark_alpha`, `lam`). The ablation found **GPM is counterproductive here** — it protects against input-subspace shift, but these tasks have stationary inputs (label_permuted permutes labels; adapters restore canonical inputs), so GPM freezes the shared layers. **DER++ logit distillation is the win**: `DarkReplayEWC` (= Replay+EWC+distillation, `--dark-alpha 0.5`) drives 130-task retention to ~1.0 (BWT≈0), the project's best anti-forgetting result. Lesson: anchor the *function* (outputs), not weights or input subspaces.
 
 `HippocampalReplayEWCTrainer` overrides `loss_acc()` to blend MLP softmax with prototype-based episodic predictions at evaluation time (the buffer doubles as a hippocampal episodic memory). The blending weight is optionally uncertainty-gated by the MLP's top-2 margin.
 
