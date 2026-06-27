@@ -126,4 +126,5 @@
 - 新 trainer 加進 `trainers.py` 的 `TRAINER_REGISTRY`，`test_smoke` 會自動覆蓋。
 - 跑完更新 `report.md`（新增小節 + 更新 §0 TL;DR 與結論）與本檔（移除已完成項）。
 - 誠實第一：負結果（像 GPM、DER++ 在 Class-IL 反轉）和正結果一樣要記錄。
+- 有結果，也要把結論更新到 report.md，不要只改 NEXT_STEPS.md，否則會斷層
 - 結束一輪改善與測試結果，做一次 git commit 。
