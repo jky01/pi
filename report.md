@@ -54,7 +54,9 @@
 
 **(R) P8：frozen pretrained 特徵上的 Class-IL（Split-CIFAR-100）**（§18）。用 frozen ImageNet ResNet18 抽 CIFAR-100 特徵（`extract_features.py`，唯一用 torch 的一步），在特徵上維持純 numpy 訓練小 head，跑標準 **Split-CIFAR-100**（20 tasks×5 類、單頭、無 task id、3 seeds）。**Naive 仍崩到 0.063**（強表徵不會自己解掉 CL）、線性頭 ReplayEWC **0.471（forget 0.440）**、DER++ **0.495**、**NCMReplayEWC 0.530（forget 0.198、retention 0.743）**。三 benchmark 合看，class-IL「線性頭→NCM」的改善**隨全域類別數單調放大**（MNIST 10 類微弱 → CIFAR-100 100 類大 → pi ~200 類戲劇性）——**pi 的「NCM 是 class-IL 英雄」不是特例，而是類別數的函數**，無偏原型讀出是跨 benchmark/跨表徵的修法。對「離真正 CL 多遠」：**強表徵把規模/表徵這道牆推近一步、但牆沒倒**（53% final 且這是 frozen 特徵＋有 buffer＋清楚切片的最有利設定；無 buffer/開放世界/正向遷移的硬牆未碰）。下一步 P9（拔 buffer）或 P10（量正向遷移）。
 
-**(S) P10：正向遷移量測——是「持續不忘」不是「持續變強」**（§19）。在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head（task-k 受限 5-way acc，隔離新任務本身學多快）。**每一個步數預算(2/5/10/20)持續模型都不比 fresh 快、反而略慢**（Δ = -0.037/-0.022/-0.008/-0.013），**且不隨經驗增長**。Naive-continual 對照(隱藏層自由累積)Δ≈0，分離出因果：**主因是 frozen backbone 已封頂(沒東西可累積)、抗遺忘機制再加小幅可塑性稅**。量化結論：**最有利設定下，正向遷移/累積加速≈0**——「越學越快、知識複利」這道最遠的牆完全站著。整個 P7–P10 把「離真正 CL 多遠」變成數字：**抗遺忘工具箱是跨 benchmark/表徵的真知識，但系統只會「持續不忘」、不會「持續變強」；真正的累積尚未發生。** 結果檔 `results_forward_transfer_{cifar100,naive_cifar100}.json`。
+**(S) P10：正向遷移量測——是「持續不忘」不是「持續變強」**（§19）。在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head（task-k 受限 5-way acc，隔離新任務本身學多快）。**每一個步數預算(2/5/10/20)持續模型都不比 fresh 快、反而略慢**（Δ = -0.037/-0.022/-0.008/-0.013），**且不隨經驗增長**。Naive-continual 對照(隱藏層自由累積)Δ≈0，分離出因果：**主因是 frozen backbone 已封頂(沒東西可累積)、抗遺忘機制再加小幅可塑性稅**。量化結論：**最有利設定下，正向遷移/累積加速≈0**——「越學越快、知識複利」這道最遠的牆完全站著。整個 P7–P10 把「離真正 CL 多遠」變成數字：**抗遺忘工具箱是跨 benchmark/表徵的真知識，但在 frozen regime 下系統只會「持續不忘」、不會「持續變強」。** （此悲觀結論被 P8b 修正，見下。）結果檔 `results_forward_transfer_{cifar100,naive_cifar100}.json`。
+
+**(T) P8b：unfreeze backbone——「持續變強」在「會動的表徵 × 保住的可塑性」下終於出現**（§20）。P10 的零遷移是 frozen regime 的結構性限制。P8b 改用從零小 CNN、backbone 跨 task 持續適應（torch + MPS GPU，唯一的 GPU 工作負載），用 task-k 受限 5-way acc 量「學新 task 的速度」。**三 regime 對照給出充要條件**：frozen(不會動)→ Δ≈0；會動但 **Naive(崩可塑性)→ Δ 負(-0.044，重現 loss of plasticity)**；會動且 **Replay(保可塑性)→ Δ 強正(+0.174)且隨經驗單調增長**（early +0.035 → late **+0.282**，per-task late 達 +0.30~+0.40，2 seeds 一致）。**模型學過越多、學新任務越快——這就是「持續變強」。** 修正 P7–P10 的悲觀結論：那道最遠的牆不是不可動，而是需要**表徵持續建構 × 可塑性持續維持**同時成立；缺一不可（frozen→零、naive→負、replay→正）。這也統一了本專案兩條長期主線——replay 防遺忘、§9 防可塑性流失——在會動的表徵上 replay 同時擔起兩者，累積學習於是浮現。結果檔 `results_backbone_transfer_{cifar100,replay_cifar100}.json`。
 
 ---
 
@@ -913,7 +915,49 @@ P10 把先前的定性判斷變成數字：**目前的系統是在「持續不�
 
 ---
 
-## 20. 結論
+## 20. unfreeze backbone：當表徵會適應且保住可塑性，「持續變強」終於出現（P8b）
+
+**為什麼**：§19（P10）在 frozen backbone 上量到正向遷移≈0，但有一道內建限制——frozen backbone 已封頂，表徵不需要被「建構」，本就偵測不到累積。P8b 拿掉這個限制：用一個**從零開始的小 CNN，backbone 跨 task 持續適應**（torch 訓練迴圈，MPS GPU 加速），這才是表徵會被逐步建立、累積學習有機會出現的 regime（也最貼近 LLM 持續微調）。
+
+**做法**（Split-CIFAR-100 原始影像，20 tasks×5 類，2 seeds）：沿用 P10 的探針——量「task-k 受限 5-way acc」隨步數的曲線，比較**持續模型**（一個 CNN 依序學 task 0..k，backbone 累積結構）vs **fresh**（全新隨機 CNN 只學 task k）。兩者吃同一筆 task-k 資料、同架構，唯一差別是 backbone 是否被持續訓練過 → Δ=持續−fresh 的早期學習優勢就是表徵的正向遷移，看它**是否隨 k 增長**。關鍵變因是持續模型用什麼維持訓練：
+
+### 20.1 三個 regime 的對照：正向遷移需要「會動的表徵 × 保住的可塑性」
+
+| 持續模型 regime | Δ@40（學新 task 速度 vs fresh） | early(0-4) → late(15-19) | 結論 |
+| :--- | :---: | :---: | :--- |
+| **P10 frozen backbone** | -0.013 | -0.018 → -0.041 | 零遷移：backbone 封頂，沒東西可累積 |
+| **P8b 會動 backbone + Naive** | **-0.044** | -0.029 → -0.024 | **負遷移**：可塑性崩潰，累積反而傷害新學習 |
+| **P8b 會動 backbone + Replay** | **+0.174** | +0.035 → **+0.282** | **正遷移、隨經驗增長** |
+
+- **Naive-continual 重現 loss of plasticity**（呼應 §9）：會動的 backbone 在 naive 持續 SGD 下逐步喪失學新 task 的能力，continual 大多卡在亂猜（cont@40≈0.20–0.24），**比 fresh 還差**，且差距隨步數擴大（Δ@80 = -0.088）。光讓表徵「會動」不夠，會動但崩壞反而更糟。
+- **Replay-continual 同時保住可塑性與累積表徵**，正向遷移**強且隨經驗單調增長**：
+
+| 步數預算 | 持續模型 5-way acc | fresh | Δ overall | early → late | 趨勢 |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| @10 | 0.305 | 0.217 | +0.087 | -0.007 → +0.140 | GROWS |
+| @20 | 0.335 | 0.217 | +0.118 | +0.043 → +0.165 | GROWS |
+| @40 | 0.451 | 0.277 | **+0.174** | +0.035 → **+0.282** | GROWS |
+| @80 | 0.548 | 0.364 | +0.184 | +0.114 → +0.245 | GROWS |
+
+per-task Δ@40 幾乎單調爬升：early tasks ≈0（task0 -0.011、task2 +0.050），到 late tasks 大幅領先（task16 +0.306、task18 **+0.398**、task19 +0.301）。2 seeds 一致。**模型學過越多 task，學新 task 越快——這就是「持續變強」。**
+
+### 20.2 對「離真正的持續學習還有多遠」的最終答案
+
+把 P10 與 P8b 合起來，先前「最遠那道牆完全站著」的悲觀結論被**修正**：
+
+- P10 的零遷移**不是普世結論，而是 frozen regime 的結構性限制**——backbone 封頂時當然量不到累積。
+- 一旦讓**表徵會適應 × 可塑性被保住**，正向遷移就出現、且隨經驗增長：**那道最遠的牆會移動。**
+- 缺一不可：frozen（不會動）→ 零；會動但 naive（崩可塑性）→ 負；會動且 replay（保可塑性）→ 正。
+
+**這把整個 P7–P8b 弧線收束成一個正面而精確的命題**：抗遺忘工具箱（replay + Fisher-EWC + DER++/NCM）是跨 benchmark/表徵的真知識；而「持續變強」（正向遷移、知識複利）**並非不可達，它的充要條件是「表徵持續建構」與「可塑性持續維持」同時成立**——這也正好把本專案兩條長期主線（抗遺忘的 replay、抗可塑性流失的 §9/ContinualBP）統一起來：在會動的表徵上，replay 同時擔起防遺忘與保可塑性，於是累積學習浮現。
+
+**限制 / 下一步**：(a) 仍是小 CNN、絕對準確率不高（continual ~0.45–0.55 @ few steps），效果是相對量級穩健但規模小；(b) fresh baseline 完全從零，部分優勢來自「持續模型等於在 CIFAR 上預訓練過」——但這正是累積 CL 的本質；(c) 下一步可在已接好的 MPS GPU 上**放大**（真 ResNet18 end-to-end、更多 seed、更長 stream），檢驗正向遷移是否隨規模持續，以及 DER++/EWC 等更強的可塑性維持機制能否再放大累積。
+
+**結果檔**：`results_backbone_transfer_cifar100.json`（Naive）、`results_backbone_transfer_replay_cifar100.json`（Replay）；程式 `run_backbone_transfer.py`（torch + MPS）。
+
+---
+
+## 21. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -938,7 +982,8 @@ P10 把先前的定性判斷變成數字：**目前的系統是在「持續不�
 21. **on-manifold 輸入生成器假設被推翻；殘留缺口是真實樣本的不可取代價值（§16，P6，負面結果）**。P5 把缺口歸因於因子化輸入離流形。P6 改從全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform＝on-manifold）+ scholar 標註，但 3-seed **全面更差**（conflicting 0.428、label 0.769），儘管 forgetting 最低（0.052）——把 teacher 均勻蒸餾到整個輸入空間是過強全域正則、犧牲可塑性（diag 0.54→0.45），且稀釋類界訊號。**per-class 集中回放比全域 on-manifold 覆蓋更重要。** 修正 P5 歸因：scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw 在 conflicting 有 +BWT 而合成回放沒有），不是可被更好輸入模型補上的失配。整個 P4–P6 的總結論：**「不存原始樣本」可行且常常足夠（label_permuted 長流甚至贏 raw），但要完全追平 raw replay 仍有一道由真實樣本聯合結構撐起的小硬牆。**
 22. **外部效度驗證：核心機制守住、戲劇性數字是 pi 特例（§17，P7）**。把結論搬到 CL 社群的標準 benchmark：**Permuted-MNIST（多頭 Task-IL）上 DER++ 函數錨定完整守住**——0.912 > ReplayEWC 0.896、BWT→0、retention 0.998，且優勢隨串流長度複利（與 pi 一致）。**Split-MNIST class-IL 上 NCM「降低遺忘」的方向成立**（forgetting 最低 0.028、retention 最高 0.977），**但 pi 的「線性頭災難性崩潰、DER++ 反轉成有害、NCM 是唯一解」被推翻為 200 類特例**——標準 10 類下線性頭 0.926 不崩、DER++ 0.952 反而最佳。教訓：**replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出是跨 benchmark 的真知識；但具體數字的戲劇性與「某機制必然反轉」的強論斷會隨類別數/串流長度/buffer 比例而變，不能外推。** 這也驗證了停掉 P2.5–P2.10 自動 gating 微調的判斷（那條線在 pi 特性上精雕、外部效度低）。下一個現代化方向是 frozen pretrained feature + CL 讀出（P8，需先接特徵抽取器）。
 23. **Frozen pretrained 特徵上的 Class-IL：NCM 的價值隨類別數放大、強表徵不抹平工具箱（§18，P8）**。用 frozen ImageNet ResNet18 特徵跑標準 **Split-CIFAR-100**（20 tasks×5 類、單頭、無 task id）：Naive 仍崩到 **0.063**（強表徵不會自己解掉持續學習）、線性頭 ReplayEWC **0.471（forget 0.440）**、DER++ **0.495**、**NCMReplayEWC 0.530（forget 0.198、retention 0.743）**。三個 benchmark 合看，class-IL 的「線性頭→NCM」改善隨全域類別數單調放大（MNIST 10 類微弱、CIFAR-100 100 類大、pi ~200 類戲劇性），**證明 pi 的「NCM 是 class-IL 英雄」不是特例而是類別數的函數**；無偏原型讀出是跨 benchmark、跨表徵都成立的修法。同時回答「離真正 CL 多遠」：**強表徵把規模/表徵這道牆推近一步，但牆沒倒**——53% final、且這還是在 frozen 強特徵＋有 buffer＋清楚 task 切片的**最有利設定**下；真正的硬牆（無 buffer、開放世界、正向遷移/累積）一個都還沒碰。
-24. **正向遷移量測：是「持續不忘」不是「持續變強」（§19，P10）**。到 P8 為止所有指標都是「別忘記」。P10 在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head，用 task-k 受限 5-way acc 隔離「新任務本身學多快」。結果：**每一個步數預算下持續模型都不比 fresh 快、反而略慢**（Δ@2/5/10/20 = -0.037/-0.022/-0.008/-0.013），且**不隨經驗增長**（early≈late）。Naive-continual 對照(隱藏層自由累積)Δ≈0，分離出因果：**主因是 frozen backbone 已封頂（沒有東西可累積），抗遺忘機制再加一層小幅可塑性稅**。量化結論：**本專案最有利設定下，正向遷移/累積加速≈0**——「最遠那道牆」(越學越快、知識複利)完全站著。限制：frozen backbone 對偵測正向遷移本就不利，真正檢驗需讓 backbone 也跨 task 適應(P8b)。
+24. **正向遷移量測：是「持續不忘」不是「持續變強」（§19，P10）**。到 P8 為止所有指標都是「別忘記」。P10 在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head，用 task-k 受限 5-way acc 隔離「新任務本身學多快」。結果：**每一個步數預算下持續模型都不比 fresh 快、反而略慢**（Δ@2/5/10/20 = -0.037/-0.022/-0.008/-0.013），且**不隨經驗增長**（early≈late）。Naive-continual 對照(隱藏層自由累積)Δ≈0，分離出因果：**主因是 frozen backbone 已封頂（沒有東西可累積），抗遺忘機制再加一層小幅可塑性稅**。量化結論：在**frozen regime** 下正向遷移/累積加速≈0；但這是結構性限制（見 P8b 修正），不是普世結論。
+25. **unfreeze backbone：「持續變強」在「會動的表徵 × 保住的可塑性」下出現（§20，P8b）**。P10 的零正向遷移有個結構性限制——frozen backbone 封頂、沒東西可累積。P8b 改用從零的小 CNN、backbone 跨 task 持續適應（torch + MPS），量「學新 task 的速度」。三 regime 對照給出充要條件：**frozen（不會動）→ Δ≈0；會動但 Naive（崩可塑性）→ Δ 負(-0.044，重現 loss of plasticity)；會動且 Replay（保可塑性）→ Δ 強正(+0.174)且隨經驗單調增長**（early +0.035 → late +0.282，per-task late 達 +0.30~+0.40，2 seeds 一致）。**模型學過越多、學新任務越快=持續變強。** 這修正了 P10 的悲觀結論：那道最遠的牆不是不可動，而是需要「表徵持續建構 × 可塑性持續維持」同時成立——也把本專案兩條主線（replay 防遺忘、§9 防可塑性流失）統一：在會動的表徵上 replay 同時擔起兩者，累積學習於是浮現。下一步可在已接好的 MPS GPU 上放大（真 ResNet18 end-to-end）。
 
 ---
 
@@ -973,7 +1018,9 @@ P10 把先前的定性判斷變成數字：**目前的系統是在「持續不�
 - `extract_features.py` / `feature_benchmark.py` / `run_features.py`：§18 P8 frozen pretrained 特徵上的 Class-IL——用 frozen ImageNet ResNet18 抽 CIFAR-100 特徵（唯一用 torch 的一步，輸出 `cifar100_resnet18.npz`，已 gitignore），在特徵上維持純 numpy 訓練小 head，重用全部 trainers。
 - `results_feature_split_cifar100.json`：§18 Split-CIFAR-100 結果——NCM 在 100 類重新成為最大抗遺忘槓桿（forget 0.440→0.198），證明 NCM 價值隨類別數放大。
 - `run_forward_transfer.py`：§19 P10 正向遷移量測——比較持續模型 vs fresh-from-scratch 學新 task 的速度（task-k 受限 5-way acc），隔離表徵的累積效益。
-- `results_forward_transfer_cifar100.json` / `results_forward_transfer_naive_cifar100.json`：§19 結果（ReplayEWC 主結果 + Naive 對照）——正向遷移≈0、不隨經驗增長，主因 frozen backbone 封頂。
+- `results_forward_transfer_cifar100.json` / `results_forward_transfer_naive_cifar100.json`：§19 結果（ReplayEWC 主結果 + Naive 對照）——frozen regime 下正向遷移≈0、不隨經驗增長，主因 frozen backbone 封頂。
+- `run_backbone_transfer.py`：§20 P8b unfreeze backbone（唯一用 torch 訓練 + MPS GPU 的實驗）——從零小 CNN 跨 task 持續適應，量正向遷移；支援 `--continual-mode {naive,replay}`、`--device {auto,cpu,mps}`。
+- `results_backbone_transfer_cifar100.json` / `results_backbone_transfer_replay_cifar100.json`：§20 結果（Naive 負遷移 / Replay 正遷移且隨經驗增長）——「持續變強」需要會動的表徵 × 保住的可塑性。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。

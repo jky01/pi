@@ -1,0 +1,265 @@
+"""
+P8b：unfreeze backbone，檢驗「表徵必須被建構」時是否出現正向遷移 / 累積。
+
+P10 在 frozen ImageNet backbone 上量到正向遷移≈0，但限制是 backbone 已封頂、
+表徵不需要被建構。P8b 改用一個**從零開始的小 CNN，backbone 跨 task 持續適應**，
+這才是表徵會被逐步建立、累積學習有機會出現的 regime（也最貼近 LLM 持續微調）。
+
+探針（沿用 P10，但 backbone 改成會動的）：在 Split-CIFAR-100（原始影像）流上，
+量「task-k 受限 5-way acc」隨步數的曲線，比較：
+- 持續模型：一個小 CNN 依序訓練 task 0..k（backbone 累積結構），plain SGD（Naive-
+  continual，隔離純表徵累積、不加抗遺忘 confound）；
+- fresh：全新隨機 CNN 只學 task k。
+若「會動的表徵」真能累積 → 持續模型學新 task 越來越快（Δ 隨 k 增長）。
+
+只用 torch 做這支實驗；其餘專案維持純 numpy。
+"""
+import argparse
+import json
+import os
+import pickle
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.set_num_threads(torch.get_num_threads())
+CHECKPOINTS = [0, 5, 10, 20, 40, 80, 160]
+MEAN = torch.tensor([0.5071, 0.4865, 0.4409]).view(1, 3, 1, 1)
+STD = torch.tensor([0.2673, 0.2564, 0.2762]).view(1, 3, 1, 1)
+
+
+def pick_device(name):
+    if name == "auto":
+        return "mps" if torch.backends.mps.is_available() else "cpu"
+    return name
+
+
+def load_cifar100_raw(root="./cifar_data/cifar-100-python"):
+    def unp(fn):
+        with open(os.path.join(root, fn), "rb") as f:
+            return pickle.load(f, encoding="latin1")
+    tr, te = unp("train"), unp("test")
+    Xtr = tr["data"].reshape(-1, 3, 32, 32).astype(np.float32) / 255.0
+    Xte = te["data"].reshape(-1, 3, 32, 32).astype(np.float32) / 255.0
+    ytr = np.array(tr["fine_labels"], dtype=np.int64)
+    yte = np.array(te["fine_labels"], dtype=np.int64)
+    return Xtr, ytr, Xte, yte
+
+
+def normalize(x):
+    return (x - MEAN.to(x.device)) / STD.to(x.device)
+
+
+class SmallCNN(nn.Module):
+    """從零訓練的小 CNN：3 個 conv block → 128-d 特徵 → 線性頭。"""
+    def __init__(self, n_classes=100, width=64):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, width, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),     # 32->16
+            nn.Conv2d(width, width * 2, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),  # 16->8
+            nn.Conv2d(width * 2, width * 2, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Linear(width * 2, n_classes)
+
+    def forward(self, x):
+        z = self.features(x).flatten(1)
+        return self.head(z)
+
+
+def acc_5way(model, Xt, yt, task_classes):
+    model.eval()
+    with torch.no_grad():
+        logits = model(normalize(Xt))
+        cols = torch.tensor(task_classes, device=logits.device)
+        sub = logits[:, cols]
+        pred = cols[sub.argmax(1)]
+    model.train()
+    return (pred == yt).float().mean().item()
+
+
+class ReservoirBuffer:
+    """跨 task 的 reservoir replay buffer（存原始 [0,1] 影像 + 全域標籤）。"""
+    def __init__(self, capacity, rng):
+        self.cap = capacity
+        self.rng = rng
+        self.X = None
+        self.y = None
+        self.n_seen = 0
+        self.size = 0
+
+    def add(self, xb, yb):
+        if self.X is None:
+            self.X = torch.zeros((self.cap,) + xb.shape[1:], dtype=xb.dtype, device=xb.device)
+            self.y = torch.zeros(self.cap, dtype=yb.dtype, device=xb.device)
+        for i in range(xb.shape[0]):
+            if self.size < self.cap:
+                self.X[self.size] = xb[i]; self.y[self.size] = yb[i]; self.size += 1
+            else:
+                j = self.rng.randint(0, self.n_seen + 1)
+                if j < self.cap:
+                    self.X[j] = xb[i]; self.y[j] = yb[i]
+            self.n_seen += 1
+
+    def sample(self, m):
+        m = min(m, self.size)
+        idx = self.rng.randint(0, self.size, size=m)
+        return self.X[idx], self.y[idx]
+
+
+def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng, buffer=None):
+    n = X.shape[0]
+    curve, s = {}, 0
+    if 0 in CHECKPOINTS:
+        curve[0] = acc_5way(model, Xt, yt, task_classes)
+    todo = [c for c in CHECKPOINTS if c > 0]
+    for ep in range(epochs):
+        order = rng.permutation(n) if ep > 0 else np.arange(n)
+        for i in range(0, n, batch):
+            idx = order[i:i + batch]
+            xb_raw = X[idx]; yb = y[idx]
+            if buffer is not None:
+                buffer.add(xb_raw, yb)  # 把當前樣本納入 reservoir
+                if buffer.size >= batch:
+                    rx, ry = buffer.sample(batch)
+                    xin = torch.cat([normalize(xb_raw), normalize(rx)], 0)
+                    yin = torch.cat([yb, ry], 0)
+                else:
+                    xin, yin = normalize(xb_raw), yb
+            else:
+                xin, yin = normalize(xb_raw), yb
+            opt.zero_grad()
+            loss = F.cross_entropy(model(xin), yin)
+            loss.backward(); opt.step()
+            s += 1
+            if todo and s == todo[0]:
+                curve[s] = acc_5way(model, Xt, yt, task_classes)
+                todo.pop(0)
+        if not todo:
+            break
+    if todo:
+        curve[s] = acc_5way(model, Xt, yt, task_classes)
+    return curve
+
+
+def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
+            lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
+            device="cpu"):
+    torch.manual_seed(seed)
+    Xtr, ytr, Xte, yte = load_cifar100_raw()
+    rng = np.random.RandomState(seed)
+    buffer = (ReservoirBuffer(buffer_cap, np.random.RandomState(7000 + seed))
+              if continual_mode == "replay" else None)
+
+    task_classes = [tuple(range(classes_per_task * t, classes_per_task * (t + 1)))
+                    for t in range(n_tasks)]
+    # 每個 task 的 train/test index（子採樣以控制 CPU 成本）
+    tr_idx, te_idx = [], []
+    for classes in task_classes:
+        tr = np.where(np.isin(ytr, classes))[0]
+        te = np.where(np.isin(yte, classes))[0]
+        tr = rng.permutation(tr)[:train_per_class * classes_per_task]
+        tr_idx.append(tr); te_idx.append(te[:test_per_class * classes_per_task])
+
+    cont = SmallCNN(n_classes=n_tasks * classes_per_task, width=width).to(device)
+    cont_opt = torch.optim.SGD(cont.parameters(), lr=lr, momentum=0.9)
+
+    per_task = []
+    for k in range(n_tasks):
+        X = torch.from_numpy(Xtr[tr_idx[k]]).to(device); y = torch.from_numpy(ytr[tr_idx[k]]).to(device)
+        Xt = torch.from_numpy(Xte[te_idx[k]]).to(device); yt = torch.from_numpy(yte[te_idx[k]]).to(device)
+        tcls = task_classes[k]
+
+        rng_c = np.random.RandomState(1000 + seed)
+        cont_curve = train_curve(cont, cont_opt, X, y, Xt, yt, tcls, epochs, batch, rng_c,
+                                 buffer=buffer)
+
+        fresh = SmallCNN(n_classes=n_tasks * classes_per_task, width=width).to(device)
+        fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
+        rng_f = np.random.RandomState(1000 + seed)
+        fresh_curve = train_curve(fresh, fresh_opt, X, y, Xt, yt, tcls, epochs, batch, rng_f)
+
+        per_task.append(dict(task=k, continual=cont_curve, fresh=fresh_curve))
+        print(f"  seed{seed} task{k:>2}: cont@40={cont_curve.get(40, float('nan')):.3f} "
+              f"fresh@40={fresh_curve.get(40, float('nan')):.3f}", flush=True)
+    return per_task
+
+
+def at(curve, step):
+    ks = sorted(int(x) for x in curve.keys())
+    best = ks[0]
+    for x in ks:
+        if x <= step:
+            best = x
+    return curve[best] if best in curve else curve[str(best)]
+
+
+def summarize(all_seed, step):
+    n_tasks = len(all_seed[0])
+    rows = []
+    for k in range(n_tasks):
+        c = np.mean([at(s[k]["continual"], step) for s in all_seed])
+        f = np.mean([at(s[k]["fresh"], step) for s in all_seed])
+        rows.append((k, c, f, c - f))
+    return rows
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    p.add_argument("--n-tasks", type=int, default=20)
+    p.add_argument("--classes-per-task", type=int, default=5)
+    p.add_argument("--train-per-class", type=int, default=200)
+    p.add_argument("--test-per-class", type=int, default=100)
+    p.add_argument("--lr", type=float, default=0.05)
+    p.add_argument("--epochs", type=int, default=4)
+    p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--width", type=int, default=64)
+    p.add_argument("--continual-mode", choices=["naive", "replay"], default="naive")
+    p.add_argument("--device", default="auto", help="auto | cpu | mps")
+    p.add_argument("--output", default="results_backbone_transfer_cifar100.json")
+    args = p.parse_args()
+
+    device = pick_device(args.device)
+    print(f"device: {device}", flush=True)
+
+    all_seed = []
+    for seed in args.seeds:
+        all_seed.append(run_one(seed, args.n_tasks, args.classes_per_task,
+                                args.train_per_class, args.test_per_class,
+                                args.lr, args.epochs, args.batch, args.width,
+                                continual_mode=args.continual_mode, device=device))
+        print(f"seed {seed} done", flush=True)
+
+    print(f"\n=== P8b forward transfer with ADAPTING backbone (small CNN, "
+          f"continual={args.continual_mode}) ===")
+    print("task-k 5-way acc: continual (backbone adapts across tasks) vs fresh-from-scratch")
+    for step in [10, 20, 40, 80]:
+        rows = summarize(all_seed, step)
+        c = np.mean([r[1] for r in rows]); f = np.mean([r[2] for r in rows])
+        early = np.mean([d for k, _, _, d in rows if k < 5])
+        late = np.mean([d for k, _, _, d in rows if k >= 15])
+        overall = np.mean([d for _, _, _, d in rows])
+        grow = late - early
+        tag = ("GROWS w/ accumulation" if grow > 0.02 else
+               ("FLAT" if abs(grow) <= 0.02 else "SHRINKS"))
+        print(f"  @{step:>3} steps: continual {c:.3f} | fresh {f:.3f} | Δ {overall:+.3f} | "
+              f"early {early:+.3f} -> late {late:+.3f} (cumulative {grow:+.3f} {tag})")
+
+    rows = summarize(all_seed, 40)
+    print("\nPer-task Δ (continual - fresh) @40 steps:")
+    for k, c, f, d in rows:
+        print(f" {k:>3} | cont {c:.3f} | fresh {f:.3f} | Δ {d:+.3f}")
+
+    with open(args.output, "w") as fp:
+        json.dump(dict(checkpoints=CHECKPOINTS,
+                       per_seed=[[{"task": t["task"],
+                                   "continual": {str(k): v for k, v in t["continual"].items()},
+                                   "fresh": {str(k): v for k, v in t["fresh"].items()}}
+                                  for t in ps] for ps in all_seed]), fp)
+    print("saved", args.output)
+
+
+if __name__ == "__main__":
+    main()

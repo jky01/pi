@@ -45,6 +45,12 @@ $PY run_mnist.py split --methods Naive ReplayEWC DarkReplayEWC NCMReplayEWC --se
 # cifar100_resnet18.npz, gitignored); run_features.py then trains a small head in pure numpy.
 $PY extract_features.py                       # one-time: cache CIFAR-100 ResNet18 features
 $PY run_features.py --methods Naive ReplayEWC DarkReplayEWC NCMReplayEWC --seeds 0 1 2
+
+# Forward-transfer probes: does the system get FASTER at new tasks, not just forget less?
+# (report §19 P10 / §20 P8b). run_backbone_transfer.py is the only torch-training experiment
+# and supports MPS GPU (~5-6x on Apple Silicon for the small CNN); the rest stay pure numpy.
+$PY run_forward_transfer.py                              # P10: frozen features, ~0 transfer
+$PY run_backbone_transfer.py --continual-mode replay --device mps --seeds 0 1  # P8b: adapting backbone -> positive transfer
 ```
 
 ## Architecture
