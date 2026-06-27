@@ -15,12 +15,14 @@
                               短流/衝突關閉，驗證 P2.7 regime 訊號需求。
 9. BenefitDarkReplayEWCTrainer
                             — P2.8：用 function-space 反事實收益偵測是否開 DER++。
-10. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
-11. MarginSurpriseReplayEWCTrainer
+10. SlowBenefitDarkReplayEWCTrainer
+                            — P2.9：多步 shadow rollout，量測慢時間尺度 DER++ 收益。
+11. SurpriseReplayEWCTrainer — ReplayEWC + loss/surprise-prioritized replay sampling。
+12. MarginSurpriseReplayEWCTrainer
                             — ReplayEWC + loss/surprise + low-margin boundary replay。
-12. HippocampalReplayEWCTrainer
+13. HippocampalReplayEWCTrainer
                             — SurpriseReplayEWC + episodic prototype memory at inference。
-13. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
+14. ContinualBackpropTrainer — Sutton/Dohare 的 continual backprop：只選擇性地
                               重置「低效用、夠老」的死/低貢獻單元，其餘權重完全
                               不動——這是對話第一輪明確回答「不重置權重」的機制，
                               主打可塑性流失（失效 B），跟前兩者主打遺忘（失效 A）形成對照。
@@ -1904,6 +1906,84 @@ class BenefitDarkReplayEWCTrainer(DarkReplayEWCTrainer):
         return loss, acc
 
 
+class SlowBenefitDarkReplayEWCTrainer(BenefitDarkReplayEWCTrainer):
+    """Multi-step function-space benefit detector for DER++ distillation (P2.9).
+
+    P2.8 used a single reversible update, which was safe but too short-sighted
+    to see DER++'s slow proactive consolidation. This variant evaluates the same
+    DER++ on/off counterfactual after several virtual replay/current updates in
+    a restored shadow state, then reuses the P2.8 EMA controller.
+    """
+    name = "SlowBenefitDarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, dark_confidence_threshold: float = 0.0,
+                 dark_require_correct: bool = False, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0, benefit_probe_interval: int = 100,
+                 benefit_ema_decay: float = 0.9, benefit_threshold: float = 0.0,
+                 benefit_alpha_lr: float = 1.0, benefit_harm_weight: float = 1.0,
+                 benefit_logit_weight: float = 0.0, benefit_min_old: int = 4,
+                 slow_rollout_steps: int = 5):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            dark_alpha=dark_alpha,
+            replay_weight=replay_weight,
+            dark_confidence_threshold=dark_confidence_threshold,
+            dark_require_correct=dark_require_correct,
+            distill_start_task=distill_start_task,
+            distill_ramp_tasks=distill_ramp_tasks,
+            benefit_probe_interval=benefit_probe_interval,
+            benefit_ema_decay=benefit_ema_decay,
+            benefit_threshold=benefit_threshold,
+            benefit_alpha_lr=benefit_alpha_lr,
+            benefit_harm_weight=benefit_harm_weight,
+            benefit_logit_weight=benefit_logit_weight,
+            benefit_min_old=benefit_min_old,
+        )
+        self.slow_rollout_steps = max(1, int(slow_rollout_steps))
+
+    def _virtual_metrics(self, alpha, current_grads, X, Y, sample, task_idx, old_subset):
+        snap = self._snapshot_model()
+        prev_override = self._probe_alpha_override
+        prev_suppress = self._suppress_alpha_trace
+        try:
+            self._probe_alpha_override = float(alpha)
+            self._suppress_alpha_trace = True
+            for _ in range(self.slow_rollout_steps):
+                cache = self.model.forward(X, task_idx)
+                grads = self.model.backward(cache, Y, task_idx)
+                grads = self._mix_dark_replay_grads(grads, *sample, task_idx)
+                ewc_grads = self._ewc_grad(task_idx)
+                self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
+
+            old_X, old_Y, old_tasks, old_logits = old_subset
+            old_loss, old_acc = self._routed_loss_acc(old_X, old_Y, old_tasks)
+            old_mse = self._routed_logit_mse(old_X, old_tasks, old_logits)
+            cur_loss, cur_acc = self.model.loss_acc(X, Y, task_idx)
+            return dict(
+                old_loss=float(old_loss),
+                old_acc=float(old_acc),
+                old_logit_mse=float(old_mse),
+                current_loss=float(cur_loss),
+                current_acc=float(cur_acc),
+            )
+        finally:
+            self._probe_alpha_override = prev_override
+            self._suppress_alpha_trace = prev_suppress
+            self._restore_model(snap)
+
+
 class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
     """ReplayEWC with surprise-prioritized replay sampling.
 
@@ -2795,6 +2875,7 @@ TRAINER_REGISTRY = {
     "RtpDarkReplayEWC": RtpDarkReplayEWCTrainer,
     "HorizonDarkReplayEWC": HorizonDarkReplayEWCTrainer,
     "BenefitDarkReplayEWC": BenefitDarkReplayEWCTrainer,
+    "SlowBenefitDarkReplayEWC": SlowBenefitDarkReplayEWCTrainer,
     "OnlineEWCReplay": OnlineEWCReplayTrainer,
     "OnlineDarkReplayEWC": OnlineDarkReplayEWCTrainer,
     "GenerativeReplayEWC": GenerativeReplayEWCTrainer,

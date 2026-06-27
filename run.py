@@ -142,7 +142,7 @@ def run_one(method_name, seed, stream_kwargs, model_kwargs, lr, batch_size=10,
         trainer_diagnostics["dark_effective_alpha_mean"] = float(np.mean(dark_alpha_trace))
         trainer_diagnostics["dark_effective_alpha_tail_mean"] = float(np.mean(dark_alpha_trace[-tail_n:]))
 
-    for attr in ["horizon", "horizon_threshold", "horizon_regime"]:
+    for attr in ["horizon", "horizon_threshold", "horizon_regime", "slow_rollout_steps"]:
         if hasattr(trainer, attr):
             trainer_diagnostics[attr] = getattr(trainer, attr)
 
@@ -343,6 +343,8 @@ def main():
                         help="Weight for old replay logit-MSE improvement in BenefitDarkReplayEWC.")
     parser.add_argument("--benefit-min-old", type=int, default=None,
                         help="Minimum old replay samples required to run a BenefitDarkReplayEWC probe.")
+    parser.add_argument("--slow-rollout-steps", type=int, default=None,
+                        help="Virtual update horizon for SlowBenefitDarkReplayEWC multi-step probes.")
     parser.add_argument("--consolidate-every", type=int, default=None,
                         help="Step interval for task-free online EWC consolidation (Online*EWC* trainers).")
     parser.add_argument("--fisher-sample", type=int, default=None,
@@ -474,6 +476,8 @@ def main():
         trainer_kwargs["benefit_logit_weight"] = args.benefit_logit_weight
     if args.benefit_min_old is not None:
         trainer_kwargs["benefit_min_old"] = args.benefit_min_old
+    if args.slow_rollout_steps is not None:
+        trainer_kwargs["slow_rollout_steps"] = args.slow_rollout_steps
     if args.consolidate_every is not None:
         trainer_kwargs["consolidate_every"] = args.consolidate_every
     if args.fisher_sample is not None:
