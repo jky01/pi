@@ -297,6 +297,14 @@ def main():
                         help="Disable GPM gradient projection in FunctionSpaceReplay (leaves replay + DER++).")
     parser.add_argument("--gpm-threshold", type=float, default=None,
                         help="GPM explained-variance threshold for old-task subspace basis (higher = more protection, less plasticity).")
+    parser.add_argument("--lookahead-beta", type=float, default=None,
+                        help="Beta scaling parameter for LookaheadDarkReplayEWC.")
+    parser.add_argument("--lookahead-ema-decay", type=float, default=None,
+                        help="EMA decay parameter for LookaheadDarkReplayEWC's conflict tracker.")
+    parser.add_argument("--rtp-cos-threshold", type=float, default=None,
+                        help="Cosine threshold for RtpDarkReplayEWC regime detector.")
+    parser.add_argument("--rtp-probe-steps", type=int, default=None,
+                        help="Number of steps to probe gradient cosine in RtpDarkReplayEWC.")
     parser.add_argument("--output", default=None,
                         help="Output JSON path. Defaults to results_<mode>.json in the project folder.")
     args = parser.parse_args()
@@ -390,6 +398,14 @@ def main():
         trainer_kwargs["use_gpm"] = False
     if args.gpm_threshold is not None:
         trainer_kwargs["gpm_threshold"] = args.gpm_threshold
+    if args.lookahead_beta is not None:
+        trainer_kwargs["lookahead_beta"] = args.lookahead_beta
+    if args.lookahead_ema_decay is not None:
+        trainer_kwargs["lookahead_ema_decay"] = args.lookahead_ema_decay
+    if args.rtp_cos_threshold is not None:
+        trainer_kwargs["rtp_cos_threshold"] = args.rtp_cos_threshold
+    if args.rtp_probe_steps is not None:
+        trainer_kwargs["rtp_probe_steps"] = args.rtp_probe_steps
 
     stream_kwargs_template = dict(
         digits_file="pi_digits_600000.txt",

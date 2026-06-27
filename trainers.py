@@ -847,6 +847,323 @@ class PressureDarkReplayEWCTrainer(DarkReplayEWCTrainer):
         return weights
 
 
+class LookaheadDarkReplayEWCTrainer(DarkReplayEWCTrainer):
+    """DarkReplayEWC with Counterfactual Lookahead Probing for regime detection.
+
+    Before applying the update, we simulate the current task's step. If it
+    hurts replay loss (conflicting tasks), we scale down dark alpha to preserve plasticity.
+    If it is neutral or helps (shared rule / label_permuted), we keep dark alpha high.
+    """
+    name = "LookaheadDarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, dark_confidence_threshold: float = 0.0,
+                 dark_require_correct: bool = False, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0, lookahead_beta: float = 500.0,
+                 lookahead_ema_decay: float = 0.9):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            dark_alpha=dark_alpha,
+            replay_weight=replay_weight,
+            dark_confidence_threshold=dark_confidence_threshold,
+            dark_require_correct=dark_require_correct,
+            distill_start_task=distill_start_task,
+            distill_ramp_tasks=distill_ramp_tasks,
+        )
+        self.lookahead_beta = float(lookahead_beta)
+        self.lookahead_alpha = float(dark_alpha)
+        self.lookahead_ema_decay = float(lookahead_ema_decay)
+        self.delta_L_ema = None
+        self.alpha_trace = []
+        self.delta_L_trace = []
+
+    def _compute_replay_loss(self, rX, rY, rtasks):
+        if self.model.multi_head or self.model.input_adapter:
+            total_loss = 0.0
+            for t in sorted(set(rtasks)):
+                sub_idx = [i for i, val in enumerate(rtasks) if val == t]
+                sub_X = rX[sub_idx]
+                sub_Y = rY[sub_idx]
+                loss, _ = self.model.loss_acc(sub_X, sub_Y, t)
+                total_loss += loss * len(sub_idx)
+            return total_loss / len(rtasks)
+        else:
+            loss, _ = self.model.loss_acc(rX, rY)
+            return loss
+
+    def _lookahead_conflict_check(self, current_grads, rX, rY, rtasks, current_task_idx):
+        if current_task_idx is None or current_task_idx <= 0:
+            return 0.0
+
+        # Only measure conflict on PAST tasks' samples
+        past_idx = [i for i, t in enumerate(rtasks) if t is not None and t < current_task_idx]
+        if len(past_idx) == 0:
+            # If no past samples, assume current EMA holds or is neutral
+            return self.delta_L_ema if self.delta_L_ema is not None else 0.0
+
+        past_X = rX[past_idx]
+        past_Y = rY[past_idx]
+        past_tasks = [rtasks[i] for i in past_idx]
+
+        L_old = self._compute_replay_loss(past_X, past_Y, past_tasks)
+
+        # Save current parameters
+        W1_bak = self.model.W1.copy()
+        b1_bak = self.model.b1.copy()
+        W2_bak = self.model.W2.copy()
+        b2_bak = self.model.b2.copy()
+
+        if self.model.multi_head:
+            W3_bak = self.model.heads_W[current_task_idx].copy()
+            b3_bak = self.model.heads_b[current_task_idx].copy()
+        else:
+            W3_bak = self.model.W3.copy()
+            b3_bak = self.model.b3.copy()
+
+        if self.model.input_adapter and current_task_idx is not None:
+            A_bak = self.model.adapters[current_task_idx].copy()
+
+        # Apply virtual step
+        self.model.W1 -= self.lr * current_grads["W1"]
+        self.model.b1 -= self.lr * current_grads["b1"]
+        self.model.W2 -= self.lr * current_grads["W2"]
+        self.model.b2 -= self.lr * current_grads["b2"]
+
+        if self.model.multi_head:
+            self.model.heads_W[current_task_idx] -= self.lr * current_grads["W3"]
+            self.model.heads_b[current_task_idx] -= self.lr * current_grads["b3"]
+        else:
+            self.model.W3 -= self.lr * current_grads["W3"]
+            self.model.b3 -= self.lr * current_grads["b3"]
+
+        if self.model.input_adapter and current_task_idx is not None and "A" in current_grads:
+            self.model.adapters[current_task_idx] -= self.lr * current_grads["A"]
+
+        # Compute loss after update
+        L_new = self._compute_replay_loss(past_X, past_Y, past_tasks)
+
+        # Restore parameters
+        self.model.W1 = W1_bak
+        self.model.b1 = b1_bak
+        self.model.W2 = W2_bak
+        self.model.b2 = b2_bak
+
+        if self.model.multi_head:
+            self.model.heads_W[current_task_idx] = W3_bak
+            self.model.heads_b[current_task_idx] = b3_bak
+        else:
+            self.model.W3 = W3_bak
+            self.model.b3 = b3_bak
+
+        if self.model.input_adapter and current_task_idx is not None:
+            self.model.adapters[current_task_idx] = A_bak
+
+        delta_L = L_new - L_old
+
+        # Maintain Exponential Moving Average
+        if self.delta_L_ema is None:
+            self.delta_L_ema = delta_L
+        else:
+            d = self.lookahead_ema_decay
+            self.delta_L_ema = d * self.delta_L_ema + (1.0 - d) * delta_L
+
+        return self.delta_L_ema
+
+    def _effective_dark_alpha(self, current_grads, ce_grads, dark_grads):
+        return self.lookahead_alpha
+
+    def train_step(self, X, Y, task_idx: int = None):
+        self._active_task_idx = task_idx
+        loss, acc = self.model.loss_acc(X, Y, task_idx)
+        cache = self.model.forward(X, task_idx)
+        grads = self.model.backward(cache, Y, task_idx)
+
+        sample = self._sample_replay()
+        if sample is not None:
+            rX, rY, rtasks, rlogits = sample
+            # Counterfactual lookahead probing
+            delta_L_ema = self._lookahead_conflict_check(grads, rX, rY, rtasks, task_idx)
+            scale = np.exp(-self.lookahead_beta * max(0.0, delta_L_ema))
+            self.lookahead_alpha = float(self.dark_alpha * scale * self._distill_age_scale())
+            
+            self.alpha_trace.append(self.lookahead_alpha)
+            self.delta_L_trace.append(float(delta_L_ema))
+            if len(self.alpha_trace) > 2000:
+                self.alpha_trace = self.alpha_trace[-1000:]
+                self.delta_L_trace = self.delta_L_trace[-1000:]
+
+            # Mix gradients using self.lookahead_alpha
+            grads = self._mix_dark_replay_grads(grads, *sample, task_idx)
+
+        ewc_grads = self._ewc_grad(task_idx)
+        self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
+        self._reservoir_insert(X, Y, task_idx)
+        return loss, acc
+
+
+class RtpDarkReplayEWCTrainer(DarkReplayEWCTrainer):
+    """DarkReplayEWC with Representational Transfer Probe (RTP) using gradient-cosine regime detection.
+
+    We accumulate shared-layer gradients over the first N steps of a new task,
+    and compare it to the average gradient of past tasks sampled from the buffer.
+    If the cosine similarity is >= 0, we classify as synergistic and activate DER++ distillation.
+    If negative, we classify as conflicting and disable distillation (alpha = 0.0).
+    """
+    name = "RtpDarkReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, dark_alpha: float = 0.5,
+                 replay_weight: float = 0.5, dark_confidence_threshold: float = 0.0,
+                 dark_require_correct: bool = False, distill_start_task: int = 0,
+                 distill_ramp_tasks: int = 0, rtp_probe_steps: int = 5,
+                 rtp_cos_threshold: float = 0.0):
+        super().__init__(
+            model,
+            lr=lr,
+            capacity=capacity,
+            replay_batch=replay_batch,
+            seed=seed,
+            lam=lam,
+            fisher_batches=fisher_batches,
+            fisher_decay=fisher_decay,
+            grad_clip_norm=grad_clip_norm,
+            dark_alpha=dark_alpha,
+            replay_weight=replay_weight,
+            dark_confidence_threshold=dark_confidence_threshold,
+            dark_require_correct=dark_require_correct,
+            distill_start_task=distill_start_task,
+            distill_ramp_tasks=distill_ramp_tasks,
+        )
+        self.rtp_probe_steps = int(rtp_probe_steps)
+        self.rtp_cos_threshold = float(rtp_cos_threshold)
+        self._last_task_idx = None
+        self.rtp_step_counter = 0
+        self.rtp_accum_grads = None
+        self.rtp_active_alpha = 0.0
+        self.rtp_regime = "unknown"
+        self.alpha_trace = []
+        self.regime_trace = []
+
+    def _compute_past_tasks_avg_gradient(self, current_task_idx):
+        if len(self.buf_X) == 0 or current_task_idx is None or current_task_idx <= 0:
+            return {
+                "W1": np.zeros_like(self.model.W1),
+                "b1": np.zeros_like(self.model.b1),
+                "W2": np.zeros_like(self.model.W2),
+                "b2": np.zeros_like(self.model.b2),
+            }
+        
+        past_idx = [i for i, t in enumerate(self.buf_task) if t is not None and t < current_task_idx]
+        if len(past_idx) == 0:
+            return {
+                "W1": np.zeros_like(self.model.W1),
+                "b1": np.zeros_like(self.model.b1),
+                "W2": np.zeros_like(self.model.W2),
+                "b2": np.zeros_like(self.model.b2),
+            }
+        
+        sample_idx = self.rng.choice(past_idx, size=min(100, len(past_idx)), replace=False)
+        sX = np.stack([self.buf_X[i] for i in sample_idx])
+        sY = np.array([self.buf_Y[i] for i in sample_idx], dtype=np.int64)
+        stasks = [self.buf_task[i] for i in sample_idx]
+        
+        accum_grads = {
+            "W1": np.zeros_like(self.model.W1),
+            "b1": np.zeros_like(self.model.b1),
+            "W2": np.zeros_like(self.model.W2),
+            "b2": np.zeros_like(self.model.b2),
+        }
+        
+        if self.model.multi_head or self.model.input_adapter:
+            for t in sorted(set(stasks)):
+                sub_idx = [i for i, val in enumerate(stasks) if val == t]
+                sub_X = sX[sub_idx]
+                sub_Y = sY[sub_idx]
+                cache = self.model.forward(sub_X, t)
+                grads = self.model.backward(cache, sub_Y, t)
+                weight = len(sub_idx) / len(stasks)
+                for k in ["W1", "b1", "W2", "b2"]:
+                    accum_grads[k] += weight * grads[k]
+        else:
+            cache = self.model.forward(sX)
+            grads = self.model.backward(cache, sY)
+            for k in ["W1", "b1", "W2", "b2"]:
+                accum_grads[k] = grads[k]
+                
+        return accum_grads
+
+    def _effective_dark_alpha(self, current_grads, ce_grads, dark_grads):
+        return self.rtp_active_alpha
+
+    def train_step(self, X, Y, task_idx: int = None):
+        self._active_task_idx = task_idx
+        
+        # Detect new task transition
+        if task_idx != self._last_task_idx:
+            self._last_task_idx = task_idx
+            self.rtp_step_counter = 0
+            self.rtp_accum_grads = {
+                "W1": np.zeros_like(self.model.W1),
+                "b1": np.zeros_like(self.model.b1),
+                "W2": np.zeros_like(self.model.W2),
+                "b2": np.zeros_like(self.model.b2),
+            }
+            self.rtp_active_alpha = 0.0
+            self.rtp_regime = "probing" if (task_idx is not None and task_idx > 0) else "task_0"
+            if task_idx == 0:
+                self.rtp_active_alpha = float(self.dark_alpha)
+            
+        loss, acc = self.model.loss_acc(X, Y, task_idx)
+        cache = self.model.forward(X, task_idx)
+        grads = self.model.backward(cache, Y, task_idx)
+
+        # Probing stage logic
+        if task_idx is not None and task_idx > 0 and self.rtp_regime == "probing":
+            for k in ["W1", "b1", "W2", "b2"]:
+                self.rtp_accum_grads[k] += grads[k]
+            self.rtp_step_counter += 1
+            if self.rtp_step_counter == self.rtp_probe_steps:
+                # Compute past task average gradient
+                g_past = self._compute_past_tasks_avg_gradient(task_idx)
+                v_curr = np.concatenate([self.rtp_accum_grads[k].ravel() for k in ["W1", "b1", "W2", "b2"]])
+                v_past = np.concatenate([g_past[k].ravel() for k in ["W1", "b1", "W2", "b2"]])
+                cos = np.dot(v_curr, v_past) / (np.linalg.norm(v_curr) * np.linalg.norm(v_past) + 1e-8)
+                
+                if cos >= self.rtp_cos_threshold:
+                    self.rtp_active_alpha = float(self.dark_alpha)
+                    self.rtp_regime = "synergistic"
+                else:
+                    self.rtp_active_alpha = 0.0
+                    self.rtp_regime = "conflicting"
+                self.rtp_accum_grads = None
+
+        self.alpha_trace.append(self.rtp_active_alpha)
+        self.regime_trace.append(self.rtp_regime)
+
+        sample = self._sample_replay()
+        if sample is not None:
+            # Mix gradients using self.rtp_active_alpha (via _effective_dark_alpha)
+            grads = self._mix_dark_replay_grads(grads, *sample, task_idx)
+
+        ewc_grads = self._ewc_grad(task_idx)
+        self.model.sgd_step(grads, self.lr, extra_grads=ewc_grads, task_idx=task_idx)
+        self._reservoir_insert(X, Y, task_idx)
+        return loss, acc
+
+
 class SurpriseReplayEWCTrainer(ReplayEWCTrainer):
     """ReplayEWC with surprise-prioritized replay sampling.
 
@@ -1734,6 +2051,8 @@ TRAINER_REGISTRY = {
     "DarkReplayEWC": DarkReplayEWCTrainer,
     "AdaptiveDarkReplayEWC": AdaptiveDarkReplayEWCTrainer,
     "PressureDarkReplayEWC": PressureDarkReplayEWCTrainer,
+    "LookaheadDarkReplayEWC": LookaheadDarkReplayEWCTrainer,
+    "RtpDarkReplayEWC": RtpDarkReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "HippocampalReplayEWC": HippocampalReplayEWCTrainer,
