@@ -773,6 +773,123 @@ class OnlineDarkReplayEWCTrainer(DarkReplayEWCTrainer):
         pass  # task-free: consolidation is driven by step interval, not boundaries
 
 
+class GenerativeReplayEWCTrainer(ReplayEWCTrainer):
+    """Buffer-free replay: no raw samples are ever stored.
+
+    The inputs are one-hot digit windows (``K`` positions x 10 digit values).
+    Instead of a reservoir of raw samples, this keeps, per (task, class), a
+    factorized categorical generative model — the per-position digit frequencies
+    accumulated as sufficient statistics from the data stream as it passes. Replay
+    draws *synthetic* one-hot windows from that model and routes them through the
+    matching head, so the shared layers and old heads keep being rehearsed without
+    retaining any raw data. Storage is bounded by ``n_tasks * n_classes * in_dim``
+    and, crucially, does not grow with stream length.
+
+    The EWC Fisher/anchor consolidation still runs at ``on_task_end`` on the
+    *current* task's transient data (no old data retained), so this is the
+    generative analogue of ``ReplayEWC`` and is compared head-to-head against it.
+    """
+    name = "GenerativeReplayEWC"
+
+    def __init__(self, model: MLP, lr: float = 0.05, capacity: int = 2000,
+                 replay_batch: int = 16, seed: int = 0, lam: float = 5.0,
+                 fisher_batches: int = 30, fisher_decay: float = 0.9,
+                 grad_clip_norm: float = 50.0, gen_smoothing: float = 0.1,
+                 gen_sum_match: bool = True, gen_sum_tol: float = 1.0):
+        super().__init__(model, lr=lr, capacity=capacity, replay_batch=replay_batch,
+                         seed=seed, lam=lam, fisher_batches=fisher_batches,
+                         fisher_decay=fisher_decay, grad_clip_norm=grad_clip_norm)
+        self.in_dim = int(self.model.dims[0])
+        self.alphabet = 10
+        self.K = self.in_dim // self.alphabet
+        self.gen_smoothing = float(gen_smoothing)
+        # Conditional generation: keep synthetic windows whose digit-sum matches the
+        # class's observed sum band (the sum is what defines the label here), within
+        # gen_sum_tol * std. Without this, independent per-position sampling produces
+        # windows whose sum falls in the wrong bucket -> synthetic label noise.
+        self.gen_sum_match = bool(gen_sum_match)
+        self.gen_sum_tol = float(gen_sum_tol)
+        # digit value of each one-hot dim: [0..9, 0..9, ...] so window_sum = X @ value_vec
+        self.value_vec = np.tile(np.arange(self.alphabet), self.K).astype(np.float64)
+        self.gen_sum = {}      # (task, class) -> (in_dim,) running one-hot counts
+        self.gen_count = {}    # (task, class) -> int
+        self.gen_sval = {}     # (task, class) -> running sum of window-sums
+        self.gen_sval_sq = {}  # (task, class) -> running sum of window-sums^2
+        self.gen_keys = []     # ordered list of seen (task, class) keys
+
+    def _reservoir_insert(self, X, Y, task_idx=None):
+        # Update per-class sufficient statistics instead of storing raw samples.
+        Y = np.asarray(Y).astype(np.int64)
+        svals = X @ self.value_vec
+        for c in np.unique(Y):
+            key = (task_idx, int(c))
+            mask = (Y == c)
+            if key not in self.gen_sum:
+                self.gen_sum[key] = np.zeros(self.in_dim, dtype=np.float64)
+                self.gen_count[key] = 0
+                self.gen_sval[key] = 0.0
+                self.gen_sval_sq[key] = 0.0
+                self.gen_keys.append(key)
+            self.gen_sum[key] += X[mask].sum(axis=0)
+            self.gen_count[key] += int(mask.sum())
+            self.gen_sval[key] += float(svals[mask].sum())
+            self.gen_sval_sq[key] += float((svals[mask] ** 2).sum())
+
+    def _sample_digits(self, probs, m):
+        out = np.zeros((m, self.in_dim), dtype=np.float64)
+        rows = np.arange(m)
+        digit_sum = np.zeros(m, dtype=np.float64)
+        for p in range(self.K):
+            digits = self.rng.choice(self.alphabet, size=m, p=probs[p])
+            out[rows, p * self.alphabet + digits] = 1.0
+            digit_sum += digits
+        return out, digit_sum
+
+    def _generate(self, key, m):
+        # Sample m synthetic one-hot windows from the (task, class) categorical model,
+        # optionally keeping only those whose digit-sum matches the class sum band.
+        counts = self.gen_sum[key].reshape(self.K, self.alphabet) + self.gen_smoothing
+        probs = counts / counts.sum(axis=1, keepdims=True)
+        if not self.gen_sum_match or self.gen_count[key] < 2:
+            return self._sample_digits(probs, m)[0]
+
+        n = self.gen_count[key]
+        mean = self.gen_sval[key] / n
+        var = max(0.0, self.gen_sval_sq[key] / n - mean * mean)
+        band = self.gen_sum_tol * np.sqrt(var)
+        kept = []
+        for _ in range(8):  # bounded rejection sampling
+            cand, csum = self._sample_digits(probs, max(m, 4 * m))
+            ok = np.abs(csum - mean) <= band
+            if ok.any():
+                kept.append(cand[ok])
+                if sum(len(a) for a in kept) >= m:
+                    break
+        if not kept:
+            return self._sample_digits(probs, m)[0]  # fall back if band too tight
+        pool = np.concatenate(kept, axis=0)
+        if pool.shape[0] < m:  # top up with unconditional samples
+            pool = np.concatenate([pool, self._sample_digits(probs, m - pool.shape[0])[0]], axis=0)
+        return pool[:m]
+
+    def _sample_replay(self):
+        if not self.gen_keys:
+            return None
+        counts = np.array([self.gen_count[k] for k in self.gen_keys], dtype=np.float64)
+        probs = counts / counts.sum()
+        idx = self.rng.choice(len(self.gen_keys), size=self.replay_batch, p=probs)
+        rX_list, rY, rtasks = [], [], []
+        for ki in np.unique(idx):
+            key = self.gen_keys[int(ki)]
+            m = int(np.sum(idx == ki))
+            rX_list.append(self._generate(key, m))
+            rY.extend([key[1]] * m)
+            rtasks.extend([key[0]] * m)
+        rX = np.concatenate(rX_list, axis=0)
+        rY = np.array(rY, dtype=np.int64)
+        return rX, rY, rtasks
+
+
 class AdaptiveDarkReplayEWCTrainer(DarkReplayEWCTrainer):
     """DarkReplayEWC with gradient-conflict gated logit distillation.
 
@@ -2171,6 +2288,7 @@ TRAINER_REGISTRY = {
     "RtpDarkReplayEWC": RtpDarkReplayEWCTrainer,
     "OnlineEWCReplay": OnlineEWCReplayTrainer,
     "OnlineDarkReplayEWC": OnlineDarkReplayEWCTrainer,
+    "GenerativeReplayEWC": GenerativeReplayEWCTrainer,
     "SurpriseReplayEWC": SurpriseReplayEWCTrainer,
     "MarginSurpriseReplayEWC": MarginSurpriseReplayEWCTrainer,
     "HippocampalReplayEWC": HippocampalReplayEWCTrainer,

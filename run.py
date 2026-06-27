@@ -309,6 +309,12 @@ def main():
                         help="Step interval for task-free online EWC consolidation (Online*EWC* trainers).")
     parser.add_argument("--fisher-sample", type=int, default=None,
                         help="Buffer sample size for task-free online Fisher estimation (Online*EWC* trainers).")
+    parser.add_argument("--gen-smoothing", type=float, default=None,
+                        help="Laplace smoothing for the GenerativeReplayEWC categorical model.")
+    parser.add_argument("--gen-sum-tol", type=float, default=None,
+                        help="Sum-band tolerance (in stds) for GenerativeReplayEWC conditional generation.")
+    parser.add_argument("--gen-sum-match-off", action="store_true",
+                        help="Disable sum-matched rejection sampling in GenerativeReplayEWC (ablation).")
     parser.add_argument("--output", default=None,
                         help="Output JSON path. Defaults to results_<mode>.json in the project folder.")
     args = parser.parse_args()
@@ -414,6 +420,12 @@ def main():
         trainer_kwargs["consolidate_every"] = args.consolidate_every
     if args.fisher_sample is not None:
         trainer_kwargs["fisher_sample"] = args.fisher_sample
+    if args.gen_smoothing is not None:
+        trainer_kwargs["gen_smoothing"] = args.gen_smoothing
+    if args.gen_sum_tol is not None:
+        trainer_kwargs["gen_sum_tol"] = args.gen_sum_tol
+    if args.gen_sum_match_off:
+        trainer_kwargs["gen_sum_match"] = False
 
     stream_kwargs_template = dict(
         digits_file="pi_digits_600000.txt",

@@ -26,6 +26,7 @@
 - **Pressure / maturity gating 邊界（§12.3）**：`PressureDarkReplayEWC`（可靠 logits × label-loss pressure）安全但偏保守，130-task 把 ReplayEWC **0.815→0.847**，仍低於 full DER++ **0.892**；logit drift 是假警報，delayed DER++ start=40/80 也不夠。下一步要做的是 **regime/horizon detector**，不是再調單一 batch-level gate。
 - **cos-RTP regime detector 失敗（§12.4，3-seed 驗收）**：task-onset 共享層梯度餘弦**不是**有效 regime 訊號——RTP 幾乎永遠判 conflicting、退化成 ReplayEWC，130-task 只有 **0.818**（< full DER++ 0.893）。機制完好（強制永遠開→0.898），病灶在訊號（多頭標籤排列污染共享層梯度方向）。教訓：局部/reactive/權重空間訊號（cosine、logit drift、label loss）都不足，要用 function-space 反事實量測或 horizon 訊號（→ P2.7）。
 - **Task-free 的代價趨近於零（§13，P3）**：把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計後，80-task 下 ReplayEWC 0.818→0.826、DER++ 0.868→0.855（在 std 內）。核心配方（replay + Fisher-EWC + DER++）天生接近 task-free；邊界在此 regime 可有可無。
+- **Buffer-free 生成式回放長流反超 raw replay（§14，P4）**：`GenerativeReplayEWC` 不存原始樣本，label_permuted 80-task **0.916** 勝過 raw ReplayEWC 0.818 / DER++ 0.868（固定 buffer 在長流被稀釋、生成統計量不衰減）；但須條件在定義標籤的統計量上（sum-matched ablation 0.470→0.753），conflicting 多變規則下保真度不足（0.431<0.486）。
 - **正向遷移**：表徵層有（晚段任務最終準確率更高），學習速度沒有（§10.3）。
 
 ## 2. Backlog（依優先序；每項含 為什麼 / 做法 / 驗收）
@@ -39,10 +40,11 @@
 - **P2.6 — Lookahead 與 RTP 動態 Regime 偵測器（已做完並 3-seed 驗收，結論為負面）**：實作了 Lookahead 與 cos-RTP 門控，但 **3-seed 正式驗收推翻初版「成功」結論**：cos-RTP 在 130-task label_permuted 只有 0.818（< full DER++ 0.893、甚至略低於 ReplayEWC 0.832），因為它幾乎永遠判 conflicting、退化成 ReplayEWC（alpha_mean≈0.011）。threshold 掃描證明機制完好（強制永遠開→0.898）、病灶是訊號（task-onset 梯度餘弦分不開共享規則長流 vs 真衝突）。詳見 §12.4.1/12.4.2。**P2.6 的目標（自動辨識何時值得 proactive consolidation）尚未達成 → 退回 backlog 為 P2.7。**
 
 - **P3 — Task-free (無邊界) CL（已完成，§13）**：新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`，把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計（從 reservoir buffer 取樣）。80-task × 3 seeds：失去邊界知識的代價趨近於零（EWC +0.008、DER++ −0.012 在 std 內），無邊界 DER++ 仍勝過有邊界 ReplayEWC。
+- **P4 — Buffer-free / generative replay（已完成，§14）**：新增 `GenerativeReplayEWC`（完全不存原始樣本，per-(task,class) categorical 生成模型 + sum-matched conditional generation）。label_permuted 80-task buffer-free **0.916 反超** raw ReplayEWC 0.818 與 DER++ 0.868（長流 buffer 被稀釋、生成統計量不衰減）；conflicting 0.431 < raw 0.486（sum-matched 條件統計量對非 sum 規則不符）。
 
 **下一個要做 / Todo**
 - **P2.7 — function-space / horizon regime 偵測器（接續 P2.6 的未竟目標）**：見下方 backlog。task-onset 權重梯度餘弦已證實無效，改用反事實 replay-accuracy 量測或 horizon 訊號。
-- **P4 — Buffer-free / generative replay**：用特徵級回放（Feature Replay）或高斯偽特徵生成（Gaussian Pseudo-Rehearsal），取代原始樣本 Buffer。
+- **P5 — rule-agnostic 生成式回放（接續 P4）**：P4 的 sum-matched 只條件在總和、對 conflicting 多變規則不符。下一步讓生成模型條件在「真正定義該任務標籤的統計量」或模型自身特徵/logits，補上 conflicting 的保真度缺口。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
 **結果**：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 Class-IL final 0.31→**0.858**、遺忘 0.50→**0.06**、retention>1.0（3 seeds, std 0.003）。診斷正確：病灶是線性頭的 recency/magnitude bias，換成無偏原型讀出即解。候選清單裡的 cosine/BiC/class-balanced replay 尚未試（NCM 已夠強，這些可作為進一步小幅優化或在更大規模時備用）。
@@ -124,17 +126,25 @@
 
 **結論**：reservoir replay 才是主力抗遺忘機制（本來就無邊界），Fisher 鞏固只需粗略滾動估計，精確 task-end 時機可有可無——核心配方天生接近 task-free。注意：多頭 Task-IL 的 head（與 input_adapter 的 adapter）在 train/eval 仍需 task id 做路由，這是架構需求、不是鞏固時機的邊界知識；P3 移除的是後者。若要連 head 路由都 task-free，須走 single-head class_il（見 §11）或 task-inference 機制。
 
-### P4 — Buffer-free / generative replay
-- **為什麼**：DER++ 仍存 2000 筆原始樣本；真正的終身學習可能不准存原始資料、串流無上限。這一步應在 P2/P3 之後做，因為先要知道方法在「真衝突」和「無邊界」下是否仍成立。
-- **做法**：實作不存原始輸入的版本：
-  - **feature replay**：只存/重播倒數第二層特徵（a2）而非原始 X；或
-  - **小型 generative replay**：每類別一個 Gaussian（mean+cov）在輸入或特徵空間合成舊資料；
-  - 對照原始 buffer 的 DER++/ReplayEWC。
-- **驗收**：在 label_permuted 130-task 與 P2 conflicting-task 上，buffer-free 版本 retention 能不能接近原始 DER++。
+### ✅ P4 — Buffer-free / generative replay（已完成，§14）
+**做完的事情**：新增 `GenerativeReplayEWC`（`trainers.py`）——完全不存原始樣本，改對每 (task,class) 維護因子化 categorical 生成模型（per-position 數字頻率充分統計量），回放時抽合成 one-hot 窗口、經對應 head 路由（重用既有多頭/adapter 路由）。Fisher 仍在 `on_task_end` 用當前任務瞬時資料。關鍵設計 **sum-matched conditional generation**：rejection-sample 讓合成窗口的數字和落在類別和分布 `mean±gen_sum_tol·std` 內（因為標籤由和定義）。CLI：`--gen-smoothing`、`--gen-sum-tol`、`--gen-sum-match-off`（ablation）。smoke 三 mode 全過。
 
-## 3. 建議順序與理由（P1/P2/P2.5/P3 已完成；P2.6 做完但結論為負面）
+**結果**：
+- sum-match ablation（10-task×1 seed）：關掉 0.470 → 打開 **0.753**（diag 0.569→0.688、forget 0.138→0.040）。
+- label_permuted 交叉：10-task raw 0.810 > gen 0.753（buffer 餵得飽）；**80-task gen 0.916 > raw ReplayEWC 0.818 > raw DER++ 0.868**（3 seeds；固定 buffer 被稀釋、生成統計量不衰減；gen 方差更小、遺忘更低）。
+- conflicting 40-task：gen **0.431** < raw ReplayEWC 0.486（sum-matched 只條件在總和，對 weighted/half/product 規則是錯統計量）。
+- 結果檔：`results_genreplay_{label_permuted,longstream_label_permuted,conflicting_40,10task_label_permuted,nomatch_ablation_10task}.json`。
 
-1. **P4（buffer-free / generative replay）** — 下一個最高價值：拿掉 raw replay buffer，改為在隱藏特徵空間中重播特徵（Feature Replay）或為每個類別維護 Gaussian 分布做 Pseudo-Rehearsal。P3 已證實 task-free 不損效能，且既有結論一再指出 replay 是主力——所以「能不能在不存原始樣本下保住 replay 的威力」是最關鍵的下一道硬牆。驗收：在 80/130-task label_permuted 與 conflicting 上，buffer-free 版 retention 能否接近原始 DER++。
+**結論**：不存原始樣本可行、且在「條件統計量對得上 + 串流夠長」時甚至超越 raw replay；瓶頸是生成模型能否抓住定義標籤的統計量，而非記憶機制本身。→ 開 P5。
+
+### P5 — rule-agnostic 生成式回放（接續 P4 未竟）
+- **為什麼**：P4 的 sum-matched 條件統計量是手挑的（總和），只對預設 sum 規則對。conflicting 多變規則下保真度不足（0.431<0.486）。
+- **做法候選**：(a) 條件在模型自身的倒數第二層特徵或 logits（資料驅動，自動對齊任務規則）；(b) 每 (task,class) 存小型 Gaussian / 混合模型於特徵空間並配合 feature replay；(c) 用每任務凍結 teacher 對合成樣本做 DER++ 蒸餾（generative dark replay）。
+- **驗收**：conflicting 40-task buffer-free 逼近 raw ReplayEWC（final/Joint 差距 ≤2%），且 label_permuted 不退步。
+
+## 3. 建議順序與理由（P1/P2/P2.5/P3/P4 已完成；P2.6 做完但結論為負面）
+
+1. **P5（rule-agnostic 生成式回放）** — 直接接續 P4：把生成模型的條件從手挑統計量改成資料驅動（特徵/logits），補上 conflicting 保真度缺口。價值高且路徑清楚。
 2. **P2.7（function-space / horizon regime detector）** — 接續 P2.6 未竟目標（自動切換 DER++），但 P2.6 已證實 task-onset 權重梯度餘弦無效，要改用反事實 replay-accuracy probe，風險較高；建議**先用 oracle validation 確認可學 schedule 存在**再投入。
 
 ## 4. 慣例
