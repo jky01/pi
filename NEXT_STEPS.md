@@ -27,6 +27,7 @@
 - **cos-RTP regime detector 失敗（§12.4，3-seed 驗收）**：task-onset 共享層梯度餘弦**不是**有效 regime 訊號——RTP 幾乎永遠判 conflicting、退化成 ReplayEWC，130-task 只有 **0.818**（< full DER++ 0.893）。機制完好（強制永遠開→0.898），病灶在訊號（多頭標籤排列污染共享層梯度方向）。教訓：局部/reactive/權重空間訊號（cosine、logit drift、label loss）都不足，要用 function-space 反事實量測或 horizon 訊號（→ P2.7）。
 - **P2.7 horizon oracle 驗證（§12.5，部分正面）**：`HorizonDarkReplayEWC` 證明「已知 horizon」可作上界 schedule：20-task label 關閉 DER++ 得 **0.873**（= ReplayEWC）、40-task conflicting 關閉得 **0.486**（= ReplayEWC）、80/130-task label 開啟得 **0.868/0.893**（= full DER++）。但 80-task × 2000 steps 反例顯示 horizon 長度本身不夠，還要看訓練 budget / function-space benefit。
 - **P2.8 online function-space benefit detector（§12.6，部分正面/負面）**：`BenefitDarkReplayEWC` 用可回復虛擬步比較 DER++ on/off。label-loss benefit 版成功避開誤開：conflicting 40 **0.486**、80×2000 **0.788**，都等於 ReplayEWC；但長流 80/130 也只等於 ReplayEWC（**0.818/0.832**），拿不到 full DER++ **0.868/0.893**。logit-MSE benefit ablation 會開，但在短流/80×2000 誤開並貼近 DarkReplayEWC 壞結果。教訓：**單步反事實太短視；logit 幾何太假陽性；DER++ 的收益是多步、慢時間尺度的 proactive consolidation。**
+- **P2.9 local multi-step slow-benefit controller（§12.7，負面結果）**：`SlowBenefitDarkReplayEWC` 把 P2.8 probe 擴成最近 5 個 current batches 的 shadow rollout。label-loss 版保持安全：20-task **0.873**、80×2000 **0.788**、conflicting 40 **0.486**，但 alpha 仍全程 0，80/130 長流仍是 **0.818/0.832**，拿不到 full DER++ **0.868/0.893**。小 logit 權重 0.02 會讓 80×2000 seed0 掉到 **0.771**。教訓：同一局部 window 多走幾步仍不是長期因果收益；下一步要做跨真實時間持續存在的 shadow/bandit 或顯式 regime prior。
 - **Task-free 的代價趨近於零（§13，P3）**：把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計後，80-task 下 ReplayEWC 0.818→0.826、DER++ 0.868→0.855（在 std 內）。核心配方（replay + Fisher-EWC + DER++）天生接近 task-free；邊界在此 regime 可有可無。
 - **Buffer-free 生成式回放長流反超 raw replay（§14，P4）**：`GenerativeReplayEWC` 不存原始樣本，label_permuted 80-task **0.916** 勝過 raw ReplayEWC 0.818 / DER++ 0.868（固定 buffer 在長流被稀釋、生成統計量不衰減）；但須條件在定義標籤的統計量上（sum-matched ablation 0.470→0.753），conflicting 多變規則下保真度不足（0.431<0.486）。
 - **rule-agnostic 生成回放：scholar teacher 補上 conflicting（§15，P5）**：NB 自分類器失敗（太弱，label 退步到 0.521）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher 對合成輸入蒸餾）conflicting 0.474（final/Joint 差 raw 僅 1.6%）、遺忘最低 0.082。沒有單一 buffer-free 生成器全勝（簡單統計量→sum-match；複雜規則→scholar）；殘留缺口源自因子化輸入保真度。
@@ -44,6 +45,7 @@
 - **P2.6 — Lookahead 與 RTP 動態 Regime 偵測器（已做完並 3-seed 驗收，結論為負面）**：實作了 Lookahead 與 cos-RTP 門控，但 **3-seed 正式驗收推翻初版「成功」結論**：cos-RTP 在 130-task label_permuted 只有 0.818（< full DER++ 0.893、甚至略低於 ReplayEWC 0.832），因為它幾乎永遠判 conflicting、退化成 ReplayEWC（alpha_mean≈0.011）。threshold 掃描證明機制完好（強制永遠開→0.898）、病灶是訊號（task-onset 梯度餘弦分不開共享規則長流 vs 真衝突）。詳見 §12.4.1/12.4.2。**P2.6 的目標（自動辨識何時值得 proactive consolidation）尚未達成 → 退回 backlog 為 P2.7。**
 - **P2.7 — Horizon oracle regime detector（已完成，§12.5，部分正面）**：實作 `HorizonDarkReplayEWC` 與 `--horizon-threshold/--horizon-override`。標準驗收下，oracle horizon gate 可在 20/40-task 關閉 DER++、在 80/130-task 開啟 DER++，同時貼近 ReplayEWC 安全性與 full DER++ 長流增益。限制：80-task × 2000 steps 顯示「任務數夠長」不一定代表 DER++ 立刻有益，下一步需改成 online function-space benefit probe。
 - **P2.8 — Online function-space benefit detector（已完成，§12.6，部分正面/負面）**：實作 `BenefitDarkReplayEWC`、`--benefit-*` CLI、diagnostics。label-loss 版是安全閥：20-task label **0.873**、80×2000 **0.788**、conflicting 40 **0.486**，都避開 DER++ 傷害；但 80×4000 **0.818**、130×4000 **0.832**，仍退回 ReplayEWC，未達 ≥0.87 長流目標。logit-MSE benefit ablation 證明「保留舊 logits 幾何」不是可靠收益訊號，會在短流/未成熟長流誤開。
+- **P2.9 — Local multi-step / slow-benefit controller（已完成，§12.7，負面結果）**：實作 `SlowBenefitDarkReplayEWC`、`--slow-rollout-steps`、diagnostics。recent-window 5-step label-loss probe 保持 P2.8 安全性但仍全程 alpha=0；小 logit 權重 0.02 仍誤開 80×2000。結論：local rollout 不是 DER++ 長期收益 detector，下一步若繼續此線，需做 persistent shadow-model bandit。
 
 - **P3 — Task-free (無邊界) CL（已完成，§13）**：新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`，把 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距線上估計（從 reservoir buffer 取樣）。80-task × 3 seeds：失去邊界知識的代價趨近於零（EWC +0.008、DER++ −0.012 在 std 內），無邊界 DER++ 仍勝過有邊界 ReplayEWC。
 - **P4 — Buffer-free / generative replay（已完成，§14）**：新增 `GenerativeReplayEWC`（完全不存原始樣本，per-(task,class) categorical 生成模型 + sum-matched conditional generation）。label_permuted 80-task buffer-free **0.916 反超** raw ReplayEWC 0.818 與 DER++ 0.868（長流 buffer 被稀釋、生成統計量不衰減）；conflicting 0.431 < raw 0.486（sum-matched 條件統計量對非 sum 規則不符）。
@@ -51,7 +53,7 @@
 - **P6 — 更強的輸入生成器（已完成，§16，負面結果）**：`ScholarGlobalGenerativeReplayEWC`（全域 per-task 邊際抽 on-manifold 輸入 + scholar 標註）**推翻 P5 的 on-manifold 歸因**——3-seed 全面更差（conflicting 0.428 < scholar-class 0.474；label 0.769 < 0.809），儘管 forgetting 最低（0.052），瓶頸是可塑性（diag 0.54→0.45）。per-class 集中回放比全域覆蓋更重要；殘留小差距更像真實樣本不可取代的價值（精確 per-class 聯合結構→正向後向遷移），非輸入分布失配。
 
 **下一個要做 / Todo**
-- **P2.9 — multi-step / slow-timescale consolidation controller（接續 P2.8 的限制）**：單步 function-space probe 太短視，下一步要用多步 rollout、shadow model/bandit、或 sleep-style replay window 評估「開 DER++ 的長期收益」，而不是只看一步後的 label loss。
+- **P2.10 — persistent shadow-model bandit / regime prior（接續 P2.9 的限制）**：P2.9 證明 local window rollout 不夠。下一步若要繼續找自動 DER++ policy，應讓 alpha=0 與 alpha=0.5 的 shadow learners 從真實時間早期開始並行經歷 stream，週期性用 held-out replay/current 評估長期 retention/plasticity，再更新主模型 policy；或加入明確的 horizon/budget/regime prior，再用 function-space 訊號校正。
 - **（可選）P6b — per-class autoregressive 生成器**：P6 證明「全域 on-manifold」方向錯；唯一還沒試的是 per-class **autoregressive**（抓類內位置相關）能否把 scholar-class 從 0.474 再推近 raw 0.486。但邊際空間極小（僅差 1.6% final/Joint），優先序低。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
@@ -142,16 +144,20 @@
 - label-loss probe 是安全的，但太短視：它看到 DER++ 一步後讓 replay label loss / current loss 變差，所以永遠關閉；然而 full DER++ 的長流收益來自多步、慢時間尺度的 proactive consolidation。
 - logit-MSE probe 會看到「舊函數幾何更像」，但這正是 P2.5/P2.8 反覆證明的假陽性：保幾何不等於保有用任務表現。
 
-### P2.9 — multi-step / slow-timescale consolidation controller（下一步）
-**要做的事情**：把 P2.8 的一步 probe 延長成多步/慢時間尺度評估，讓 detector 能看見 DER++ 的 proactive 長期收益，同時保留 P2.8 對短流/衝突的安全性。
+### ✅/❌ P2.9 — local multi-step / slow-benefit controller（已完成，§12.7，負面結果）
+**做完的事情**：新增 `SlowBenefitDarkReplayEWC`。它把 P2.8 的一步虛擬更新延長成最近 `slow_rollout_steps=5` 個 current batches 的可回復 shadow rollout，仍比較 `alpha=0` vs `alpha=dark_alpha`，並沿用 P2.8 的 benefit score / EMA。CLI：`--slow-rollout-steps`；diagnostics：`slow_rollout_steps`、`benefit_*`、`dark_effective_alpha_*`。
 
-- **候選做法**：
-  - **shadow-model bandit**：週期性複製兩個輕量 shadow（alpha=0 vs alpha=0.5），在未來一小段 stream/replay window 上各跑 K 步，再用 held-out replay/current batch 評估舊任務 retention 與新任務 plasticity，更新主模型 alpha。
-  - **sleep-style consolidation probe**：線上先偏保守；每隔一段時間做 replay-only/混合 replay 的小型「睡眠窗口」，比較 DER++ consolidation 是否提升舊 replay accuracy 且不降低近期任務。
-  - **budget-aware prior + function probe**：用已觀察到的 task length、buffer dilution、舊任務 age 分布當慢變先驗；最終仍由多步 function-space 評估決定 alpha。
-- **驗收**：
-  - 保持 P2.8 的安全性：conflicting 40、20-task、80×2000 不低於 ReplayEWC。
-  - 恢復 P2.7 oracle 的長流增益：80×4000 接近 0.868，130×4000 ≥0.87。
+**3-seed 結果（recent-window rollout，label-loss benefit，`benefit_logit_weight=0`）**：
+- label_permuted 20×4000：**0.873 ± 0.015**，alpha=0，短流安全。
+- label_permuted 80×2000：**0.788 ± 0.030**，alpha=0，保持 P2.8 安全性。
+- conflicting 40×3000：**0.486 ± 0.002**，alpha=0，真衝突安全。
+- label_permuted 80×4000：**0.818 ± 0.045**，alpha=0，未拿到 full DER++ 0.868。
+- label_permuted 130×4000：**0.832 ± 0.079**，alpha=0，未達 ≥0.87，低於 full DER++ 0.893。
+
+**ablation / 教訓**：
+- `benefit_logit_weight=0.02`（seed0）在 conflicting 40 尚安全（0.486），但 80×2000 掉到 **0.771**（ReplayEWC/P2.8 seed0 0.820），130 也只有 **0.866**（P2.8 seed0 0.890）。小 logit 權重仍是假陽性。
+- local 5-step window 比 one-step 更長，但仍只看到 DER++ 的短期 label/current harm，看不到從 stream 早期開始維持 soft function geometry 的長期複利。
+- P2.9 排除的是「同一局部視窗多走幾步」；真正未試的是 persistent shadow-model bandit：shadow_on/off 必須從早期就共同經歷真實 stream，而不是每次 probe 才從當前模型複製。
 
 ### ✅ P3 — Task-free（無邊界）CL（已完成，§13）
 **做完的事情**：新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`（`trainers.py`）。`on_task_end` 改 no-op；Fisher/anchor 改由 `_online_consolidate_fisher` 每 `consolidate_every` 步從 reservoir buffer 取樣估計（多頭按 head 分組前傳），squared-grad 累加與 `fisher_decay` EMA 與邊界版一致，`lam` 可沿用。CLI：`--consolidate-every`、`--fisher-sample`。smoke test 三 mode 全過。
@@ -196,9 +202,9 @@
 
 **結論**：殘留缺口不是 on-manifold 與否的問題。scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw conflicting 有 +BWT、合成回放沒有）。P4–P6 總結：不存原始樣本可行且常足夠（長流甚至贏 raw），完全追平 raw 仍有一道由真實樣本聯合結構撐起的小硬牆。唯一未試：per-class autoregressive（見上方 Todo P6b，優先序低）。
 
-## 3. 建議順序與理由（P1/P2/P2.5/P2.7/P2.8/P3/P4/P5/P6 已完成；P2.6 負面、P2.8 部分正面/負面）
+## 3. 建議順序與理由（P1/P2/P2.5/P2.7/P2.8/P2.9/P3/P4/P5/P6 已完成；P2.6/P2.9 負面、P2.8 部分正面/負面）
 
-1. **P2.9（multi-step / slow-timescale consolidation controller）** — P2.8 證明一步 function-space probe 安全但太短視，logit-MSE 又是假陽性。下一步要用多步 shadow/bandit 或 sleep-style replay window 評估 DER++ 的長期收益，這是目前 backlog 中最有開放價值的題目。
+1. **P2.10（persistent shadow-model bandit / regime prior）** — P2.9 證明 local multi-step rollout 還是太短視；若要繼續找自動 DER++ policy，必須讓 shadow_on/off 跨真實時間累積差異，或加入顯式 horizon/budget/regime prior。
 2. **（可選）P6b（per-class autoregressive 生成器）** — 邊際空間極小（scholar-class 距 raw 僅 1.6%），優先序低。
 
 ## 4. 慣例

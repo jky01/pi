@@ -2,7 +2,7 @@
 
 ## 0. 主要結果摘要（TL;DR）
 
-純 numpy 手刻的 80→64→64→10 MLP，在 pi 數位構造的 Permuted-Pi-Digits 長串流上測 15 種持續學習機制。主要結論：
+純 numpy 手刻的 80→64→64→10 MLP，在 pi 數位構造的 Permuted-Pi-Digits 長串流上測多種持續學習機制。主要結論：
 
 **(A) 兩種任務流、兩種瓶頸**（80 tasks，final average accuracy，3 seeds）
 
@@ -40,13 +40,15 @@
 
 **(K) P2.8：online function-space benefit detector 安全但太短視**（§12.6）。新增 `BenefitDarkReplayEWC`：週期性做可回復虛擬步，比較 DER++ on/off 對舊 replay label loss 與 current loss 的影響。label-loss benefit 版成功避開誤開：20-task label **0.873**、80×2000 **0.788**、conflicting 40 **0.486**，都等於 ReplayEWC；但長流 80/130 也只到 **0.818/0.832**，拿不到 full DER++ **0.868/0.893**。logit-MSE benefit ablation 會開，卻在短流/未成熟長流誤開並貼近 DarkReplayEWC 壞結果。結論：一步 function-space label probe 太短視；logit 幾何是高假陽性訊號；DER++ 的收益是多步、慢時間尺度的 proactive consolidation。
 
-**(L) P3：移除任務邊界依賴的代價趨近於零（task-free CL）**（§13）。新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`：把靠 `on_task_end` 邊界觸發的 Fisher/anchor 鞏固，改成每固定步距從 reservoir buffer 線上估計（`on_task_end` 改 no-op）。80-task × 3 seeds 對照：ReplayEWC 0.818 → **OnlineEWCReplay 0.826（+0.008）**；DarkReplayEWC 0.868 → **OnlineDarkReplayEWC 0.855（−0.012，在 std 內）**。無邊界 DER++ 仍勝過有邊界 ReplayEWC。結論：核心配方（replay + Fisher-EWC + DER++）**天生就接近 task-free**——reservoir replay 才是主力，Fisher 只需粗略滾動估計，精確 task-end 時機可有可無。
+**(L) P2.9：local multi-step benefit controller 仍太短視（負面結果）**（§12.7）。新增 `SlowBenefitDarkReplayEWC`：把 P2.8 的一步虛擬更新擴成最近 5 個 current batches 的可回復 shadow rollout。label-loss 版保持安全：20-task **0.873**、80×2000 **0.788**、conflicting 40 **0.486**，但 alpha 仍全程 0，80/130 長流仍只有 **0.818/0.832**，沒拿回 full DER++ **0.868/0.893**。小 logit 權重 ablation（0.02）在 80×2000 seed0 掉到 **0.771**、130 seed0 也只有 **0.866**，再次證明 logit 幾何不是可靠收益訊號。結論：同一局部 replay/current window 的多步 rollout 仍不是 DER++ 長期因果收益；下一步若要解，必須用跨真實時間持續存在的 shadow/bandit 或明確 regime prior。
 
-**(M) P4：buffer-free 生成式回放在長流甚至超越 raw replay**（§14）。新增 `GenerativeReplayEWC`：**完全不存原始樣本**，改對每 (task,class) 維護因子化 categorical 生成模型（per-position 數字頻率），回放時抽合成 one-hot 窗口。關鍵是 **sum-matched conditional generation**（rejection-sample 讓合成窗口的數字和落在類別的和分布內，因為標籤由「和」定義；ablation：關掉→0.470、打開→0.753 @10-task）。label_permuted 出現**交叉且優勢隨長度複利放大**：10-task raw replay 贏（0.810 vs 0.753，buffer 餵得飽），但 **80-task buffer-free 反超 0.916 > raw ReplayEWC 0.818 / raw DER++ 0.868**，**130-task 更拉大到 0.947 > 0.832 / 0.893**（方差小到 0.006）——固定 2000 buffer 在長流被稀釋（~15–25/task），生成統計量卻不衰減。限制：conflicting 40-task 生成式 0.431 < raw 0.486，因為 sum-matched 只條件在總和、對非 sum 規則是錯統計量。
+**(M) P3：移除任務邊界依賴的代價趨近於零（task-free CL）**（§13）。新增 `OnlineEWCReplay` / `OnlineDarkReplayEWC`：把靠 `on_task_end` 邊界觸發的 Fisher/anchor 鞏固，改成每固定步距從 reservoir buffer 線上估計（`on_task_end` 改 no-op）。80-task × 3 seeds 對照：ReplayEWC 0.818 → **OnlineEWCReplay 0.826（+0.008）**；DarkReplayEWC 0.868 → **OnlineDarkReplayEWC 0.855（−0.012，在 std 內）**。無邊界 DER++ 仍勝過有邊界 ReplayEWC。結論：核心配方（replay + Fisher-EWC + DER++）**天生就接近 task-free**——reservoir replay 才是主力，Fisher 只需粗略滾動估計，精確 task-end 時機可有可無。
 
-**(N) P5：scholar(teacher) 生成式回放補上 conflicting 缺口**（§15）。為讓條件自動對齊任務規則試了兩條路：`NBGenerativeReplayEWC`（用儲存 categorical 自建 naive-Bayes 分類器做 rejection）**失敗**——conflicting 0.418 < sum-match 0.431，且 label_permuted 退步到 0.521（自分類器太弱）；`ScholarGenerativeReplayEWC`（每任務快照成凍結 teacher，對合成輸入用 teacher soft logits 蒸餾，generative DER++）**成功**——conflicting 40-task **0.474（final/Joint 0.628 vs raw 0.644，差 1.6%≤2%）、遺忘最低 0.082**，因為 teacher 編碼了每任務真實規則（含交互）能正確標註合成輸入；label_permuted 80-task 0.809 ≈ raw 0.818（但不及 sum-match 峰值 0.916）。教訓：**沒有單一 buffer-free 生成器全勝**——已知簡單統計量用 sum-match（甚至贏 raw），規則複雜/未知用 scholar（一份常數快照換 rule-agnostic 標註）；殘留缺口都指向因子化輸入保真度（→P6）。把「能不能不存原始樣本」變成「生成模型能否抓住定義標籤的統計量」的保真度問題。
+**(N) P4：buffer-free 生成式回放在長流甚至超越 raw replay**（§14）。新增 `GenerativeReplayEWC`：**完全不存原始樣本**，改對每 (task,class) 維護因子化 categorical 生成模型（per-position 數字頻率），回放時抽合成 one-hot 窗口。關鍵是 **sum-matched conditional generation**（rejection-sample 讓合成窗口的數字和落在類別的和分布內，因為標籤由「和」定義；ablation：關掉→0.470、打開→0.753 @10-task）。label_permuted 出現**交叉且優勢隨長度複利放大**：10-task raw replay 贏（0.810 vs 0.753，buffer 餵得飽），但 **80-task buffer-free 反超 0.916 > raw ReplayEWC 0.818 / raw DER++ 0.868**，**130-task 更拉大到 0.947 > 0.832 / 0.893**（方差小到 0.006）——固定 2000 buffer 在長流被稀釋（~15–25/task），生成統計量卻不衰減。限制：conflicting 40-task 生成式 0.431 < raw 0.486，因為 sum-matched 只條件在總和、對非 sum 規則是錯統計量。
 
-**(O) P6：on-manifold（全域）輸入生成器假設被推翻（負面結果）**（§16）。P5 把殘留缺口歸因於因子化輸入離流形。P6 改用全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform 數位＝on-manifold）+ scholar 標註（`ScholarGlobalGenerativeReplayEWC`）。3-seed 反而**全面更差**：conflicting 0.428 < scholar-class 0.474 < raw 0.486、label 0.769 < scholar-class 0.809，**儘管 forgetting 最低**（0.052）——瓶頸是可塑性（diag 0.54→0.45）。把 teacher 均勻蒸餾到整個輸入空間是過強的全域正則、稀釋類界訊號；per-class 集中回放比全域覆蓋更重要。修正歸因：殘留小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移），非輸入分布失配。
+**(O) P5：scholar(teacher) 生成式回放補上 conflicting 缺口**（§15）。為讓條件自動對齊任務規則試了兩條路：`NBGenerativeReplayEWC`（用儲存 categorical 自建 naive-Bayes 分類器做 rejection）**失敗**——conflicting 0.418 < sum-match 0.431，且 label_permuted 退步到 0.521（自分類器太弱）；`ScholarGenerativeReplayEWC`（每任務快照成凍結 teacher，對合成輸入用 teacher soft logits 蒸餾，generative DER++）**成功**——conflicting 40-task **0.474（final/Joint 0.628 vs raw 0.644，差 1.6%≤2%）、遺忘最低 0.082**，因為 teacher 編碼了每任務真實規則（含交互）能正確標註合成輸入；label_permuted 80-task 0.809 ≈ raw 0.818（但不及 sum-match 峰值 0.916）。教訓：**沒有單一 buffer-free 生成器全勝**——已知簡單統計量用 sum-match（甚至贏 raw），規則複雜/未知用 scholar（一份常數快照換 rule-agnostic 標註）；殘留缺口都指向因子化輸入保真度（→P6）。把「能不能不存原始樣本」變成「生成模型能否抓住定義標籤的統計量」的保真度問題。
+
+**(P) P6：on-manifold（全域）輸入生成器假設被推翻（負面結果）**（§16）。P5 把殘留缺口歸因於因子化輸入離流形。P6 改用全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform 數位＝on-manifold）+ scholar 標註（`ScholarGlobalGenerativeReplayEWC`）。3-seed 反而**全面更差**：conflicting 0.428 < scholar-class 0.474 < raw 0.486、label 0.769 < scholar-class 0.809，**儘管 forgetting 最低**（0.052）——瓶頸是可塑性（diag 0.54→0.45）。把 teacher 均勻蒸餾到整個輸入空間是過強的全域正則、稀釋類界訊號；per-class 集中回放比全域覆蓋更重要。修正歸因：殘留小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移），非輸入分布失配。
 
 ---
 
@@ -84,7 +86,7 @@
 
 ## 3. 模型與演算法
 
-兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含 29 個 trainer（含 Joint 離線上界，以及後續的 Class-IL、DER++、adaptive/pressure/horizon/benefit gating、task-free、generative replay、Benna-Fusi、FunctionSpace 等實驗方法）；早期主表仍保留九個核心方法，後續章節再分別報告新增方法。
+兩層隱藏層 MLP（80→64→64→10，ReLU+softmax），純 numpy 手刻 forward/backward。程式現在包含 30 個 trainer（含 Joint 離線上界，以及後續的 Class-IL、DER++、adaptive/pressure/horizon/benefit/slow-benefit gating、task-free、generative replay、Benna-Fusi、FunctionSpace 等實驗方法）；早期主表仍保留九個核心方法，後續章節再分別報告新增方法。
 
 - **Naive**：純線上 SGD，無任何保護機制，作為下界基準。
 - **EWC**：以 Fisher 資訊對角線錨定舊參數的二次懲罰項。方案 A 中二次懲罰主要應用於共享隱藏層參數。
@@ -618,6 +620,43 @@ P2.8 的安全性很好：它不會重犯 P2.7 在 80×2000 的誤開，也能�
 2. **一步 logit-MSE probe 是高假陽性訊號。** 它會保舊 logits 幾何，但這不等於保有用表現；在短流與真衝突下會誤開。
 3. **DER++ 的價值是多步、慢時間尺度的鞏固效果。** P2.8 把下一步問題釐清成：不是「量測哪個一步訊號」，而是要做 multi-step / slow-timescale controller，例如 shadow-model bandit 或 sleep-style replay window。
 
+### 12.7 P2.9：Local multi-step slow-benefit controller（負面結果）
+
+P2.8 的 one-step probe 太短視；P2.9 直接把 probe 拉長，測試「同一個 online 局部視窗裡，多走幾步是否能看見 DER++ 的慢時間尺度收益」。
+
+**做法**：新增 `SlowBenefitDarkReplayEWC`。它繼承 `BenefitDarkReplayEWC`，但每次 probe 不是只做一步虛擬更新，而是在可回復 shadow state 裡重播最近 `slow_rollout_steps=5` 個 current batches，分別比較：
+
+- `alpha=0`：ReplayEWC-like local rollout。
+- `alpha=dark_alpha`：DER++ local rollout。
+
+之後仍用 P2.8 的 benefit score / EMA 控制真實訓練 alpha。CLI 新增 `--slow-rollout-steps`，diagnostics 會記錄 `slow_rollout_steps`、`benefit_*` 與實際 `dark_effective_alpha_*`。
+
+**正式 3-seed 結果（recent-window rollout，label-loss benefit，`benefit_logit_weight=0`）**：
+
+| 設定 | SlowBenefit 行為 | final | BWT | mean forgetting | 判讀 |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| label_permuted 20 × 4000 | alpha=0 | **0.873 ± 0.015** | +0.112 | 0.038 | 短流安全，等於 ReplayEWC/P2.8 |
+| label_permuted 80 × 2000 | alpha=0 | **0.788 ± 0.030** | +0.021 | 0.092 | 保持 P2.8 安全性，未重犯 horizon 誤開 |
+| conflicting 40 × 3000 | alpha=0 | **0.486 ± 0.002** | -0.054 | 0.112 | 真衝突安全，等於 ReplayEWC/P2.8 |
+| label_permuted 80 × 4000 | alpha=0 | **0.818 ± 0.045** | -0.035 | 0.111 | 未拿到 full DER++ 0.868 |
+| label_permuted 130 × 4000 | alpha=0 | **0.832 ± 0.079** | -0.056 | 0.120 | 未達 ≥0.87，仍低於 full DER++ 0.893 |
+
+這個結果很乾淨：local 5-step rollout 比 one-step 更長，但 label-loss benefit 仍全程判 DER++ 有害，alpha=0，最後完全退回 P2.8/ReplayEWC。也就是說，**把同一個局部 window 多走幾步，仍不足以量到 DER++ 的長期因果收益**。
+
+**小 logit 權重 ablation（`benefit_logit_weight=0.02`，seed0）**：
+
+| 設定 | SlowBenefit(logit 0.02) | 安全基準 | 判讀 |
+| :--- | :---: | :---: | :--- |
+| conflicting 40 × 3000 | 0.486 | ReplayEWC 0.488(seed0) | 這個 seed 尚安全 |
+| label_permuted 80 × 2000 | **0.771** | ReplayEWC/P2.8 0.820(seed0) | 未成熟長流誤開，安全性破功 |
+| label_permuted 130 × 4000 | **0.866** | P2.8 0.890(seed0), full DER++ 0.874(seed0) | 沒救回長流，反而低於 alpha=0 seed0 |
+
+因此 P2.9 排除了兩個看似合理但不夠的方向：
+
+1. **local multi-step label-loss rollout 仍太近視。** 它只看見 DER++ 在短期內犧牲 hard-label CE / current loss，卻看不見長流裡「從一開始維持 soft function geometry」的複利收益。
+2. **local multi-step logit geometry 仍是假陽性。** 即使權重小到 0.02，也會在 80×2000 這種「任務數長但訓練 budget 不成熟」的設定誤開，且 130 seed0 沒有改善。
+3. **下一步不能再是同一視窗的虛擬 rollout。** 若要自動開 DER++，需要跨真實時間持續存在的 shadow-model bandit（on/off shadow 從早期就共同經歷 stream）、或顯式 regime / budget prior，再用 function-space 評估校正。這更接近生物腦裡快/慢系統的分工：局部突觸變化看不到長期鞏固價值，必須有跨時間的慢變狀態或離線整合過程。
+
 ## 13. Task-free（無邊界）持續學習：移除任務邊界依賴（P3）
 
 到目前為止所有 EWC 系列方法都靠 `on_task_end` 在「任務結束」這個明確邊界上估計 Fisher 對角線並快照 anchor——等於知道任務何時切換。真實串流沒有邊界。P3 把這個依賴拿掉，量化「失去邊界知識的代價」。
@@ -740,11 +779,12 @@ scholar-global 在兩個設定都**最差 final，卻有最低 forgetting**（co
 13. **Pressure/maturity gating 進一步縮小了答案空間（§12.3）**。可靠記憶 × label-loss pressure 是安全的，能在 130-task 把 ReplayEWC 0.815 拉到 0.847，但仍不及 full DER++ 0.892；logit drift 會誤判，delayed start=40/80 也不夠。這說明 DER++ 的價值是 proactive consolidation，而不是 reactive repair。下一步要做 regime/horizon detector，而不是再找單一局部 gate。
 14. **cos-RTP regime 偵測器失敗，但釐清了訊號需求（§12.4，負面結果）**。task-onset 共享層梯度餘弦無法分辨「共享規則長流（該開 DER++）」與「真衝突（該關）」——3-seed 驗收下 RTP 幾乎永遠判 conflicting、退化成 ReplayEWC，130-task 只有 0.818（< full DER++ 0.893，甚至略低於 ReplayEWC 0.832）。threshold 掃描證明機制完好（強制永遠開→0.898），病灶是訊號：多頭標籤排列把不同反傳誤差旋進共享層，污染了梯度方向。這把 §12.2/12.3/12.4 三次嘗試的共同教訓定型：**局部、reactive、權重空間的訊號（cosine、logit drift、label loss）都不足以判斷「是否值得 proactive consolidation」；要做就得用 function-space 反事實量測（開 DER++ 後舊任務 replay accuracy 是否真的改善且新任務不受傷）或 horizon 訊號。** 在找到這種訊號前，實務上的穩健選擇是：已知長共享流就直接開 full DER++，已知短流/衝突就用 ReplayEWC。
 15. **horizon oracle 證明可切換 schedule 存在，但不是完整 detector（§12.5，P2.7）**。`HorizonDarkReplayEWC` 在已知 horizon 時能做正確粗切：20-task label 關 DER++ 得 0.873（=ReplayEWC）、40-task conflicting 關 DER++ 得 0.486（=ReplayEWC）、80/130-task label 開 DER++ 得 0.868/0.893（=full DER++）。這證明 ReplayEWC 安全性與 DER++ 長流增益可由同一 trainer 切換取得；但 80-task × 2000 steps 中，開 DER++ 0.736 < ReplayEWC 0.788，說明 horizon 長度本身不是充分條件。下一步應做 budget-aware、function-space 的 benefit probe。
-16. **一步 function-space benefit detector 安全但太短視（§12.6，P2.8）**。`BenefitDarkReplayEWC` 用 DER++ on/off 可回復虛擬步直接量測功能收益。label-loss 版成功避免誤開：20-task label 0.873、80×2000 0.788、conflicting 40 0.486，皆等於 ReplayEWC；但 80/130 長流也退回 ReplayEWC（0.818/0.832），拿不到 full DER++（0.868/0.893）。logit-MSE 版會開，卻在短流/未成熟長流誤開。這說明 DER++ 的收益不是一步後果，而是多步、慢時間尺度的 proactive consolidation；下一步要做 shadow/bandit 或 sleep-style 多步 controller。
-17. **核心配方天生接近 task-free（§13，P3）**。把 EWC 的 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距的線上滾動估計（`OnlineEWCReplay` / `OnlineDarkReplayEWC`，`on_task_end` 改 no-op），80-task 下失去邊界知識的代價趨近於零：ReplayEWC 0.818→0.826、DER++ 0.868→0.855（皆在 seed std 內），無邊界 DER++ 仍勝過有邊界 ReplayEWC。原因是 reservoir replay 才是主力抗遺忘機制（本來就無邊界）、DER++ logit 目標也在入 buffer 時就抓好，唯一用到邊界的 Fisher 鞏固只需要粗略估計。**邊界在此 regime 是便利、不是必要**；剩下真正依賴 task id 的只有多頭 head / adapter 的「路由」（架構需求，非鞏固時機），要完全擺脫需走 single-head class_il 或 task-inference。
-18. **buffer-free 生成式回放在長流可超越 raw replay（§14，P4）**。`GenerativeReplayEWC` 完全不存原始樣本，改對每類別維護生成模型並回放合成樣本。保真度的關鍵是條件在「定義標籤的統計量」上（本 benchmark 是窗口和；sum-matched ablation 0.470→0.753）。label_permuted 出現交叉：短流 raw replay 較佳（buffer 餵得飽），但 **80-task buffer-free 0.916 反超 raw ReplayEWC 0.818 與 raw DER++ 0.868**——固定 buffer 在長流被稀釋、生成統計量卻不衰減。conflicting 下因 sum-matched 條件統計量與多變規則不符而落後（0.431 < 0.486）。教訓：**「不存原始樣本」可行且在長流甚至更強，但前提是生成模型抓得住定義標籤的統計量**——這是把 raw buffer 換成生成模型時真正的瓶頸，而非記憶機制本身。
-19. **rule-agnostic 生成回放：teacher 蒸餾補上 conflicting，自分類器則失敗（§15，P5）**。為讓條件自動對齊任務規則：`NBGenerativeReplayEWC`（從儲存 categorical 自建 NB 分類器 rejection）**失敗**（conflicting 0.418、label 退步到 0.521——因子化邊際做的分類器太弱）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher、對合成輸入做 soft-logit 蒸餾，generative DER++）**成功補上 conflicting 缺口**——0.474（final/Joint 0.628 vs raw 0.644，差 1.6%）且遺忘最低 0.082，因為 teacher 編碼每任務真實規則（含交互）能正確標註；label_permuted ≈ raw（0.809）但不及 sum-match 峰值。結論：**沒有單一 buffer-free 生成器全勝**（已知簡單統計量→sum-match；規則複雜/未知→scholar）。
-20. **on-manifold 輸入生成器假設被推翻；殘留缺口是真實樣本的不可取代價值（§16，P6，負面結果）**。P5 把缺口歸因於因子化輸入離流形。P6 改從全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform＝on-manifold）+ scholar 標註，但 3-seed **全面更差**（conflicting 0.428、label 0.769），儘管 forgetting 最低（0.052）——把 teacher 均勻蒸餾到整個輸入空間是過強全域正則、犧牲可塑性（diag 0.54→0.45），且稀釋類界訊號。**per-class 集中回放比全域 on-manifold 覆蓋更重要。** 修正 P5 歸因：scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw 在 conflicting 有 +BWT 而合成回放沒有），不是可被更好輸入模型補上的失配。整個 P4–P6 的總結論：**「不存原始樣本」可行且常常足夠（label_permuted 長流甚至贏 raw），但要完全追平 raw replay 仍有一道由真實樣本聯合結構撐起的小硬牆。**
+16. **一步 function-space benefit detector 安全但太短視（§12.6，P2.8）**。`BenefitDarkReplayEWC` 用 DER++ on/off 可回復虛擬步直接量測功能收益。label-loss 版成功避免誤開：20-task label 0.873、80×2000 0.788、conflicting 40 0.486，皆等於 ReplayEWC；但 80/130 長流也退回 ReplayEWC（0.818/0.832），拿不到 full DER++（0.868/0.893）。logit-MSE 版會開，卻在短流/未成熟長流誤開。這說明 DER++ 的收益不是一步後果，而是多步、慢時間尺度的 proactive consolidation。
+17. **local multi-step benefit controller 仍太短視（§12.7，P2.9，負面結果）**。`SlowBenefitDarkReplayEWC` 把 probe 擴成最近 5 個 current batches 的可回復 shadow rollout。label-loss 版保持 P2.8 安全性（20-task 0.873、80×2000 0.788、conflicting 0.486），但 alpha 仍全程 0，80/130 長流仍是 0.818/0.832，沒拿回 full DER++。小 logit 權重 0.02 也會讓 80×2000 seed0 從 0.820 掉到 0.771，且 130 seed0 只有 0.866。結論：同一局部視窗多走幾步仍不是長期因果收益；下一步需要跨真實時間持續存在的 shadow/bandit 或顯式 regime prior。
+18. **核心配方天生接近 task-free（§13，P3）**。把 EWC 的 Fisher/anchor 鞏固從 `on_task_end` 邊界觸發改成固定步距的線上滾動估計（`OnlineEWCReplay` / `OnlineDarkReplayEWC`，`on_task_end` 改 no-op），80-task 下失去邊界知識的代價趨近於零：ReplayEWC 0.818→0.826、DER++ 0.868→0.855（皆在 seed std 內），無邊界 DER++ 仍勝過有邊界 ReplayEWC。原因是 reservoir replay 才是主力抗遺忘機制（本來就無邊界）、DER++ logit 目標也在入 buffer 時就抓好，唯一用到邊界的 Fisher 鞏固只需要粗略估計。**邊界在此 regime 是便利、不是必要**；剩下真正依賴 task id 的只有多頭 head / adapter 的「路由」（架構需求，非鞏固時機），要完全擺脫需走 single-head class_il 或 task-inference。
+19. **buffer-free 生成式回放在長流可超越 raw replay（§14，P4）**。`GenerativeReplayEWC` 完全不存原始樣本，改對每類別維護生成模型並回放合成樣本。保真度的關鍵是條件在「定義標籤的統計量」上（本 benchmark 是窗口和；sum-matched ablation 0.470→0.753）。label_permuted 出現交叉：短流 raw replay 較佳（buffer 餵得飽），但 **80-task buffer-free 0.916 反超 raw ReplayEWC 0.818 與 raw DER++ 0.868**——固定 buffer 在長流被稀釋、生成統計量卻不衰減。conflicting 下因 sum-matched 條件統計量與多變規則不符而落後（0.431 < 0.486）。教訓：**「不存原始樣本」可行且在長流甚至更強，但前提是生成模型抓得住定義標籤的統計量**——這是把 raw buffer 換成生成模型時真正的瓶頸，而非記憶機制本身。
+20. **rule-agnostic 生成回放：teacher 蒸餾補上 conflicting，自分類器則失敗（§15，P5）**。為讓條件自動對齊任務規則：`NBGenerativeReplayEWC`（從儲存 categorical 自建 NB 分類器 rejection）**失敗**（conflicting 0.418、label 退步到 0.521——因子化邊際做的分類器太弱）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher、對合成輸入做 soft-logit 蒸餾，generative DER++）**成功補上 conflicting 缺口**——0.474（final/Joint 0.628 vs raw 0.644，差 1.6%）且遺忘最低 0.082，因為 teacher 編碼每任務真實規則（含交互）能正確標註；label_permuted ≈ raw（0.809）但不及 sum-match 峰值。結論：**沒有單一 buffer-free 生成器全勝**（已知簡單統計量→sum-match；規則複雜/未知→scholar）。
+21. **on-manifold 輸入生成器假設被推翻；殘留缺口是真實樣本的不可取代價值（§16，P6，負面結果）**。P5 把缺口歸因於因子化輸入離流形。P6 改從全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform＝on-manifold）+ scholar 標註，但 3-seed **全面更差**（conflicting 0.428、label 0.769），儘管 forgetting 最低（0.052）——把 teacher 均勻蒸餾到整個輸入空間是過強全域正則、犧牲可塑性（diag 0.54→0.45），且稀釋類界訊號。**per-class 集中回放比全域 on-manifold 覆蓋更重要。** 修正 P5 歸因：scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw 在 conflicting 有 +BWT 而合成回放沒有），不是可被更好輸入模型補上的失配。整個 P4–P6 的總結論：**「不存原始樣本」可行且常常足夠（label_permuted 長流甚至贏 raw），但要完全追平 raw replay 仍有一道由真實樣本聯合結構撐起的小硬牆。**
 
 ---
 
@@ -753,7 +793,7 @@ scholar-global 在兩個設定都**最差 final，卻有最低 forgetting**（co
 - `pi_digits.py`：產生/快取 pi 小數位序列。
 - `benchmark.py`：Permuted-Pi-Digits 串流（支持多頭 `label_permuted` 和單頭 `input_permuted`）。
 - `model.py`：支持多頭選擇、per-task 輸入轉接器（`input_adapter`）與可塑性診斷的 numpy MLP 實現。
-- `trainers.py`：29 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、AdaptiveDarkReplayEWC、PressureDarkReplayEWC、LookaheadDarkReplayEWC、RtpDarkReplayEWC、**HorizonDarkReplayEWC（P2.7 horizon oracle gate）**、**BenefitDarkReplayEWC（P2.8 function-space benefit gate）**、**OnlineEWCReplay / OnlineDarkReplayEWC（task-free 無邊界線上 Fisher 鞏固）**、**GenerativeReplayEWC / NBGenerativeReplayEWC / ScholarGenerativeReplayEWC / ScholarGlobalGenerativeReplayEWC（buffer-free 生成回放：sum-match / naive-Bayes / teacher 蒸餾 / 全域 on-manifold）**、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、NCMReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**、**FunctionSpaceReplay（Replay + DER++ 蒸餾 + GPM 投影，可切換）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
+- `trainers.py`：30 種 CL Trainer，含 Naive、**Joint 離線上界**、EWC、（Task-Balanced）Replay、ReplayEWC、DarkReplayEWC、AdaptiveDarkReplayEWC、PressureDarkReplayEWC、LookaheadDarkReplayEWC、RtpDarkReplayEWC、**HorizonDarkReplayEWC（P2.7 horizon oracle gate）**、**BenefitDarkReplayEWC（P2.8 one-step function-space benefit gate）**、**SlowBenefitDarkReplayEWC（P2.9 local multi-step slow-benefit gate）**、**OnlineEWCReplay / OnlineDarkReplayEWC（task-free 無邊界線上 Fisher 鞏固）**、**GenerativeReplayEWC / NBGenerativeReplayEWC / ScholarGenerativeReplayEWC / ScholarGlobalGenerativeReplayEWC（buffer-free 生成回放：sum-match / naive-Bayes / teacher 蒸餾 / 全域 on-manifold）**、SurpriseReplayEWC、MarginSurpriseReplayEWC、HippocampalReplayEWC、NCMReplayEWC、ContinualBP、ReplayContinualBP、**SustainableReplayEWC（Fisher 保護的神經元回收）**、**BennaFusi / BennaFusiReplay（多時間尺度複雜突觸）**、**FunctionSpaceReplay（Replay + DER++ 蒸餾 + GPM 投影，可切換）**。所有 replay/記憶路徑都已接好輸入轉接器（依 task 分組套用對應 adapter）。
 - `run.py` / `run_one_combo.py`：主實驗腳本（命令行選模式、方法、seed、任務數；`--input-adapter` 開啟輸入轉接器，`--joint-batch/--joint-steps` 控制上界）。
 - `analyze.py`：彙整多 seed 實驗結果，輸出 JSON 與畫圖；缺 matplotlib 時用 Pillow 輸出圖表並產生 summary JSON。
 - `results_label_permuted.json` / `results_input_permuted.json`：9 種主方法的原始數據。
@@ -769,6 +809,7 @@ scholar-global 在兩個設定都**最差 final，卻有最低 forgetting**（co
 - `results_rtp_longstream_label_permuted.json`（130 tasks）/ `results_rtp_conflicting_40.json`（40 tasks）/ `results_rtp_{20,80}_label_permuted.json`：§12.4 cos-RTP regime 偵測器的 3-seed 正式驗收（負面結果：RTP 退化成 ReplayEWC、拿不到長流 DER++ 增益）。
 - `results_p27_horizon_label_permuted_{20_s4000,80_s4000,130,80_s2000}.json` / `results_p27_horizon_conflicting_40.json` / `results_p27_baseline_label_permuted_80_s2000.json`：§12.5 P2.7 horizon oracle gate 驗證（標準設定部分正面；80-task × 2000 steps 顯示 horizon 太粗）。
 - `results_p28_benefit_{label_permuted_20_s4000,label_permuted_80_s2000,label_permuted_80_s4000,label_permuted_130,conflicting_40}.json` / `results_p28_ablation_logit025_*.json`：§12.6 P2.8 online function-space benefit detector（安全但太短視；logit-MSE ablation 會誤開）。
+- `results_p29_window_slow5_{label_permuted_20_s4000,label_permuted_80_s2000,label_permuted_80_s4000,label_permuted_130,conflicting_40}.json` / `results_p29_window_slow5_logit002_*.json`：§12.7 P2.9 local multi-step slow-benefit controller（負面結果：label-loss 安全但仍退回 ReplayEWC；小 logit 權重仍誤開 80×2000）。
 - `results_taskfree_label_permuted.json` / `results_taskfree_misaligned137_label_permuted.json`：§13 P3 task-free（無邊界）對照——boundary vs OnlineEWCReplay/OnlineDarkReplayEWC，以及故意把鞏固步距錯位的穩健性檢驗。
 - `results_genreplay_label_permuted.json`（80 tasks）/ `results_genreplay_longstream_label_permuted.json`（130 tasks）/ `results_genreplay_conflicting_40.json`（40 tasks）/ `results_genreplay_10task_label_permuted.json` / `results_genreplay_nomatch_ablation_10task.json`：§14 P4 buffer-free 生成式回放（GenerativeReplayEWC）對照與 sum-match ablation。
 - `results_p5_nb_{conflicting_40,label_permuted}.json` / `results_p5_scholar_{conflicting_40,label_permuted}.json`：§15 P5 rule-agnostic 生成回放——NB 自分類器（失敗）與 scholar teacher 蒸餾（補上 conflicting 缺口）。
