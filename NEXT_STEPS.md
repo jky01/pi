@@ -59,10 +59,11 @@
 - **P2.10 — persistent shadow-model bandit / regime prior（停損）**：P2.5→P2.9 共 5 輪自動 DER++ gating 全部報酬遞減/負面，且都是在 pi 數位的特性上精雕細琢。P7 外部驗證（§17）顯示「該不該開 DER++」的答案本就隨類別數/串流長度/buffer 比例而變，這條線外部效度低。實務穩健解已知：長共享流直接開 full DER++、短流/衝突用 ReplayEWC（P2.7 horizon oracle 已證明可切換 schedule 存在）。**停止再做自動 detector。**
 - **P6b — per-class autoregressive 生成器（停損）**：邊際空間僅 1.6% final/Joint，且 P6 已證明殘留缺口是「真實樣本不可取代的價值」而非輸入保真度，繼續投入價值低。**停損。**
 
+- **P10 — 量測正向遷移 / 累積（已完成，§19）**：在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」（`run_forward_transfer.py`）：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head，用 task-k 受限 5-way acc 隔離新任務本身學多快。**結果：正向遷移≈0**——每個步數預算(2/5/10/20)持續模型都不比 fresh 快、反而略慢（Δ -0.037/-0.022/-0.008/-0.013），且不隨經驗增長。Naive-continual 對照 Δ≈0 分離出因果：**主因 frozen backbone 已封頂(沒東西可累積)、抗遺忘機制再加小幅可塑性稅**。量化了「最遠那道牆」：系統只會持續不忘、不會持續變強。結果檔 `results_forward_transfer_{cifar100,naive_cifar100}.json`。
+
 **下一個要做 / Todo**
-- **P9 — frozen-feature regime 下拔掉 replay buffer**：P8 證明強表徵下抗遺忘工具箱仍有效，但仍重度依賴 raw replay buffer（隱私/儲存/無限流的真實約束禁止）。下一步在 Split-CIFAR-100 frozen 特徵上測無 buffer 的抗遺忘：純原型（NCM class means，不存樣本只存均值/協方差）、生成式回放（P4–P6 的機制搬到特徵空間）。驗收：無 buffer 能保住 P8 的 0.530 多少。`run_features.py` 已可直接掛新 trainer。
-- **P10 — 量測正向遷移 / 累積（真正的 CL，不只是抗遺忘）**：目前全部指標都是「別忘記」。真 CL 要「越學越快」。在 frozen-feature stream 上量：早學 k 個 task 後，第 k+1 個新 task 的學習速度（前幾個 batch 的 acc / 收斂步數）是否比從零開始更快。這直接戳「正向遷移：表徵有、學習速度沒有」（§10.3）這道最遠的硬牆，且不需要大改架構。
-- **（可選）P8b — backbone 也持續適應**：P8 只測 frozen backbone。讓 backbone 也學會引入表徵漂移（LLM 持續微調的真實難點），可測本專案的函數錨定/原型機制在表徵會動時是否還撐得住。需 torch 訓練迴圈，工程量較大。
+- **P8b — backbone 也持續適應（最高優先，攻 P10 的限制）**：P10 的零正向遷移有個關鍵限制——frozen backbone 已封頂，表徵不需要被「建構」，對偵測累積本就不利。要真正檢驗「越學越快」，必須讓 backbone 也跨 task 微調（引入表徵漂移＝LLM 持續微調的真實難點），看本專案的函數錨定(DER++)/原型(NCM)機制在表徵會動時是否撐得住、以及是否出現正向遷移或負遷移。需 torch 訓練迴圈（unfreeze backbone，小 lr），工程量較大但這是唯一能讓正向遷移有機會出現的 regime。
+- **P9 — frozen-feature 下拔掉 replay buffer（次優先）**：在 Split-CIFAR-100 frozen 特徵上測無 buffer 的抗遺忘（純原型 NCM class means / 生成式回放搬到特徵空間），看能保住 P8 的 0.530 多少。`run_features.py` 已可直接掛新 trainer。注意：P4–P6 已大致確立 buffer-free 的結論，此項較偏工程驗證、資訊量中等。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
 **結果**：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 Class-IL final 0.31→**0.858**、遺忘 0.50→**0.06**、retention>1.0（3 seeds, std 0.003）。診斷正確：病灶是線性頭的 recency/magnitude bias，換成無偏原型讀出即解。候選清單裡的 cosine/BiC/class-balanced replay 尚未試（NCM 已夠強，這些可作為進一步小幅優化或在更大規模時備用）。
@@ -210,11 +211,10 @@
 
 **結論**：殘留缺口不是 on-manifold 與否的問題。scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw conflicting 有 +BWT、合成回放沒有）。P4–P6 總結：不存原始樣本可行且常足夠（長流甚至贏 raw），完全追平 raw 仍有一道由真實樣本聯合結構撐起的小硬牆。唯一未試：per-class autoregressive（見上方 Todo P6b，優先序低）。
 
-## 3. 建議順序與理由（P1–P8 已完成；P2.6/P2.9 負面、P2.8 部分正面/負面；P2.10/P6b 已停損）
+## 3. 建議順序與理由（P1–P8、P10 已完成；P2.6/P2.9 負面、P2.8 部分正面/負面；P2.10/P6b 已停損）
 
-1. **P9（frozen-feature 下拔 buffer）** — 直接攻「無 buffer」硬牆，且 `run_features.py` 已就緒、工程量小。
-2. **P10（量正向遷移）** — 戳最遠的硬牆「越學越快」，不需大改架構，資訊量高。
-3. **（可選）P8b（backbone 持續適應）** — 最貼近 LLM 持續微調，但需 torch 訓練迴圈、工程量大。
+1. **P8b（backbone 持續適應）** — P10 量到零正向遷移，但限制是 frozen backbone 封頂。讓 backbone 也跨 task 適應，是唯一能讓「越學越快」有機會出現的 regime，也最貼近 LLM 持續微調。需 torch 訓練迴圈、工程量較大，但資訊量最高。
+2. **P9（frozen-feature 下拔 buffer）** — 攻「無 buffer」硬牆、`run_features.py` 已就緒；但 P4–P6 已大致確立 buffer-free 結論，偏工程驗證。
 - ~~P2.10（自動 DER++ gating）~~ / ~~P6b（per-class autoregressive）~~ — **已停損**。
 
 ## 4. 慣例

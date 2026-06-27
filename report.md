@@ -54,6 +54,8 @@
 
 **(R) P8：frozen pretrained 特徵上的 Class-IL（Split-CIFAR-100）**（§18）。用 frozen ImageNet ResNet18 抽 CIFAR-100 特徵（`extract_features.py`，唯一用 torch 的一步），在特徵上維持純 numpy 訓練小 head，跑標準 **Split-CIFAR-100**（20 tasks×5 類、單頭、無 task id、3 seeds）。**Naive 仍崩到 0.063**（強表徵不會自己解掉 CL）、線性頭 ReplayEWC **0.471（forget 0.440）**、DER++ **0.495**、**NCMReplayEWC 0.530（forget 0.198、retention 0.743）**。三 benchmark 合看，class-IL「線性頭→NCM」的改善**隨全域類別數單調放大**（MNIST 10 類微弱 → CIFAR-100 100 類大 → pi ~200 類戲劇性）——**pi 的「NCM 是 class-IL 英雄」不是特例，而是類別數的函數**，無偏原型讀出是跨 benchmark/跨表徵的修法。對「離真正 CL 多遠」：**強表徵把規模/表徵這道牆推近一步、但牆沒倒**（53% final 且這是 frozen 特徵＋有 buffer＋清楚切片的最有利設定；無 buffer/開放世界/正向遷移的硬牆未碰）。下一步 P9（拔 buffer）或 P10（量正向遷移）。
 
+**(S) P10：正向遷移量測——是「持續不忘」不是「持續變強」**（§19）。在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head（task-k 受限 5-way acc，隔離新任務本身學多快）。**每一個步數預算(2/5/10/20)持續模型都不比 fresh 快、反而略慢**（Δ = -0.037/-0.022/-0.008/-0.013），**且不隨經驗增長**。Naive-continual 對照(隱藏層自由累積)Δ≈0，分離出因果：**主因是 frozen backbone 已封頂(沒東西可累積)、抗遺忘機制再加小幅可塑性稅**。量化結論：**最有利設定下，正向遷移/累積加速≈0**——「越學越快、知識複利」這道最遠的牆完全站著。整個 P7–P10 把「離真正 CL 多遠」變成數字：**抗遺忘工具箱是跨 benchmark/表徵的真知識，但系統只會「持續不忘」、不會「持續變強」；真正的累積尚未發生。** 結果檔 `results_forward_transfer_{cifar100,naive_cifar100}.json`。
+
 ---
 
 ## 1. 目的
@@ -865,7 +867,53 @@ P8 直接驗證了之前的判斷：**強表徵把牆 #1（規模/表徵）推�
 
 ---
 
-## 19. 結論
+## 19. 量測正向遷移：是「持續不忘」還是「持續變強」？（P10）
+
+**為什麼**：到 §18 為止，所有指標都是「別忘記」（forgetting / retention / BWT）。但真正的持續學習與「只是抗遺忘」的根本差別，是**累積**——學過 k 個 task 之後，學第 k+1 個新 task 是否變得**更快**。§10.3 曾觀察「表徵有遷移、學習速度沒有」，P10 在 frozen-feature regime 下把它量化，直接戳這道最遠的硬牆，並回答「離真正 CL 多遠」。
+
+**做法**（Split-CIFAR-100 frozen ResNet18 特徵流，3 seeds）：對每個 task k，量「task-k 受限 5-way 準確率」隨訓練步數的曲線（只在 task k 自己的 5 類間 argmax，隔離「新任務本身學多快」，避開 class-IL 干擾）。比較：
+- **持續模型**：已歷經 task 0..k-1 的 ReplayEWC，隱藏層累積了過去知識；
+- **fresh 對照**：同架構、隨機初始化的新 head，只在 task k 上從零訓練（plain SGD）。
+- 兩者吃**同一個 frozen backbone 特徵**，唯一差別是隱藏層是否被持續訓練過 → 持續 − fresh 的早期學習優勢 = 表徵的正向遷移；看它**是否隨 k 增長**（真累積）。
+
+### 19.1 結果：沒有正向遷移、沒有累積加速
+
+| 步數預算 | 持續模型 5-way acc | fresh 5-way acc | Δ（正向遷移） | 隨 k 累積？ |
+| :---: | :---: | :---: | :---: | :--- |
+| @2 steps | 0.419 | 0.455 | **-0.037** | 平 |
+| @5 steps | 0.641 | 0.662 | **-0.022** | 平（噪聲） |
+| @10 steps | 0.782 | 0.790 | **-0.008** | 平 |
+| @20 steps | 0.838 | 0.851 | **-0.013** | 略縮 |
+
+在**每一個**步數預算下，持續模型學新 task 都**不比 fresh 快、反而略慢**，且 per-task Δ 散落在 0 附近、early(0-4) 與 late(15-19) 之間沒有一致增長。**累積加速不存在。**
+
+### 19.2 對照（continual=Naive）分離因果：是 backbone 封頂，不是抗遺忘的鍋
+
+把持續模型換成 **Naive**（隱藏層完全自由適應、無 replay/EWC 約束）做對照：
+
+| 持續方法 | Δ overall（學新 task 速度 vs fresh） | 解讀 |
+| :--- | :---: | :--- |
+| Naive（自由累積） | ≈ **0**（-0.003 ~ +0.017） | 即使隱藏層自由累積，對學新 task **零幫助** |
+| ReplayEWC（有抗遺忘） | 略 **負**（-0.01 ~ -0.04） | 抗遺忘機制再加一層小幅可塑性稅 |
+
+兩個結論：
+1. **主因是 frozen backbone 已封頂**——連自由累積的 Naive 隱藏層都給不出新任務的 head-start。強而通用的 backbone 已做完所有重活，**剩下沒有東西可累積**。
+2. **抗遺忘機制有可量測的可塑性稅**——ReplayEWC 比 Naive-continual 再慢一點，正是穩定–可塑性 tradeoff 的量化：防遺忘的同一套機制，會小幅拖慢新任務學習。
+
+### 19.3 對「離真正的持續學習還有多遠」的量化回答
+
+P10 把先前的定性判斷變成數字：**目前的系統是在「持續不忘」，不是在「持續變強」。**
+
+- §17/§18 證明抗遺忘工具箱是跨 benchmark、跨表徵的真知識（把會崩到 6% 的 100 類 class-IL 拉到 53%、retention 0.74）。
+- 但 P10 證明它**沒有任何累積/正向遷移**：新任務的學習速度不因學過的歷史而加快（甚至略慢），且不隨經驗增長。
+
+**這就是「最遠那道牆」的實證狀態**：持續學習領域真正承諾的「越學越快、知識複利」——在本專案最有利的設定（frozen 強特徵 + replay + 清楚切片）下，量到的是**零**。注意一個限制：本設定用 frozen backbone，表徵不需要被「建構」（backbone 已封頂），對偵測正向遷移本就不利；要真正檢驗累積，需讓 backbone 也跨 task 適應（P8b），讓表徵必須被逐步建立——那才是 LLM 持續微調真正困難、也可能真正出現正向遷移（或負遷移/漂移）的 regime。
+
+**結果檔**：`results_forward_transfer_cifar100.json`（ReplayEWC）、`results_forward_transfer_naive_cifar100.json`（Naive 對照）。
+
+---
+
+## 20. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -889,7 +937,8 @@ P8 直接驗證了之前的判斷：**強表徵把牆 #1（規模/表徵）推�
 20. **rule-agnostic 生成回放：teacher 蒸餾補上 conflicting，自分類器則失敗（§15，P5）**。為讓條件自動對齊任務規則：`NBGenerativeReplayEWC`（從儲存 categorical 自建 NB 分類器 rejection）**失敗**（conflicting 0.418、label 退步到 0.521——因子化邊際做的分類器太弱）；`ScholarGenerativeReplayEWC`（每任務凍結 teacher、對合成輸入做 soft-logit 蒸餾，generative DER++）**成功補上 conflicting 缺口**——0.474（final/Joint 0.628 vs raw 0.644，差 1.6%）且遺忘最低 0.082，因為 teacher 編碼每任務真實規則（含交互）能正確標註；label_permuted ≈ raw（0.809）但不及 sum-match 峰值。結論：**沒有單一 buffer-free 生成器全勝**（已知簡單統計量→sum-match；規則複雜/未知→scholar）。
 21. **on-manifold 輸入生成器假設被推翻；殘留缺口是真實樣本的不可取代價值（§16，P6，負面結果）**。P5 把缺口歸因於因子化輸入離流形。P6 改從全域 per-task 邊際抽合成輸入（≈ 真實 iid uniform＝on-manifold）+ scholar 標註，但 3-seed **全面更差**（conflicting 0.428、label 0.769），儘管 forgetting 最低（0.052）——把 teacher 均勻蒸餾到整個輸入空間是過強全域正則、犧牲可塑性（diag 0.54→0.45），且稀釋類界訊號。**per-class 集中回放比全域 on-manifold 覆蓋更重要。** 修正 P5 歸因：scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw 在 conflicting 有 +BWT 而合成回放沒有），不是可被更好輸入模型補上的失配。整個 P4–P6 的總結論：**「不存原始樣本」可行且常常足夠（label_permuted 長流甚至贏 raw），但要完全追平 raw replay 仍有一道由真實樣本聯合結構撐起的小硬牆。**
 22. **外部效度驗證：核心機制守住、戲劇性數字是 pi 特例（§17，P7）**。把結論搬到 CL 社群的標準 benchmark：**Permuted-MNIST（多頭 Task-IL）上 DER++ 函數錨定完整守住**——0.912 > ReplayEWC 0.896、BWT→0、retention 0.998，且優勢隨串流長度複利（與 pi 一致）。**Split-MNIST class-IL 上 NCM「降低遺忘」的方向成立**（forgetting 最低 0.028、retention 最高 0.977），**但 pi 的「線性頭災難性崩潰、DER++ 反轉成有害、NCM 是唯一解」被推翻為 200 類特例**——標準 10 類下線性頭 0.926 不崩、DER++ 0.952 反而最佳。教訓：**replay+Fisher-EWC 骨幹、DER++ 函數錨定、無偏原型讀出是跨 benchmark 的真知識；但具體數字的戲劇性與「某機制必然反轉」的強論斷會隨類別數/串流長度/buffer 比例而變，不能外推。** 這也驗證了停掉 P2.5–P2.10 自動 gating 微調的判斷（那條線在 pi 特性上精雕、外部效度低）。下一個現代化方向是 frozen pretrained feature + CL 讀出（P8，需先接特徵抽取器）。
-23. **Frozen pretrained 特徵上的 Class-IL：NCM 的價值隨類別數放大、強表徵不抹平工具箱（§18，P8）**。用 frozen ImageNet ResNet18 特徵跑標準 **Split-CIFAR-100**（20 tasks×5 類、單頭、無 task id）：Naive 仍崩到 **0.063**（強表徵不會自己解掉持續學習）、線性頭 ReplayEWC **0.471（forget 0.440）**、DER++ **0.495**、**NCMReplayEWC 0.530（forget 0.198、retention 0.743）**。三個 benchmark 合看，class-IL 的「線性頭→NCM」改善隨全域類別數單調放大（MNIST 10 類微弱、CIFAR-100 100 類大、pi ~200 類戲劇性），**證明 pi 的「NCM 是 class-IL 英雄」不是特例而是類別數的函數**；無偏原型讀出是跨 benchmark、跨表徵都成立的修法。同時回答「離真正 CL 多遠」：**強表徵把規模/表徵這道牆推近一步，但牆沒倒**——53% final、且這還是在 frozen 強特徵＋有 buffer＋清楚 task 切片的**最有利設定**下；真正的硬牆（無 buffer、開放世界、正向遷移/累積）一個都還沒碰。下一步 P9（拔掉 buffer）或 P10（量正向遷移）。
+23. **Frozen pretrained 特徵上的 Class-IL：NCM 的價值隨類別數放大、強表徵不抹平工具箱（§18，P8）**。用 frozen ImageNet ResNet18 特徵跑標準 **Split-CIFAR-100**（20 tasks×5 類、單頭、無 task id）：Naive 仍崩到 **0.063**（強表徵不會自己解掉持續學習）、線性頭 ReplayEWC **0.471（forget 0.440）**、DER++ **0.495**、**NCMReplayEWC 0.530（forget 0.198、retention 0.743）**。三個 benchmark 合看，class-IL 的「線性頭→NCM」改善隨全域類別數單調放大（MNIST 10 類微弱、CIFAR-100 100 類大、pi ~200 類戲劇性），**證明 pi 的「NCM 是 class-IL 英雄」不是特例而是類別數的函數**；無偏原型讀出是跨 benchmark、跨表徵都成立的修法。同時回答「離真正 CL 多遠」：**強表徵把規模/表徵這道牆推近一步，但牆沒倒**——53% final、且這還是在 frozen 強特徵＋有 buffer＋清楚 task 切片的**最有利設定**下；真正的硬牆（無 buffer、開放世界、正向遷移/累積）一個都還沒碰。
+24. **正向遷移量測：是「持續不忘」不是「持續變強」（§19，P10）**。到 P8 為止所有指標都是「別忘記」。P10 在 Split-CIFAR-100 frozen 特徵流上量「學新 task 的速度」：持續模型(ReplayEWC) vs 同特徵、隨機初始化、只學該 task 的 fresh head，用 task-k 受限 5-way acc 隔離「新任務本身學多快」。結果：**每一個步數預算下持續模型都不比 fresh 快、反而略慢**（Δ@2/5/10/20 = -0.037/-0.022/-0.008/-0.013），且**不隨經驗增長**（early≈late）。Naive-continual 對照(隱藏層自由累積)Δ≈0，分離出因果：**主因是 frozen backbone 已封頂（沒有東西可累積），抗遺忘機制再加一層小幅可塑性稅**。量化結論：**本專案最有利設定下，正向遷移/累積加速≈0**——「最遠那道牆」(越學越快、知識複利)完全站著。限制：frozen backbone 對偵測正向遷移本就不利，真正檢驗需讓 backbone 也跨 task 適應(P8b)。
 
 ---
 
@@ -923,6 +972,8 @@ P8 直接驗證了之前的判斷：**強表徵把牆 #1（規模/表徵）推�
 - `results_mnist_permuted.json` / `results_mnist_split.json`：§17 驗證結果——DER++ 函數錨定守住（Permuted-MNIST），NCM 方向守住但「DER++ 反轉」被推翻為 200 類特例（Split-MNIST）。
 - `extract_features.py` / `feature_benchmark.py` / `run_features.py`：§18 P8 frozen pretrained 特徵上的 Class-IL——用 frozen ImageNet ResNet18 抽 CIFAR-100 特徵（唯一用 torch 的一步，輸出 `cifar100_resnet18.npz`，已 gitignore），在特徵上維持純 numpy 訓練小 head，重用全部 trainers。
 - `results_feature_split_cifar100.json`：§18 Split-CIFAR-100 結果——NCM 在 100 類重新成為最大抗遺忘槓桿（forget 0.440→0.198），證明 NCM 價值隨類別數放大。
+- `run_forward_transfer.py`：§19 P10 正向遷移量測——比較持續模型 vs fresh-from-scratch 學新 task 的速度（task-k 受限 5-way acc），隔離表徵的累積效益。
+- `results_forward_transfer_cifar100.json` / `results_forward_transfer_naive_cifar100.json`：§19 結果（ReplayEWC 主結果 + Naive 對照）——正向遷移≈0、不隨經驗增長，主因 frozen backbone 封頂。
 - `summary_stats_label_permuted.json` / `summary_stats_input_permuted.json`：跨 seeds 彙整後數據。
 - `fig1_diagonal_accuracy_*.png` / `fig2_bwt_finalacc_*.png` / `fig3_plasticity_diagnostics_*.png`：主方法性能對比與診斷圖表。
 - `fig4_input_permuted_adapter_ladder.png`：輸入轉接器打破結構性下限的階梯圖。
