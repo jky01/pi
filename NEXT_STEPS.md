@@ -34,10 +34,11 @@
 - **P1 — Class-IL 遺忘缺口**：已用 `NCMReplayEWC` 解掉線性頭 recency bias，詳見 §11.3。
 - **P2 — Conflicting-task benchmark**：已新增真衝突任務、40-task scorecard、DER++ alpha sweep，詳見 §12.1。
 - **P2.5 — Pressure / maturity gating**：已實作 `PressureDarkReplayEWC`、confidence/loss-pressure gate、delayed DER++ maturity gate，並完成 20/80/130-task 對照，詳見 §12.3。
+- **P2.6 — Lookahead 與 RTP 動態 Regime 偵測器**：已實作 Lookahead 與基於梯度餘弦的 RTP 門控，自動分類 Synergistic/Conflicting 任務，詳見 §12.4。
 
 **下一個要做 / Todo**
-- **P2.6 regime / horizon detector**：不要再調單一 alpha，而是讓系統判斷目前 stream 屬於「共享規則長流」還是「真衝突/短流」，再決定 `distill_mode = off / pressure / full`。
-- P2.6 完成後再進 P3（task-free）與 P4（buffer-free / generative replay）。
+- **P3 — Task-free (無邊界) CL**：移除 `on_task_end` 依賴，將 Fisher 估計與 EWC anchor 鎖定轉為線上滾動形式。
+- **P4 — Buffer-free / generative replay**：用特徵級回放（Feature Replay）或高斯偽特徵生成（Gaussian Pseudo-Rehearsal），取代原始樣本 Buffer。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
 **結果**：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 Class-IL final 0.31→**0.858**、遺忘 0.50→**0.06**、retention>1.0（3 seeds, std 0.003）。診斷正確：病灶是線性頭的 recency/magnitude bias，換成無偏原型讀出即解。候選清單裡的 cosine/BiC/class-balanced replay 尚未試（NCM 已夠強，這些可作為進一步小幅優化或在更大規模時備用）。
@@ -70,10 +71,6 @@
   - DarkReplayEWC α=0.25：0.458 ± 0.004，final/Joint 0.711，forget 0.093。
   - DarkReplayEWC α=0.5：0.449 ± 0.006，final/Joint 0.698，forget 0.087。
   結論：α 越大，forgetting 越低，但 final/Joint 越差。DER++ 在「共享底層函數」時是英雄，在「底層函數真衝突」時會過度錨定。下一步應做 **adaptive distillation strength / conflict detector**，而不是固定開 DER++。
-- **adaptive/confidence-gated distillation sanity（20 tasks × 1000 steps × 2 seeds，已寫入 `report.md` §12.2）**：
-  - conflicting：ReplayEWC **0.384 ± 0.008**；固定 DarkReplayEWC α=0.5 **0.305 ± 0.002**；`AdaptiveDarkReplayEWC` **0.384 ± 0.008**（α 平均降到 0）；confidence-gated DarkReplayEWC **0.371 ± 0.007**。
-  - label_permuted：ReplayEWC **0.602 ± 0.004**；固定 DarkReplayEWC α=0.5 **0.470 ± 0.005**；`AdaptiveDarkReplayEWC` **0.601 ± 0.004**；confidence-gated DarkReplayEWC **0.550 ± 0.011**。
-  - 結論：gradient-conflict gate 是有效安全閥，可避免 DER++ 在真衝突下傷害模型；confidence gate 支持「可靠記憶才鞏固」的假設。但 current-vs-dark 梯度 cosine 在短流 label_permuted 也偏負，不能當完整 regime detector。下一步不要只調 α，應找 **何時開蒸餾** 的訊號（長期遺忘壓力、任務相似度、reliability × drift policy）。
 
 ### ✅ P2.5 — Pressure / maturity gating（已完成，§12.3）
 **做完的事情**：
@@ -116,9 +113,8 @@
 
 ## 3. 建議順序與理由（P1 已完成）
 
-1. **P2.6（regime / horizon detector）** — 目前最高價值：P2/P2.5 已證明「full DER++ 很強但只適合共享規則長流；ReplayEWC/Pressure 安全但較保守」。下一步要讓系統自動選 `off / pressure / full`，而不是再人工調 α。
-2. **P3（task-free）** — 若 P2.6 能在有 task boundary 的 setting 自動選對 regime，下一個硬限制是沒有任務邊界；這會直接挑戰 EWC anchor、Fisher、prototype 更新等目前依賴 `on_task_end` 的機制。
-3. **P4（buffer-free / generative replay）** — 最後再拿掉 raw replay buffer。這是更接近真實終身學習的記憶限制，但應在確認方法能通過真衝突、regime selection 與無邊界後再做。
+1. **P3（task-free）** — 下一個最高價值：目前機制均依賴 `on_task_end`（算 Fisher、更新 adapter/GPM 基、Class-IL 切片）。需要將 Fisher 對角線更新改為每步 running estimate 指數衰減，並移除對明確任務邊界的依賴。
+2. **P4（buffer-free / generative replay）** — 最後拿掉 raw replay buffer，改為在隱藏特徵空間中重播特徵（Feature Replay）或為每個類別維護 Gaussian 分布做 Pseudo-Rehearsal。
 
 ## 4. 慣例
 
