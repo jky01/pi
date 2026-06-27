@@ -166,6 +166,35 @@ class LwF:
         self.old_cols = list(range(self.cpt * (k + 1)))  # 已學過的類別
 
 
+class LwFKD:
+    """經典 LwF：softmax knowledge-distillation + 溫度（P9 用的是 DER 式 logit-MSE）。
+    §23.2 的 caveat 是「softmax-KD 可能較不致凍結」；這支做乾淨對照。蒸餾項在已學過
+    的類別欄位上對舊快照的 soften 分布做 KL，完全 buffer-free。"""
+    def __init__(self, lam, classes_per_task, T=2.0):
+        self.lam = lam
+        self.cpt = classes_per_task
+        self.T = T
+        self.old_model = None
+        self.old_cols = None
+
+    def extra_loss(self, model, cur_x, out, ncur):
+        if self.old_model is None:
+            return 0.0
+        with torch.no_grad():
+            old = self.old_model(cur_x)
+        c = self.old_cols
+        T = self.T
+        log_p = F.log_softmax(out[:ncur][:, c] / T, dim=1)
+        q = F.softmax(old[:, c] / T, dim=1)
+        return self.lam * (T * T) * F.kl_div(log_p, q, reduction="batchmean")
+
+    def after_task(self, model, k):
+        self.old_model = copy.deepcopy(model).eval()
+        for p in self.old_model.parameters():
+            p.requires_grad_(False)
+        self.old_cols = list(range(self.cpt * (k + 1)))
+
+
 def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
                 mode="naive", buffer=None, dark_alpha=0.5, reg=None):
     """訓練一個 task 並記錄 task-k 受限 5-way acc 曲線。
@@ -212,13 +241,18 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
 
 def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
             lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
-            device="cpu", arch="smallcnn", dark_alpha=0.5, lwf_lambda=1.0):
+            device="cpu", arch="smallcnn", dark_alpha=0.5, lwf_lambda=1.0, lwf_temp=2.0):
     torch.manual_seed(seed)
     Xtr, ytr, Xte, yte = load_cifar100_raw()
     rng = np.random.RandomState(seed)
     buffer = (ReservoirBuffer(buffer_cap, np.random.RandomState(7000 + seed))
               if continual_mode in ("replay", "derpp") else None)
-    reg = LwF(lwf_lambda, classes_per_task) if continual_mode == "lwf" else None
+    if continual_mode == "lwf":
+        reg = LwF(lwf_lambda, classes_per_task)
+    elif continual_mode == "lwf_kd":
+        reg = LwFKD(lwf_lambda, classes_per_task, T=lwf_temp)
+    else:
+        reg = None
 
     task_classes = [tuple(range(classes_per_task * t, classes_per_task * (t + 1)))
                     for t in range(n_tasks)]
@@ -271,6 +305,155 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
     return dict(per_task=per_task, retention=retention)
 
 
+# ---------------------------------------------------------------------------
+# P9b (a): Progressive Neural Network — buffer-free 累積。每個 task 一個 column；
+# 訓練 column k 時，columns 0..k-1 全凍結，其 penultimate 特徵經一個 learned lateral
+# 投影餵進 column k 的 head（PNN 的橫向連結）。新任務可「讀取」舊任務的凍結表徵 →
+# 完全不存原始樣本就有機會出現正向遷移，且舊 column 永不更新 → 遺忘恆為 0（架構性）。
+# 代價：容量隨 task 數線性成長（這正是 PNN 的已知 tradeoff）。
+# ---------------------------------------------------------------------------
+class FeatBackbone(nn.Module):
+    """產生 penultimate 特徵向量（去掉分類頭）的 backbone，供 column 自身與 lateral 共用。"""
+    def __init__(self, arch, width):
+        super().__init__()
+        if arch == "smallcnn":
+            self.body = SmallCNN(n_classes=1, width=width).features
+            self.out_dim = width * 2
+        elif arch == "resnet18":
+            net = make_resnet18_cifar(1)
+            net.fc = nn.Identity()
+            self.body = net
+            self.out_dim = 512
+        else:
+            raise ValueError(f"unknown arch: {arch}")
+
+    def forward(self, x):
+        return self.body(x).flatten(1)
+
+
+class PNNColumn(nn.Module):
+    """單一 PNN column：自身 backbone + head；若 n_prior>0，head 額外讀取一個對
+    前序凍結 column 特徵串接的 learned lateral 投影（ReLU）。n_prior=0 時退化成
+    一個獨立 backbone+head（= fresh baseline 完全同構）。"""
+    def __init__(self, arch, n_classes, width, n_prior, lateral_dim):
+        super().__init__()
+        self.backbone = FeatBackbone(arch, width)
+        d = self.backbone.out_dim
+        if n_prior > 0:
+            self.lateral = nn.Sequential(nn.Linear(n_prior * d, lateral_dim), nn.ReLU())
+            self.head = nn.Linear(d + lateral_dim, n_classes)
+        else:
+            self.lateral = None
+            self.head = nn.Linear(d, n_classes)
+
+    def forward(self, x, prior_feats):
+        f = self.backbone(x)
+        if self.lateral is not None and len(prior_feats) > 0:
+            h = torch.cat([f, self.lateral(torch.cat(prior_feats, 1))], 1)
+        else:
+            h = f
+        return self.head(h)
+
+
+def acc_5way_pnn(col, frozen_bbs, Xt, yt, task_classes):
+    col.eval()
+    with torch.no_grad():
+        nx = normalize(Xt)
+        pf = [bb(nx) for bb in frozen_bbs]
+        logits = col(nx, pf)
+        cols = torch.tensor(task_classes, device=logits.device)
+        pred = cols[logits[:, cols].argmax(1)]
+    col.train()
+    return (pred == yt).float().mean().item()
+
+
+def train_pnn_column(col, frozen_bbs, opt, X, y, Xt, yt, task_classes, epochs, batch, rng):
+    """訓練一個 PNN column（plain CE），記錄 task-k 受限 5-way acc 曲線。
+    lateral 來源（frozen 前序 column）以 no_grad 前傳，不接收梯度。"""
+    n = X.shape[0]
+    curve, s = {}, 0
+    if 0 in CHECKPOINTS:
+        curve[0] = acc_5way_pnn(col, frozen_bbs, Xt, yt, task_classes)
+    todo = [c for c in CHECKPOINTS if c > 0]
+    for ep in range(epochs):
+        order = rng.permutation(n) if ep > 0 else np.arange(n)
+        for i in range(0, n, batch):
+            idx = order[i:i + batch]
+            cur_x = normalize(X[idx]); yb = y[idx]
+            with torch.no_grad():
+                pf = [bb(cur_x) for bb in frozen_bbs]
+            opt.zero_grad()
+            loss = F.cross_entropy(col(cur_x, pf), yb)
+            loss.backward(); opt.step()
+            s += 1
+            if todo and s == todo[0]:
+                curve[s] = acc_5way_pnn(col, frozen_bbs, Xt, yt, task_classes)
+                todo.pop(0)
+        if not todo:
+            break
+    if todo:
+        curve[s] = acc_5way_pnn(col, frozen_bbs, Xt, yt, task_classes)
+    return curve
+
+
+def run_one_pnn(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
+                lr, epochs, batch, width, device="cpu", arch="smallcnn", lateral_dim=128):
+    torch.manual_seed(seed)
+    Xtr, ytr, Xte, yte = load_cifar100_raw()
+    rng = np.random.RandomState(seed)
+    task_classes = [tuple(range(classes_per_task * t, classes_per_task * (t + 1)))
+                    for t in range(n_tasks)]
+    tr_idx, te_idx = [], []
+    for classes in task_classes:
+        tr = np.where(np.isin(ytr, classes))[0]
+        te = np.where(np.isin(yte, classes))[0]
+        tr = rng.permutation(tr)[:train_per_class * classes_per_task]
+        tr_idx.append(tr); te_idx.append(te[:test_per_class * classes_per_task])
+
+    n_classes = n_tasks * classes_per_task
+    frozen_bbs = []   # 前序 column 的凍結 backbone（lateral 來源）
+    columns = []      # 保留每個 column 供 retention 評估
+    per_task, test_sets = [], []
+    for k in range(n_tasks):
+        X = torch.from_numpy(Xtr[tr_idx[k]]).to(device); y = torch.from_numpy(ytr[tr_idx[k]]).to(device)
+        Xt = torch.from_numpy(Xte[te_idx[k]]).to(device); yt = torch.from_numpy(yte[te_idx[k]]).to(device)
+        tcls = task_classes[k]
+        test_sets.append((Xt, yt, tcls))
+
+        col = PNNColumn(arch, n_classes, width, n_prior=k, lateral_dim=lateral_dim).to(device)
+        opt = torch.optim.SGD(col.parameters(), lr=lr, momentum=0.9)
+        rng_c = np.random.RandomState(1000 + seed)
+        cont_curve = train_pnn_column(col, frozen_bbs, opt, X, y, Xt, yt, tcls, epochs, batch, rng_c)
+        col.backbone.eval()
+        for p in col.backbone.parameters():
+            p.requires_grad_(False)
+        frozen_bbs.append(col.backbone)
+        columns.append(col)
+
+        # fresh baseline：與其他 mode 完全同構（獨立 backbone+head，只學 task k）
+        fresh = make_model(arch, n_classes, width).to(device)
+        fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
+        rng_f = np.random.RandomState(1000 + seed)
+        fresh_curve = train_curve(fresh, fresh_opt, X, y, Xt, yt, tcls, epochs, batch, rng_f, mode="naive")
+
+        per_task.append(dict(task=k, continual=cont_curve, fresh=fresh_curve))
+        print(f"  seed{seed} task{k:>2}: cont@40={cont_curve.get(40, float('nan')):.3f} "
+              f"fresh@40={fresh_curve.get(40, float('nan')):.3f}", flush=True)
+
+    # retention：column j 在 task j 後即凍結 → 用 column j（laterals 取前序 0..j-1）回評。
+    maxc = max(CHECKPOINTS)
+    diag = [at(per_task[j]["continual"], maxc) for j in range(n_tasks)]
+    final = [acc_5way_pnn(columns[j], frozen_bbs[:j], Xt, yt, tcls)
+             for j, (Xt, yt, tcls) in enumerate(test_sets)]
+    forgetting = [diag[j] - final[j] for j in range(n_tasks)]
+    retention = dict(diag=diag, final=final,
+                     mean_forgetting=float(np.mean(forgetting)),
+                     mean_final=float(np.mean(final)))
+    print(f"  seed{seed} retention: mean_final={retention['mean_final']:.3f} "
+          f"mean_forgetting={retention['mean_forgetting']:.3f} (PNN: 0 by construction)", flush=True)
+    return dict(per_task=per_task, retention=retention)
+
+
 def at(curve, step):
     ks = sorted(int(x) for x in curve.keys())
     best = ks[0]
@@ -301,9 +484,12 @@ def main():
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--width", type=int, default=64)
-    p.add_argument("--continual-mode", choices=["naive", "replay", "derpp", "lwf"], default="naive")
+    p.add_argument("--continual-mode",
+                   choices=["naive", "replay", "derpp", "lwf", "lwf_kd", "pnn"], default="naive")
     p.add_argument("--dark-alpha", type=float, default=0.5, help="DER++ logit distillation weight")
     p.add_argument("--lwf-lambda", type=float, default=1.0, help="LwF (buffer-free) distillation weight")
+    p.add_argument("--lwf-temp", type=float, default=2.0, help="LwF softmax-KD temperature (lwf_kd)")
+    p.add_argument("--lateral-dim", type=int, default=128, help="PNN lateral projection dim")
     p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
     p.add_argument("--output", default="results_backbone_transfer_cifar100.json")
@@ -314,11 +500,18 @@ def main():
 
     all_seed, retentions = [], []
     for seed in args.seeds:
-        res = run_one(seed, args.n_tasks, args.classes_per_task,
-                      args.train_per_class, args.test_per_class,
-                      args.lr, args.epochs, args.batch, args.width,
-                      continual_mode=args.continual_mode, device=device,
-                      arch=args.arch, dark_alpha=args.dark_alpha, lwf_lambda=args.lwf_lambda)
+        if args.continual_mode == "pnn":
+            res = run_one_pnn(seed, args.n_tasks, args.classes_per_task,
+                              args.train_per_class, args.test_per_class,
+                              args.lr, args.epochs, args.batch, args.width,
+                              device=device, arch=args.arch, lateral_dim=args.lateral_dim)
+        else:
+            res = run_one(seed, args.n_tasks, args.classes_per_task,
+                          args.train_per_class, args.test_per_class,
+                          args.lr, args.epochs, args.batch, args.width,
+                          continual_mode=args.continual_mode, device=device,
+                          arch=args.arch, dark_alpha=args.dark_alpha,
+                          lwf_lambda=args.lwf_lambda, lwf_temp=args.lwf_temp)
         all_seed.append(res["per_task"])
         retentions.append(res["retention"])
         print(f"seed {seed} done", flush=True)

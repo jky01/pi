@@ -64,6 +64,8 @@
 
 **(W) P9：無 buffer 累積——函數蒸餾取代不了真實樣本（負面結果）**（§23）。P8 的累積全靠 replay buffer；P9 用 **LwF**（=DER++ 的蒸餾項但不存樣本）做乾淨 ablation。**buffer-free 完全失敗**：naive Δ@40≈0、**LwF 比 naive 更差**（-0.089，λ=0.1/1.0 皆然）、continual 卡在亂猜(~0.20)，且負向遷移**隨經驗惡化**（蒸餾錨點累積→逐步凍結 backbone）。**乾淨結論**：DER++ 兩成分中真正的引擎是 **replay-CE on 真實樣本**（同時保可塑性＋推正向遷移），logit 蒸餾單獨用反而凍結——§20–§22 的「持續變強」引擎是 buffer 裡的**真實樣本**，蒸餾只是放大器。caveat：用 DER 式 logit-MSE 非經典 softmax-KD，但後者也無產生正向遷移的機制。**定位**：L3（會累積）達成但仍架在 replay buffer 拐杖上；buffer-free 累積＝最明確的未解開放問題。結果檔 `results_p9_{naive,lwf,lwf_lam0.1}_resnet18.json`。
 
+**(X) P9b：無 buffer 累積其實可達——參數隔離與 softmax-KD 兩條路都拿到正向遷移（正面結果，修正 P9 悲觀定位）**（§24）。P9 只證明「DER 式 logit-MSE 蒸餾」buffer-free 會凍結；P9b 試另外兩條 buffer-free 路線，**兩條都成功**。**(a) 參數隔離（PNN 式）**：每 task 一個 column、新 column 橫向讀取前序凍結 column 的特徵（`--continual-mode pnn`，smallcnn、20 tasks、2 seeds）——**Δ@40 +0.101**（buffer-free！介於 smallcnn naive −0.044 與 buffered replay +0.174 之間）、**mean_forgetting 0.000（架構性零遺忘）**、mean_final 0.501，per-task 正向遷移隨 task 數累積放大（late tasks Δ 達 +0.17~+0.23）。代價：容量隨 task 線性成長 + 推論需 task-id 路由到對的 column。**(b) 經典 softmax-KD + 溫度**（`--continual-mode lwf_kd`，resnet18、對齊 P9 設定）——**直接推翻 P9 的 caveat**：softmax-KD **不凍結**（mean_final **0.357** ≫ 亂猜 0.20、且優於 naive 0.214），且**拿到正向且隨經驗增長的 buffer-free 遷移**（**Δ@40 +0.089**，early +0.010 → late +0.159，cumulative GROWS），對比 logit-MSE LwF 的 −0.089（凍結）。**乾淨結論修正**：P9 的「蒸餾單獨用必凍結」是 **DER 式 logit-MSE 的特例**，不是蒸餾通則——換成 well-conditioned 的 softmax-KD（soften 分布、有溫度）就既不凍結、又能 buffer-free 累積。**buffer-free 累積不是硬牆**：可由 (a) 容量擴張 或 (b) 軟函數蒸餾達成；兩者都仍低於 buffered replay/DER++（+0.180/+0.268、mean_final 0.564/0.641），真正不可取代的仍是真實樣本帶來的更高絕對 retention + 後向遷移。結果檔 `results_p9b_pnn_smallcnn.json`、`results_p9b_lwfkd_resnet18.json`。
+
 ---
 
 ## 1. 目的
@@ -1086,7 +1088,56 @@ P9 把「無 buffer」這道牆量化成**硬牆**：在 P8 的會動-backbone r
 
 ---
 
-## 24. 結論
+## 24. 無 buffer 累積其實可達：參數隔離與 softmax-KD 兩條路（P9b，正面結果）
+
+**為什麼**：P9 的乾淨 ablation 證明「DER 式 logit-MSE 蒸餾」在無 buffer 下不但拿不到累積、還會逐步凍結 backbone，並把「buffer-free 累積」定位成最明確的未解開放問題。但 P9 的結論其實只覆蓋**一種** buffer-free 機制（logit-MSE 函數蒸餾）。P9b 問：**換別的 buffer-free 機制，累積回不回得來？** 試兩條：(a) **參數隔離 / 動態擴張**（PNN 式：新任務讀取舊任務凍結的表徵），(b) **經典 LwF 的 softmax-KD + 溫度**（P9 caveat 點名、但沒做的版本）。
+
+**做法**：同 P8b–P9 框架（Split-CIFAR-100、20 tasks、2 seeds、CUDA RTX 2070），同一支 `run_backbone_transfer.py` 量正向遷移（task-k 受限 5-way acc 的 continual vs fresh）+ retention。
+- (a) `--continual-mode pnn`（smallcnn columns）：每 task 一個 column；訓練 column k 時 columns 0..k-1 全凍結，其 penultimate 特徵經 learned lateral 投影餵進 column k 的 head。完全不存原始樣本。
+- (b) `--continual-mode lwf_kd --lwf-temp 2.0`（resnet18，對齊 P9 的 LwF 設定）：把 P9 的 logit-MSE 換成 `T²·KL(softmax(old/T) ‖ softmax(new/T))`。
+
+### 24.1 結果：兩條 buffer-free 路都拿到正向且隨經驗增長的遷移
+
+resnet18 ladder（量 retention + 遷移，對齊 P9）：
+
+| 機制 | buffer？ | Δ@40（遷移） | early→late | mean_final | mean_forgetting |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Naive | ✗ | -0.006 | +0.046→+0.030 | 0.214 | +0.131 |
+| LwF（logit-MSE，P9） | ✗ | **-0.089** | -0.018→-0.093 | 0.200（亂猜，凍結） | +0.012 |
+| **LwF（softmax-KD，P9b）** | ✗ | **+0.089** | **+0.010→+0.159** | **0.357** | +0.209 |
+| Replay（P8d） | ✓ | +0.180 | +0.038→+0.292 | 0.564 | -0.012 |
+| DER++（P8d） | ✓ | +0.268 | +0.157→+0.378 | 0.641 | -0.033 |
+
+smallcnn ladder（PNN 的同架構對照，取自 P8b）：
+
+| 機制 | buffer？ | Δ@40（遷移） | early→late | mean_forgetting |
+| :--- | :---: | :---: | :---: | :---: |
+| Naive | ✗ | -0.044 | -0.029→-0.024 | — |
+| **PNN（參數隔離，P9b）** | ✗ | **+0.101** | per-task late Δ +0.17~+0.23 | **0.000（架構性）** |
+| Replay | ✓ | +0.174 | +0.035→+0.282 | — |
+
+- **(a) PNN**：buffer-free **Δ@40 +0.101**，介於同架構 naive(−0.044) 與 buffered replay(+0.174) 之間；per-task 正向遷移隨 task 數累積放大（早期≈0、晚期 task9/12/19 達 +0.229/+0.205/+0.207）。**mean_forgetting 0.000**（舊 column 凍結→架構性零遺忘）、mean_final 0.501。**代價**：容量隨 task 線性成長（一 column/task + lateral）、推論需 task-id 路由到對的 column。
+- **(b) softmax-KD**：buffer-free **Δ@40 +0.089**、**且 cumulative GROWS**（early +0.010 → late +0.159，per-task 晚期 task17/18 達 +0.184/+0.212）。**mean_final 0.357 ≫ 亂猜 0.20、且 > naive 0.214**——它**不凍結**，與 P9 的 logit-MSE LwF（卡在 0.200）形成尖銳對比。代價：mean_forgetting 0.209（會忘，但遠非凍結），無額外容量、無 task-id 路由需求。
+
+### 24.2 解讀：P9 的「蒸餾必凍結」是 logit-MSE 特例；buffer-free 累積不是硬牆
+
+兩個修正：
+
+1. **P9 的悲觀定位被縮小**。P9 說「DER++ 的引擎是真實樣本、蒸餾只是放大器、buffer-free 累積是最明確的未解問題」。P9b 證明 buffer-free 累積**其實可達**，至少兩條路：**容量擴張**（PNN：把舊知識存進凍結的參數 column 而非樣本 buffer）與**軟函數蒸餾**（softmax-KD：soften 分布 + 溫度，比 logit-MSE 溫和太多，不會把 backbone 鎖死）。
+
+2. **「蒸餾單獨用必凍結」是 DER 式 logit-MSE 的特例，不是蒸餾通則**。同樣 buffer-free、同樣只用「當前資料過凍結舊快照」的蒸餾，把目標從 logit-MSE 換成 softmax-KD，結果從 −0.089（凍結、亂猜）翻成 **+0.089（正向、不凍結、retention 0.357）**。差別在訊號幾何：logit-MSE 各向同性鎖死所有 logit 值（包含未啟動方向）→隨已學類別累積把 backbone 凍住；softmax-KD 只約束 soften 後的**機率分布**、溫度進一步把約束放軟，留下可塑性。這也呼應本專案反覆出現的教訓（§10/§16）：**對「函數」做溫和錨定 > 對「原始輸出值/權重」做硬約束。**
+
+**殘留的真實樣本價值仍在**：兩條 buffer-free 路雖然都正向，但 Δ@40（+0.101/+0.089）與絕對 retention（mean_final 0.501/0.357）都**仍低於** buffered replay(+0.180/0.564) 與 DER++(+0.268/0.641)，且只有 buffered 法做到負 forgetting（**後向遷移**：舊任務後來變更好）。所以 P4–P6 與 P9 指認的「真實樣本不可取代的價值」沒有被推翻——被推翻的是「沒有真實樣本就連累積都拿不到」這個更強的論斷。
+
+### 24.3 P9b 對「離真正 CL 多遠」的定位
+
+把 P9 留下的「buffer-free 累積」這道牆從**硬牆**降級為**有路可走的牆**：buffer-free 也能「持續變強」，代價是要嘛容量成長（PNN）、要嘛接受較高 forgetting + 較低絕對 retention（softmax-KD）。真正剩下、且仍由真實樣本獨佔的，是「**buffer-free 同時拿到高絕對 retention + 後向遷移**」——這才是 replay/DER++ 目前唯一不可替代之處。下一步（P9c，可選）：把 PNN 放大到 resnet18（如 P8b→P8c）量容量效應，或結合 softmax-KD + 輕量擴張逼近 buffered 上界。
+
+**結果檔**：`results_p9b_pnn_smallcnn.json`、`results_p9b_lwfkd_resnet18.json`。
+
+---
+
+## 25. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -1116,6 +1167,7 @@ P9 把「無 buffer」這道牆量化成**硬牆**：在 P8 的會動-backbone r
 26. **放大到真 ResNet18：「持續變強」隨容量放大（§21，P8c）**。把 P8b 的 backbone 從小 CNN 換成 CIFAR-adapted ResNet18（~11M 參數、end-to-end、MPS GPU），探針/資料流不變。正向遷移**更大且累積增長更陡**：Δ@40 overall +0.232（小 CNN +0.174）、late(15-19) **+0.356**（小 CNN +0.282）、continual late 絕對 acc 衝到 **0.73–0.75**（fresh ~0.35）。per-task Δ 單調爬升到 task18 **+0.412**。caveat：early Δ 有一部分來自 replay 重用當前 task 資料，但跨 task 的乾淨訊號是 early→late 增長（+0.239），fresh 永遠拿不到。結論：**「持續變強」不是小模型玩具效應，隨容量放大**；P7–P8c 收束為——抗遺忘是跨 benchmark/表徵/容量的真知識，累積學習可達、其充要條件是「表徵持續建構 × 可塑性持續維持」且隨規模增強。
 27. **穩定–可塑性甜蜜點：DER++ 同時放大正向遷移與 retention（§22，P8d）**。把會動 ResNet18 的維持機制從 plain Replay 換成 DER++（replay CE + logit 蒸餾，α=0.5），同一框架量兩軸。DER++ **兩個軸都更好、無 tradeoff**：正向遷移 Δ@40 **+0.268**（replay +0.180）、late +0.378（+0.292）；retention mean_final **0.641**（0.564）；兩者 mean_forgetting 皆為負＝**backward transfer**（舊任務後來變更好），DER++ 更明顯(-0.033)。logit 蒸餾不但沒拖慢新任務（無可塑性稅），反而把舊函數壓進更條件良好的共享表徵、讓新任務學更快。**§10 的「最佳抗遺忘法」在會動 backbone 上升級成「最佳累積學習法」。** 「持續變強」配方至此完整：表徵持續建構 × replay 保可塑性 × DER++ 函數蒸餾 × 隨容量放大，統一了 replay/§9/§10 三條主線。
 28. **無 buffer 累積：函數蒸餾取代不了真實樣本（§23，P9，負面結果）**。P8b–P8d 的累積全靠 replay buffer；P9 用 **LwF**（=DER++ 的蒸餾項但不存樣本，對當前資料經凍結舊模型蒸餾舊類 logits）做乾淨 ablation。結果 buffer-free **完全失敗**：naive Δ@40≈0、**LwF 比 naive 更差（-0.089，λ=0.1/1.0 皆然）**，continual 卡在亂猜(~0.20)；型態是負向遷移**隨經驗惡化**（蒸餾錨點累積→逐步凍結 backbone），與 replay 的正向增長相反。**乾淨結論：DER++ 兩成分中，真正的引擎是 replay-CE on 真實樣本（同時保可塑性＋推正向遷移）；logit 蒸餾單獨用反而凍結。§20–§22 的「持續變強」引擎是 buffer 裡的真實樣本，蒸餾只是放大器。** caveat：用 DER 式 logit-MSE（為對齊 DER++），非經典 softmax-KD-溫度；但後者無產生正向遷移的機制、最好也只 ≈naive。定位：L3（會累積）達成但仍架在 replay buffer 拐杖上，buffer-free 累積是最明確的未解開放問題。
+29. **無 buffer 累積其實可達，且 P9 的 caveat 被自己推翻（§24，P9b，正面結果）**。P9 把 buffer-free 累積定位成硬牆，並猜測經典 softmax-KD「最好也只 ≈naive」。P9b 試兩條 P9 沒做的 buffer-free 路，**兩條都拿到正向且隨經驗增長的遷移**：(a) **參數隔離 PNN**（新任務讀舊任務凍結特徵）Δ@40 **+0.101**、**架構性零遺忘**、mean_final 0.501，代價是容量隨 task 線性成長 + 推論需 task-id 路由；(b) **softmax-KD + 溫度**（同 P9 設定，只把 logit-MSE 換成 soften-分布 KL）Δ@40 **+0.089**、early +0.010→late +0.159（**GROWS**）、mean_final **0.357 ≫ 亂猜 0.20 也 > naive 0.214**——**直接推翻 P9 的 caveat**：softmax-KD 不但不 ≈naive、還明顯正向且不凍結。**修正後的乾淨結論**：P9 的「蒸餾單獨用必凍結」是 **DER 式 logit-MSE 的特例**（各向同性鎖死所有 logit），不是蒸餾通則；換成 well-conditioned 的 softmax-KD（約束機率分布 + 溫度放軟）就保住可塑性、buffer-free 也能累積。**buffer-free 累積從硬牆降級為有路可走的牆**；真實樣本唯一仍不可取代之處，收斂成「buffer-free 同時拿到高絕對 retention + 後向遷移」——兩條 buffer-free 路的 Δ@40 與 mean_final 都仍低於 buffered replay(+0.180/0.564)/DER++(+0.268/0.641)，且只有 buffered 法做到負 forgetting（後向遷移）。
 
 ---
 

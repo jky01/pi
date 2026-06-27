@@ -18,6 +18,7 @@
 ### 0.1 在另一台機器接續（含 NVIDIA CUDA GPU，如 RTX 2070）
 - **遷移方式＝git**：`git clone https://github.com/jky01/pi.git` 後 `git checkout p8-pretrained-cl`（最新進度在這條 branch）。`pi_digits_600000.txt` 已在 repo 內；大檔（`mnist.npz`/`cifar100_resnet18.npz`/`cifar_data/`）是 gitignore、**會自動重新下載/重生**，不必搬。
 - **環境**：新機自建 venv，`pip install numpy torch torchvision`（裝 **CUDA build** 的 torch，非 CPU build）。把上面寫死的 mac 直譯器路徑換成新機的 `python`。
+  - **本 RTX 2070 機器已建好**：`PY=/home/aa/pi/.venv/bin/python`（Python 3.14、numpy 2.5.0、torch 2.12.1+cu130 / torchvision 0.27.1+cu130，`torch.cuda.is_available()=True`，device=NVIDIA GeForce RTX 2070, sm_75, 8GB）。系統 `python3` 只有 numpy、無 torch。CIFAR-100 raw 已下載在 `./cifar_data/`。
 - **資料重生**：`python mnist_data.py`（自動下載 MNIST）、`python extract_features.py`（自動下載 CIFAR-100 + ResNet18 權重並抽特徵）。
 - **用 GPU 跑（唯一 torch 訓練實驗）**：`python run_backbone_transfer.py --device cuda ...`（或 `--device auto`，會自動選 cuda）。`pick_device` 已支援 `cuda > mps > cpu`；其餘 numpy 實驗不吃 GPU。
 - **接手脈絡**：先讀本檔 + `report.md` §0（TL;DR）+ §17–§23（P7–P9 現代化弧線）。`report.md` 是完整研究日誌，整段對話的結論都已落在裡面——新開的 cold-start session 讀這幾份即可無縫接續。
@@ -76,8 +77,10 @@
 
 - **P9 — 無 buffer 下的累積（已完成，§23，負面結果）**：用 **LwF**（=DER++ 蒸餾項但不存樣本）做乾淨 ablation。buffer-free **完全失敗**：naive Δ@40≈0、**LwF 比 naive 更差**（-0.089，λ=0.1/1.0 皆然），continual 卡在亂猜、負向遷移隨經驗惡化（蒸餾錨點累積→凍結 backbone）。**乾淨結論：DER++ 的有效引擎是 replay-CE on 真實樣本，不是 logit 蒸餾；蒸餾只是放大器、單獨用反而凍結。** L3（會累積）達成但架在 replay buffer 拐杖上。`run_backbone_transfer.py` 加 `--continual-mode lwf --lwf-lambda`。結果檔 `results_p9_{naive,lwf,lwf_lam0.1}_resnet18.json`。
 
+- **P9b — 無 buffer 累積的其他機制（已完成，§24，正面結果）**：P9 只證明「DER 式 logit-MSE 蒸餾(LwF)」不行；P9b 試另兩條 buffer-free 路，**兩條都成功**。實作在 `run_backbone_transfer.py`：(a) `--continual-mode pnn`（PNN 式參數隔離，smallcnn columns + lateral）→ Δ@40 **+0.101**、**mean_forgetting 0.000**、mean_final 0.501（介於 smallcnn naive −0.044 與 replay +0.174 之間；代價＝容量隨 task 線性成長 + 推論需 task-id 路由）；(b) `--continual-mode lwf_kd --lwf-temp 2.0`（經典 softmax-KD，resnet18）→ Δ@40 **+0.089**、early +0.010→late +0.159（GROWS）、mean_final **0.357**（≫亂猜 0.20、>naive 0.214，**不凍結**）——**推翻 P9 caveat**：「蒸餾必凍結」只是 DER 式 logit-MSE 的特例，softmax-KD 保住可塑性。兩條都仍低於 buffered replay/DER++（真實樣本仍獨佔「高絕對 retention + 後向遷移」）。結果檔 `results_p9b_{pnn_smallcnn,lwfkd_resnet18}.json`。(c) 生成式回放搬到會動 backbone 尚未做（最重、優先序低）。
+
 **下一個要做 / Todo**
-- **P9b — 無 buffer 累積的其他機制（承 P9）**：P9 只證明「純函數蒸餾(LwF)」不行。還沒試的 buffer-free 路線：(a) 把 P4–P6 的**生成式回放**搬到會動 ResNet18（合成樣本當 replay-CE，補回「真實樣本」的角色）；(b) 經典 LwF 的 **softmax-KD+溫度**（確認是否至少 ≈naive 而非凍結）；(c) 參數隔離 / 動態擴張（PackNet/PNN 式）。這是把 L3 累積做成 buffer-free 的核心開放問題。
+- **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
 - **（L4 方向，遠程）task-free + 開放世界 + 漂移 + 新奇偵測/容量增長**：P3 已在 numpy 端證明 task 邊界幾乎可免費移除，但 P8 的 backbone 版尚未驗證 task-free；開放世界/漂移/自主長容量完全未碰，這才是「真正的持續學習」(L4) 與 LLM 終身學習接軌處。
 - **P9 — frozen-feature 下拔掉 replay buffer（次優先）**：在 Split-CIFAR-100 frozen 特徵上測無 buffer 的抗遺忘（純原型 NCM class means / 生成式回放搬到特徵空間），看能保住 P8 的 0.530 多少。`run_features.py` 已可直接掛新 trainer。注意：P4–P6 已大致確立 buffer-free 的結論，此項較偏工程驗證、資訊量中等。
