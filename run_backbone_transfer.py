@@ -15,6 +15,7 @@ P10 在 frozen ImageNet backbone 上量到正向遷移≈0，但限制是 backbo
 只用 torch 做這支實驗；其餘專案維持純 numpy。
 """
 import argparse
+import copy
 import json
 import os
 import pickle
@@ -136,8 +137,33 @@ class ReservoirBuffer:
         return self.X[idx], self.y[idx], z
 
 
+class LwF:
+    """Learning without Forgetting：buffer-free 函數空間蒸餾（= DER++ 不存樣本）。
+    每個 task 後凍結一份模型快照；訓練新 task 時，對**當前 batch 輸入**用舊快照在
+    已學過的類別欄位上的 logits 做 MSE 蒸餾，完全不存原始樣本。"""
+    def __init__(self, lam, classes_per_task):
+        self.lam = lam
+        self.cpt = classes_per_task
+        self.old_model = None
+        self.old_cols = None
+
+    def extra_loss(self, model, cur_x, out, ncur):
+        if self.old_model is None:
+            return 0.0
+        with torch.no_grad():
+            old = self.old_model(cur_x)
+        c = self.old_cols
+        return self.lam * F.mse_loss(out[:ncur][:, c], old[:, c])
+
+    def after_task(self, model, k):
+        self.old_model = copy.deepcopy(model).eval()
+        for p in self.old_model.parameters():
+            p.requires_grad_(False)
+        self.old_cols = list(range(self.cpt * (k + 1)))  # 已學過的類別
+
+
 def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
-                mode="naive", buffer=None, dark_alpha=0.5):
+                mode="naive", buffer=None, dark_alpha=0.5, reg=None):
     """訓練一個 task 並記錄 task-k 受限 5-way acc 曲線。
     mode: naive（純當前 batch）/ replay（+ reservoir CE）/ derpp（replay CE + logit 蒸餾）。"""
     n = X.shape[0]
@@ -164,6 +190,8 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
                 out = model(cur_x)
                 loss = F.cross_entropy(out, yb)
                 cur_logits = out.detach()
+            if reg is not None:
+                loss = loss + reg.extra_loss(model, cur_x, out, ncur)
             loss.backward(); opt.step()
             if use_buf:
                 buffer.add(xb_raw, yb, cur_logits if mode == "derpp" else None)
@@ -180,12 +208,13 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
 
 def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
             lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
-            device="cpu", arch="smallcnn", dark_alpha=0.5):
+            device="cpu", arch="smallcnn", dark_alpha=0.5, lwf_lambda=1.0):
     torch.manual_seed(seed)
     Xtr, ytr, Xte, yte = load_cifar100_raw()
     rng = np.random.RandomState(seed)
     buffer = (ReservoirBuffer(buffer_cap, np.random.RandomState(7000 + seed))
               if continual_mode in ("replay", "derpp") else None)
+    reg = LwF(lwf_lambda, classes_per_task) if continual_mode == "lwf" else None
 
     task_classes = [tuple(range(classes_per_task * t, classes_per_task * (t + 1)))
                     for t in range(n_tasks)]
@@ -210,7 +239,10 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
 
         rng_c = np.random.RandomState(1000 + seed)
         cont_curve = train_curve(cont, cont_opt, X, y, Xt, yt, tcls, epochs, batch, rng_c,
-                                 mode=continual_mode, buffer=buffer, dark_alpha=dark_alpha)
+                                 mode=continual_mode, buffer=buffer, dark_alpha=dark_alpha,
+                                 reg=reg)
+        if reg is not None:
+            reg.after_task(cont, k)
 
         fresh = make_model(arch, n_tasks * classes_per_task, width).to(device)
         fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
@@ -265,8 +297,9 @@ def main():
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--width", type=int, default=64)
-    p.add_argument("--continual-mode", choices=["naive", "replay", "derpp"], default="naive")
+    p.add_argument("--continual-mode", choices=["naive", "replay", "derpp", "lwf"], default="naive")
     p.add_argument("--dark-alpha", type=float, default=0.5, help="DER++ logit distillation weight")
+    p.add_argument("--lwf-lambda", type=float, default=1.0, help="LwF (buffer-free) distillation weight")
     p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
     p.add_argument("--device", default="auto", help="auto | cpu | mps")
     p.add_argument("--output", default="results_backbone_transfer_cifar100.json")
@@ -281,7 +314,7 @@ def main():
                       args.train_per_class, args.test_per_class,
                       args.lr, args.epochs, args.batch, args.width,
                       continual_mode=args.continual_mode, device=device,
-                      arch=args.arch, dark_alpha=args.dark_alpha)
+                      arch=args.arch, dark_alpha=args.dark_alpha, lwf_lambda=args.lwf_lambda)
         all_seed.append(res["per_task"])
         retentions.append(res["retention"])
         print(f"seed {seed} done", flush=True)

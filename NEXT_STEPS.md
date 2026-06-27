@@ -67,9 +67,12 @@
 
 - **P8d — DER++ 維持機制 + 穩定-可塑性甜蜜點（已完成，§22，正面結果）**：在會動 ResNet18 上把 continual 維持機制從 plain Replay 換成 **DER++（replay CE + logit 蒸餾 α=0.5）**，同框架同時量正向遷移與 retention。**DER++ 兩軸全勝、無 tradeoff**：正向遷移 Δ@40 +0.268（replay +0.180）、retention mean_final 0.641（0.564）；兩者 mean_forgetting 皆負＝backward transfer。logit 蒸餾無可塑性稅、反而讓新任務學更快。§10 的最佳抗遺忘法升級成最佳累積學習法。`run_backbone_transfer.py` 加 `--continual-mode derpp --dark-alpha`。結果檔 `results_p8d_{replay,derpp}_resnet18.json`。
 
+- **P9 — 無 buffer 下的累積（已完成，§23，負面結果）**：用 **LwF**（=DER++ 蒸餾項但不存樣本）做乾淨 ablation。buffer-free **完全失敗**：naive Δ@40≈0、**LwF 比 naive 更差**（-0.089，λ=0.1/1.0 皆然），continual 卡在亂猜、負向遷移隨經驗惡化（蒸餾錨點累積→凍結 backbone）。**乾淨結論：DER++ 的有效引擎是 replay-CE on 真實樣本，不是 logit 蒸餾；蒸餾只是放大器、單獨用反而凍結。** L3（會累積）達成但架在 replay buffer 拐杖上。`run_backbone_transfer.py` 加 `--continual-mode lwf --lwf-lambda`。結果檔 `results_p9_{naive,lwf,lwf_lam0.1}_resnet18.json`。
+
 **下一個要做 / Todo**
-- **P9 — 無 buffer 下的累積（最高優先，剩下的真硬牆）**：P8b/P8c/P8d 的正向遷移＋retention 都靠 replay buffer（隱私/儲存/無限流的真實約束禁止）。把這套累積搬到無 buffer（純原型 / 生成式 / 參數隔離）下還撐不撐得住，是 P8 系列之後唯一還沒攻的真硬牆。先在 frozen 特徵（`run_features.py`）試，再考慮 backbone 也動的版本。
-- **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：P8d 只用 α=0.5、單一設定。掃 α、buffer 容量、stream 長度，刻畫甜蜜點的邊界與正向遷移上限。優先序中等（機制已確立，這是刻畫）。
+- **P9b — 無 buffer 累積的其他機制（承 P9）**：P9 只證明「純函數蒸餾(LwF)」不行。還沒試的 buffer-free 路線：(a) 把 P4–P6 的**生成式回放**搬到會動 ResNet18（合成樣本當 replay-CE，補回「真實樣本」的角色）；(b) 經典 LwF 的 **softmax-KD+溫度**（確認是否至少 ≈naive 而非凍結）；(c) 參數隔離 / 動態擴張（PackNet/PNN 式）。這是把 L3 累積做成 buffer-free 的核心開放問題。
+- **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
+- **（L4 方向，遠程）task-free + 開放世界 + 漂移 + 新奇偵測/容量增長**：P3 已在 numpy 端證明 task 邊界幾乎可免費移除，但 P8 的 backbone 版尚未驗證 task-free；開放世界/漂移/自主長容量完全未碰，這才是「真正的持續學習」(L4) 與 LLM 終身學習接軌處。
 - **P9 — frozen-feature 下拔掉 replay buffer（次優先）**：在 Split-CIFAR-100 frozen 特徵上測無 buffer 的抗遺忘（純原型 NCM class means / 生成式回放搬到特徵空間），看能保住 P8 的 0.530 多少。`run_features.py` 已可直接掛新 trainer。注意：P4–P6 已大致確立 buffer-free 的結論，此項較偏工程驗證、資訊量中等。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
@@ -218,10 +221,11 @@
 
 **結論**：殘留缺口不是 on-manifold 與否的問題。scholar-class 距 raw 的 1.6% 小差距更像**真實樣本不可取代的價值**（精確 per-class 聯合結構→正向後向遷移，raw conflicting 有 +BWT、合成回放沒有）。P4–P6 總結：不存原始樣本可行且常足夠（長流甚至贏 raw），完全追平 raw 仍有一道由真實樣本聯合結構撐起的小硬牆。唯一未試：per-class autoregressive（見上方 Todo P6b，優先序低）。
 
-## 3. 建議順序與理由（P1–P8、P8b/c/d、P10 已完成；P2.6/P2.9 負面；P2.10/P6b 已停損）
+## 3. 建議順序與理由（P1–P8、P8b/c/d、P9、P10 已完成；P2.6/P2.9/P9 負面；P2.10/P6b 已停損）
 
-1. **P9（無 buffer 下的累積）** — P8 系列之後唯一還沒攻的真硬牆：把正向遷移＋retention 搬到無 buffer。`run_features.py` 已就緒可先試 frozen 版。
-2. **（可選）P8e（α/buffer/stream 掃描）** — 刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
+1. **P9b（buffer-free 累積的其他機制）** — P9 證明純蒸餾(LwF)不行；最有潛力的是把生成式回放(P4–P6)搬到會動 backbone 補回「真實樣本」角色。這是把 L3 累積做成 buffer-free 的核心開放問題。
+2. **（L4，遠程）task-free + 開放世界 + 漂移** — 真正的持續學習，與 LLM 終身學習接軌；目前基本未碰。
+3. **（可選）P8e（α/buffer/stream 掃描）** — 刻畫甜蜜點邊界。機制已確立，優先序中等。
 - ~~P2.10（自動 DER++ gating）~~ / ~~P6b（per-class autoregressive）~~ — **已停損**。
 
 ## 4. 慣例
