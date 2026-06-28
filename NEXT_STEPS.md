@@ -88,12 +88,9 @@
 **下一個要做 / Todo**
 - **P13b —（承 P13）解掉對比訊號的 batch 稀疏**：兩條路 (a) **class-balanced 對比抽樣**——replay 改成每 batch 保證數個舊類各 ≥2 樣本(湊得出正對);(b) **prototype/feature memory bank（proto-contrastive）**——把對比正/負例從小 replay batch 解耦到持續更新的特徵記憶。目標:檢驗「補足 per-old-class 正對後 SupCon 是否轉正、把 NCM 0.235 往上推」。若兩者都不行,則回 (c)。
 - **P13c —（對照基準）廣泛預訓 init 再 fine-tune**：§18 frozen ImageNet NCM 已 0.530;測「預訓 init + 會動 fine-tune」的 class-IL 上限,量化「從零 vs 預訓」對全域可分性的貢獻(P12/P13 反覆指向這是主因)。
-- **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應。機制已確立,優先序中等。
-- **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
 - **（L4 方向，遠程）task-free + 開放世界 + 漂移 + 新奇偵測/容量增長**：P3 已在 numpy 端證明 task 邊界幾乎可免費移除，但 P8 的 backbone 版尚未驗證 task-free；開放世界/漂移/自主長容量完全未碰，這才是「真正的持續學習」(L4) 與 LLM 終身學習接軌處。
-- **P9 — frozen-feature 下拔掉 replay buffer（次優先）**：在 Split-CIFAR-100 frozen 特徵上測無 buffer 的抗遺忘（純原型 NCM class means / 生成式回放搬到特徵空間），看能保住 P8 的 0.530 多少。`run_features.py` 已可直接掛新 trainer。注意：P4–P6 已大致確立 buffer-free 的結論，此項較偏工程驗證、資訊量中等。
 
 ### ✅ P1 — 攻 Class-IL 的遺忘缺口（已完成，§11.3）
 **結果**：`NCMReplayEWC`（最近類別原型讀出，iCaRL 式）把 Class-IL final 0.31→**0.858**、遺忘 0.50→**0.06**、retention>1.0（3 seeds, std 0.003）。診斷正確：病灶是線性頭的 recency/magnitude bias，換成無偏原型讀出即解。候選清單裡的 cosine/BiC/class-balanced replay 尚未試（NCM 已夠強，這些可作為進一步小幅優化或在更大規模時備用）。
