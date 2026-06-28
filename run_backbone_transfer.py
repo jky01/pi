@@ -74,20 +74,24 @@ class SmallCNN(nn.Module):
         return self.head(z)
 
 
-def make_resnet18_cifar(n_classes):
-    """CIFAR-adapted ResNet18（從零）：把 7x7/stride2 stem 換成 3x3/stride1、移除 early
-    maxpool，否則 32x32 輸入會被過度下採樣。這是 CIFAR ResNet 的標準改法。"""
-    net = torchvision.models.resnet18(weights=None, num_classes=n_classes)
+def make_resnet18_cifar(n_classes, pretrained=False):
+    """CIFAR-adapted ResNet18：把 7x7/stride2 stem 換成 3x3/stride1、移除 early maxpool，
+    否則 32x32 輸入會被過度下採樣。這是 CIFAR ResNet 的標準改法。
+    pretrained=True（P13c）：載入 ImageNet 預訓 layer1-4（廣泛可分特徵），conv1 stem 與 fc
+    為新初始化——架構與從零版完全相同,唯一差別是 body 權重 pretrained vs random（乾淨 A/B）。"""
+    weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+    net = torchvision.models.resnet18(weights=weights)
     net.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     net.maxpool = nn.Identity()
+    net.fc = nn.Linear(512, n_classes)
     return net
 
 
-def make_model(arch, n_classes, width):
+def make_model(arch, n_classes, width, pretrained=False):
     if arch == "smallcnn":
         return SmallCNN(n_classes=n_classes, width=width)
     if arch == "resnet18":
-        return make_resnet18_cifar(n_classes)
+        return make_resnet18_cifar(n_classes, pretrained=pretrained)
     raise ValueError(f"unknown arch: {arch}")
 
 
@@ -477,7 +481,7 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
             lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
             device="cpu", arch="smallcnn", dark_alpha=0.5, lwf_lambda=1.0, lwf_temp=2.0,
             eval_mode="taskil", supcon_weight=0.0, supcon_temp=0.2,
-            proto_weight=0.0, proto_temp=0.1, proto_momentum=0.9):
+            proto_weight=0.0, proto_temp=0.1, proto_momentum=0.9, pretrained=False):
     torch.manual_seed(seed)
     Xtr, ytr, Xte, yte = load_cifar100_raw()
     rng = np.random.RandomState(seed)
@@ -500,7 +504,7 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         tr = rng.permutation(tr)[:train_per_class * classes_per_task]
         tr_idx.append(tr); te_idx.append(te[:test_per_class * classes_per_task])
 
-    cont = make_model(arch, n_tasks * classes_per_task, width).to(device)
+    cont = make_model(arch, n_tasks * classes_per_task, width, pretrained=pretrained).to(device)
     cont_opt = torch.optim.SGD(cont.parameters(), lr=lr, momentum=0.9)
     # P13b：continual 的原型庫跨 task 持久累積（這正是它補回舊類訊號的關鍵）。
     cont_proto = ProtoBank(n_tasks * classes_per_task, proto_momentum) if proto_weight > 0 else None
@@ -523,7 +527,7 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         if reg is not None:
             reg.after_task(cont, k)
 
-        fresh = make_model(arch, n_tasks * classes_per_task, width).to(device)
+        fresh = make_model(arch, n_tasks * classes_per_task, width, pretrained=pretrained).to(device)
         fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
         # fresh 只學 task k，給它一個本任務內的新原型庫（保持訓練目標一致、可公平比較）。
         fresh_proto = ProtoBank(n_tasks * classes_per_task, proto_momentum) if proto_weight > 0 else None
@@ -769,6 +773,8 @@ def main():
                    help="P13b: proto-contrastive loss weight (persistent per-class prototype bank)")
     p.add_argument("--proto-temp", type=float, default=0.1, help="P13b: proto-contrastive temperature")
     p.add_argument("--proto-momentum", type=float, default=0.9, help="P13b: prototype EMA momentum")
+    p.add_argument("--pretrained", action="store_true",
+                   help="P13c: init resnet18 body from ImageNet pretrained weights (vs from-scratch)")
     p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
     p.add_argument("--eval-mode", choices=["taskil", "classil"], default="taskil",
                    help="taskil: 給 task id 的受限 5-way；classil: 無 task id 的 task-free 評估")
@@ -798,7 +804,8 @@ def main():
                           lwf_lambda=args.lwf_lambda, lwf_temp=args.lwf_temp,
                           eval_mode=args.eval_mode, supcon_weight=args.supcon_weight,
                           supcon_temp=args.supcon_temp, proto_weight=args.proto_weight,
-                          proto_temp=args.proto_temp, proto_momentum=args.proto_momentum)
+                          proto_temp=args.proto_temp, proto_momentum=args.proto_momentum,
+                          pretrained=args.pretrained)
         all_seed.append(res["per_task"])
         retentions.append(res["retention"])
         print(f"seed {seed} done", flush=True)
@@ -844,6 +851,7 @@ def main():
                        arch=args.arch, dark_alpha=args.dark_alpha, eval_mode=args.eval_mode,
                        supcon_weight=args.supcon_weight, supcon_temp=args.supcon_temp,
                        proto_weight=args.proto_weight, proto_temp=args.proto_temp,
+                       pretrained=args.pretrained,
                        retention=retentions,
                        per_seed=[[{"task": t["task"],
                                    "continual": {str(k): v for k, v in t["continual"].items()},
