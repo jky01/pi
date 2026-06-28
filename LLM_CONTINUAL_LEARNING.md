@@ -133,6 +133,36 @@ naive vs replay 的侵蝕差也再現了 §2 機制 3（在凍結 base 上小 de
 (ii) 語意 embedder 取代 lexical 檢索（更真實);(iii) scale 模型/事實量;(iv) 鞏固品質再
 push（hot durable 0.83→更高、侵蝕再降);(v) 程序性/技能類知識（非單一事實)的鞏固。
 
+**Step 5（`llm_cl/consolidate_quality.py`）— 非侵蝕整合：侵蝕已解,durable 是剩餘瓶頸**：
+鞏固時 CE on 事實（學新)＋ **對凍結 base 的 softmax-KD anchor**（在與測試無關的通用 prompt 池上,
+把當前 token 分布錨在 base → 限制 collateral drift;base logits 快取)。這是 P9/P9b 的教訓:
+蒸餾當「錨/限制副作用」,不是「引擎」(學習靠 CE)。
+
+anchor 掃描（self-replay 變體固定、同 seed,乾淨 A/B,epochs=30）：
+
+| anchor | durable | 通用侵蝕(drop) |
+| :--: | :--: | :--: |
+| 0（無錨) | 0.62 | **0.25** |
+| 0.5 | 0.50 | 0.08 |
+| **1.0** | 0.56 | **0.08** |
+| 2.0 | 0.31 | 0.08 |
+
+anchor=1.0 跨 epochs：20→durable 0.50 / **侵蝕 0.00**、30→0.56/0.08、60→0.44/0.08。
+
+- **「侵蝕有界且小」= 已解**：base-KD anchor 把通用能力侵蝕**穩定壓到 ~0**（20 epochs 時 0.00、
+  最多 0.08),不論訓多久都有界（vs 無錨 0.25 且隨 epochs 惡化)。這正是 point 4 最難的「non-eroding」
+  要求。**蒸餾錨在 base（而非舊任務)是關鍵:它限制副作用、不凍結學習。**
+- **「新技能單調增長到高 durable」= 尚未,瓶頸在鞏固品質**：durable 在 0.5B 上封頂 ~0.5–0.56,
+  **更多 epochs 不漲（甚至略降)**;QA-format 變體（`--qa`)只小升 durable 0.50→0.56 卻把侵蝕推回
+  0.17（且 0.5B 生成的 QA 良率低,16×4 只留 15)。瓶頸是**小模型的變體生成品質 + LoRA 整合容量**,
+  不是再多調 anchor/epoch 能解。
+- **下一個槓桿是 scale（1.5B+）**：更大模型 → 更好的自我變體 + 更高整合容量,才可能把 durable 推高;
+  anchor 已把侵蝕這一軸鎖死,scale 攻 durable 那一軸。
+
+**結論**：point 4 的「侵蝕有界且小」用 base-KD anchor 達成（侵蝕→~0、穩定);「durable 單調升高」
+受限於 0.5B 的鞏固品質,需 scale。erosion 與 durable 是兩個可分開攻的軸:anchor 鎖 erosion、
+scale/變體品質 攻 durable。
+
 ## 6. 環境
 
 - `.venv/bin/python`：torch 2.12.1+cu130、transformers 5.12.1、peft 0.19.1、accelerate 1.14.0
