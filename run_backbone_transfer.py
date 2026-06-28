@@ -207,6 +207,18 @@ def bic_fit(cal_logits, cal_y, group, n_groups, steps=400, lr=0.05):
     return a.detach(), b.detach()
 
 
+def logits_in_chunks(model, X, n_seen, chunk=256):
+    outs = []
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, X.shape[0], chunk):
+            outs.append(model(normalize(X[i:i + chunk]))[:, :n_seen])
+    if was_training:
+        model.train()
+    return torch.cat(outs, 0)
+
+
 def bic_acc(model, Xt, yt, n_seen, a, b, group):
     model.eval()
     with torch.no_grad():
@@ -214,6 +226,40 @@ def bic_acc(model, Xt, yt, n_seen, a, b, group):
         pred = logits.argmax(1)
     model.train()
     return (pred == yt).float().mean().item()
+
+
+def forward_with_feat(model, x_norm, arch):
+    """Forward pass that also returns the differentiable penultimate feature tensor."""
+    cap = {}
+    layer = head_of(model, arch)
+    h = layer.register_forward_hook(lambda m, inp, out: cap.__setitem__("z", inp[0]))
+    logits = model(x_norm)
+    h.remove()
+    if "z" not in cap:
+        raise RuntimeError("failed to capture penultimate features")
+    return logits, cap["z"]
+
+
+def supervised_contrastive_loss(feats, y, temp=0.2):
+    """Khosla-style SupCon over a batch. Anchors without a positive pair are ignored."""
+    n = feats.shape[0]
+    if n <= 1:
+        return feats.sum() * 0.0
+    z = F.normalize(feats, dim=1)
+    logits = (z @ z.t()) / temp
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+    eye = torch.eye(n, dtype=torch.bool, device=feats.device)
+    same = y.view(-1, 1).eq(y.view(1, -1))
+    pos = same & ~eye
+    valid = pos.sum(1) > 0
+    if not bool(valid.any()):
+        return feats.sum() * 0.0
+
+    exp_logits = torch.exp(logits).masked_fill(eye, 0.0)
+    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True).clamp_min(1e-12))
+    mean_log_prob_pos = (pos.float() * log_prob).sum(1) / pos.sum(1).clamp_min(1)
+    return -mean_log_prob_pos[valid].mean()
 
 
 class ReservoirBuffer:
@@ -311,7 +357,8 @@ class LwFKD:
 
 def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
                 mode="naive", buffer=None, dark_alpha=0.5, reg=None,
-                eval_mode="taskil", n_seen=None):
+                eval_mode="taskil", n_seen=None, arch="smallcnn",
+                supcon_weight=0.0, supcon_temp=0.2):
     """訓練一個 task 並記錄學習曲線。
     mode: naive（純當前 batch）/ replay（+ reservoir CE）/ derpp（replay CE + logit 蒸餾）。
     eval_mode: taskil → task-k 受限 5-way（給 task id）；classil → 已看過類別 argmax（無 task id）。"""
@@ -332,14 +379,28 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
             opt.zero_grad()
             if use_buf and buffer.size >= batch:
                 rx, ry, rz = buffer.sample(batch)
-                out = model(torch.cat([cur_x, normalize(rx)], 0))
+                all_x = torch.cat([cur_x, normalize(rx)], 0)
+                if supcon_weight > 0:
+                    out, feats = forward_with_feat(model, all_x, arch)
+                else:
+                    out = model(all_x)
+                    feats = None
                 loss = F.cross_entropy(out[:ncur], yb) + F.cross_entropy(out[ncur:], ry)
                 if mode == "derpp" and rz is not None:
                     loss = loss + dark_alpha * F.mse_loss(out[ncur:], rz)
+                if supcon_weight > 0:
+                    all_y = torch.cat([yb, ry], 0)
+                    loss = loss + supcon_weight * supervised_contrastive_loss(feats, all_y, supcon_temp)
                 cur_logits = out[:ncur].detach()
             else:
-                out = model(cur_x)
+                if supcon_weight > 0:
+                    out, feats = forward_with_feat(model, cur_x, arch)
+                else:
+                    out = model(cur_x)
+                    feats = None
                 loss = F.cross_entropy(out, yb)
+                if supcon_weight > 0:
+                    loss = loss + supcon_weight * supervised_contrastive_loss(feats, yb, supcon_temp)
                 cur_logits = out.detach()
             if reg is not None:
                 loss = loss + reg.extra_loss(model, cur_x, out, ncur)
@@ -360,7 +421,7 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
 def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
             lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
             device="cpu", arch="smallcnn", dark_alpha=0.5, lwf_lambda=1.0, lwf_temp=2.0,
-            eval_mode="taskil"):
+            eval_mode="taskil", supcon_weight=0.0, supcon_temp=0.2):
     torch.manual_seed(seed)
     Xtr, ytr, Xte, yte = load_cifar100_raw()
     rng = np.random.RandomState(seed)
@@ -398,7 +459,8 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         rng_c = np.random.RandomState(1000 + seed)
         cont_curve = train_curve(cont, cont_opt, X, y, Xt, yt, tcls, epochs, batch, rng_c,
                                  mode=continual_mode, buffer=buffer, dark_alpha=dark_alpha,
-                                 reg=reg, eval_mode=eval_mode, n_seen=n_seen)
+                                 reg=reg, eval_mode=eval_mode, n_seen=n_seen, arch=arch,
+                                 supcon_weight=supcon_weight, supcon_temp=supcon_temp)
         if reg is not None:
             reg.after_task(cont, k)
 
@@ -406,7 +468,8 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
         rng_f = np.random.RandomState(1000 + seed)
         fresh_curve = train_curve(fresh, fresh_opt, X, y, Xt, yt, tcls, epochs, batch, rng_f,
-                                  mode="naive", eval_mode=eval_mode, n_seen=n_seen)
+                                  mode="naive", eval_mode=eval_mode, n_seen=n_seen, arch=arch,
+                                  supcon_weight=supcon_weight, supcon_temp=supcon_temp)
 
         per_task.append(dict(task=k, continual=cont_curve, fresh=fresh_curve))
         print(f"  seed{seed} task{k:>2}: cont@40={cont_curve.get(40, float('nan')):.3f} "
@@ -434,8 +497,7 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         final_cos = [cosine_acc(cont, arch, Xt, yt, n_all) for (Xt, yt, tcls) in test_sets]
         # BiC：在 class-balanced 校準集上擬合 per-task-group affine 校正。
         cal_X, cal_y = balanced_cal_set(Xtr, ytr, tr_idx, 20, device)
-        with torch.no_grad():
-            cal_logits = cont(normalize(cal_X))[:, :n_all]
+        cal_logits = logits_in_chunks(cont, cal_X, n_all)
         group = torch.tensor([c // classes_per_task for c in range(n_all)], device=device)
         a, b = bic_fit(cal_logits, cal_y, group, n_tasks)
         final_bic = [bic_acc(cont, Xt, yt, n_all, a, b, group) for (Xt, yt, tcls) in test_sets]
@@ -637,6 +699,10 @@ def main():
     p.add_argument("--lwf-lambda", type=float, default=1.0, help="LwF (buffer-free) distillation weight")
     p.add_argument("--lwf-temp", type=float, default=2.0, help="LwF softmax-KD temperature (lwf_kd)")
     p.add_argument("--lateral-dim", type=int, default=128, help="PNN lateral projection dim")
+    p.add_argument("--supcon-weight", type=float, default=0.0,
+                   help="P13: supervised contrastive loss weight on penultimate features")
+    p.add_argument("--supcon-temp", type=float, default=0.2,
+                   help="P13: supervised contrastive temperature")
     p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
     p.add_argument("--eval-mode", choices=["taskil", "classil"], default="taskil",
                    help="taskil: 給 task id 的受限 5-way；classil: 無 task id 的 task-free 評估")
@@ -664,7 +730,8 @@ def main():
                           continual_mode=args.continual_mode, device=device,
                           arch=args.arch, dark_alpha=args.dark_alpha,
                           lwf_lambda=args.lwf_lambda, lwf_temp=args.lwf_temp,
-                          eval_mode=args.eval_mode)
+                          eval_mode=args.eval_mode, supcon_weight=args.supcon_weight,
+                          supcon_temp=args.supcon_temp)
         all_seed.append(res["per_task"])
         retentions.append(res["retention"])
         print(f"seed {seed} done", flush=True)
@@ -672,13 +739,14 @@ def main():
     probe_desc = ("task-k 5-way acc (Task-IL, given task id)" if args.eval_mode == "taskil"
                   else "all-seen-class acc (Class-IL, NO task id)")
     print(f"\n=== forward transfer with ADAPTING backbone (arch={args.arch}, "
-          f"continual={args.continual_mode}, eval={args.eval_mode}) ===")
+          f"continual={args.continual_mode}, eval={args.eval_mode}, "
+          f"supcon={args.supcon_weight:g}) ===")
     print(f"{probe_desc}: continual (backbone adapts across tasks) vs fresh-from-scratch")
     for step in [10, 20, 40, 80]:
         rows = summarize(all_seed, step)
         c = np.mean([r[1] for r in rows]); f = np.mean([r[2] for r in rows])
-        early = np.mean([d for k, _, _, d in rows if k < 5])
-        late = np.mean([d for k, _, _, d in rows if k >= 15])
+        early = np.mean([d for k, _, _, d in rows[:min(5, len(rows))]])
+        late = np.mean([d for k, _, _, d in rows[max(0, len(rows) - 5):]])
         overall = np.mean([d for _, _, _, d in rows])
         grow = late - early
         tag = ("GROWS w/ accumulation" if grow > 0.02 else
@@ -707,6 +775,7 @@ def main():
     with open(args.output, "w") as fp:
         json.dump(dict(checkpoints=CHECKPOINTS, continual_mode=args.continual_mode,
                        arch=args.arch, dark_alpha=args.dark_alpha, eval_mode=args.eval_mode,
+                       supcon_weight=args.supcon_weight, supcon_temp=args.supcon_temp,
                        retention=retentions,
                        per_seed=[[{"task": t["task"],
                                    "continual": {str(k): v for k, v in t["continual"].items()},

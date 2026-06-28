@@ -83,8 +83,12 @@
 
 - **P12 —（承 P11）會動表徵上比 NCM 更好的 task-free 讀出（已完成，§26，部分負面/修正歸因）**：在同一批訓練好的會動 backbone 上加兩個 post-hoc 讀出——`cosine_acc`（L2-normalize 頭權重+特徵）與 `bic_fit`/`bic_acc`（per-task-group affine,class-balanced 校準集擬合）。resnet18、100 類、2 seeds:DER++ 線性 0.172 / NCM 0.235 / cosine 0.154 / BiC 0.216;Replay 0.132/0.210/0.091/0.179。**BiC 修一部分偏置(+~25% 相對)但封頂在 NCM 之下;cosine 有害;沒有讀出接近 task-IL 0.641。** 修正 P11 歸因:NCM 已是最乾淨讀出(最終特徵空間重算新鮮原型),0.235 代表**特徵本身分不開 100 類＝全域跨任務可分性不足**,讀出補不了。結果檔 `results_p12_{naive,replay,derpp}_resnet18.json`。
 
+- **P13 —（承 P12）cross-buffer SupCon 直攻全域可分表徵（已完成，§27，負面結果）**：在會動 backbone 加 SupCon（`--supcon-weight`/`--supcon-temp`，跨 [當前∪replay] penultimate 特徵）。DER++、resnet18、class-IL、掃 supcon ∈ {0,0.5,1.0}:**三軸單調惡化**（NCM 0.237→0.209→0.194、forgetting 0.455→0.480、累積探針 Δ +0.234→+0.204）。病灶:replay batch 每類 <0.5 樣本、舊類湊不出同類正對 → SupCon 只收緊當前任務簇、又與 CE/DER++ 搶容量。**否證的是「在稀疏 replay batch 上直接做 SupCon」,不是 SupCon 概念**;與 §16/P4/P9 同一道「真實樣本/每類密度」硬牆。結果檔 `results_p13_derpp_supcon{0,0.5,1.0}_resnet18.json`。
+
 **下一個要做 / Todo**
-- **P13 —（承 P12，最高槓桿）逼出全域跨任務可分的表徵**：P12 證明 class-IL 缺口是表徵問題不是讀出問題。槓桿在訓練目標,不在 logit-space 校正。候選:(a) 跨 buffer 的 **supervised-contrastive**（拉近同類、推遠跨 task 異類,直接優化全域可分性）;(b) **全域 logit-adjusted / class-balanced CE**(訓練時就對抗 recency);(c) 回到 §18 的**廣泛預訓 init**(frozen ImageNet NCM 已 0.530)再 fine-tune。目標:把 DER++ class-IL 從 ~0.235 往 task-IL 0.641 推。harness `--eval-mode classil` + 四種讀出已備好,改的是訓練端。
+- **P13b —（承 P13）解掉對比訊號的 batch 稀疏**：兩條路 (a) **class-balanced 對比抽樣**——replay 改成每 batch 保證數個舊類各 ≥2 樣本(湊得出正對);(b) **prototype/feature memory bank（proto-contrastive）**——把對比正/負例從小 replay batch 解耦到持續更新的特徵記憶。目標:檢驗「補足 per-old-class 正對後 SupCon 是否轉正、把 NCM 0.235 往上推」。若兩者都不行,則回 (c)。
+- **P13c —（對照基準）廣泛預訓 init 再 fine-tune**：§18 frozen ImageNet NCM 已 0.530;測「預訓 init + 會動 fine-tune」的 class-IL 上限,量化「從零 vs 預訓」對全域可分性的貢獻(P12/P13 反覆指向這是主因)。
+- **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應。機制已確立,優先序中等。
 - **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
