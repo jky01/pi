@@ -85,9 +85,10 @@
 
 - **P13 —（承 P12）cross-buffer SupCon 直攻全域可分表徵（已完成，§27，負面結果）**：在會動 backbone 加 SupCon（`--supcon-weight`/`--supcon-temp`，跨 [當前∪replay] penultimate 特徵）。DER++、resnet18、class-IL、掃 supcon ∈ {0,0.5,1.0}:**三軸單調惡化**（NCM 0.237→0.209→0.194、forgetting 0.455→0.480、累積探針 Δ +0.234→+0.204）。病灶:replay batch 每類 <0.5 樣本、舊類湊不出同類正對 → SupCon 只收緊當前任務簇、又與 CE/DER++ 搶容量。**否證的是「在稀疏 replay batch 上直接做 SupCon」,不是 SupCon 概念**;與 §16/P4/P9 同一道「真實樣本/每類密度」硬牆。結果檔 `results_p13_derpp_supcon{0,0.5,1.0}_resnet18.json`。
 
+- **P13b —（承 P13）prototype memory bank（proto-contrastive）（已完成，§28，診斷正確但仍負面）**：實作 `ProtoBank`（持久 per-class 原型,current+replay EMA 更新)+ `--proto-weight`/`--proto-temp`/`--proto-momentum`。DER++、class-IL 掃 proto ∈ {0,0.1,0.5,1.0}:NCM 0.237→0.233→0.221→0.207。對照 P13 SupCon 同劑量 0.237→0.209→0.194——**原型庫把傷害變小(證明 P13「正對稀疏」診斷正確),但仍無任何劑量淨增益**。結論:修好正對稀疏是必要不充分,auxiliary 對比目標抬不動 class-IL,瓶頸是表徵起點/容量。結果檔 `results_p13b_derpp_proto{0,0.1,0.5,1.0}_resnet18.json`。
+
 **下一個要做 / Todo**
-- **P13b —（承 P13）解掉對比訊號的 batch 稀疏**：兩條路 (a) **class-balanced 對比抽樣**——replay 改成每 batch 保證數個舊類各 ≥2 樣本(湊得出正對);(b) **prototype/feature memory bank（proto-contrastive）**——把對比正/負例從小 replay batch 解耦到持續更新的特徵記憶。目標:檢驗「補足 per-old-class 正對後 SupCon 是否轉正、把 NCM 0.235 往上推」。若兩者都不行,則回 (c)。
-- **P13c —（對照基準）廣泛預訓 init 再 fine-tune**：§18 frozen ImageNet NCM 已 0.530;測「預訓 init + 會動 fine-tune」的 class-IL 上限,量化「從零 vs 預訓」對全域可分性的貢獻(P12/P13 反覆指向這是主因)。
+- **P13c —（最高優先）廣泛預訓 init + 會動 fine-tune**：P12(讀出)+P13(batch 對比)+P13b(原型對比)三方向全撞同一上限 ~0.235;§18 frozen ImageNet NCM 0.530 vs 從零 0.237 的 2× 差距,最強指向**表徵起點/容量**是真正槓桿。做法:`make_resnet18_cifar` 改用 `torchvision.models.resnet18(weights=IMAGENET1K_V1)` 起步(stem 仍 CIFAR-adapt、但載入預訓權重)、會動 fine-tune,跑 class-IL（linear/NCM/cosine/BiC）量「預訓 init 能否同時拿 task-IL 累積 + class-IL 全域可分」。對照從零 0.237。注意 32×32 輸入與 ImageNet stem 的相容(可能要保留 7×7 stem 或只載 layer1-4)。
 - **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
 - **（L4 方向，遠程）task-free + 開放世界 + 漂移 + 新奇偵測/容量增長**：P3 已在 numpy 端證明 task 邊界幾乎可免費移除，但 P8 的 backbone 版尚未驗證 task-free；開放世界/漂移/自主長容量完全未碰，這才是「真正的持續學習」(L4) 與 LLM 終身學習接軌處。

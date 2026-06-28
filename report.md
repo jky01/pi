@@ -72,6 +72,8 @@
 
 **(AA) P13：直攻全域可分表徵的 cross-buffer SupCon 反而有害——病灶是 buffer 每類稀疏（負面結果）**（§27）。P12 把牆移正成「更好的特徵」。P13 在會動 backbone 上加 **supervised contrastive(SupCon)**,跨 [當前 ∪ replay] batch 直接優化全域可分性(`--supcon-weight`)。**DER++、resnet18、class-IL、掃 supcon ∈ {0,0.5,1.0}**:supcon 越大,**三軸全部單調惡化**——NCM 0.237→0.209→0.194、forgetting 0.455→0.480、累積探針 Δ +0.234→+0.204。**診斷**:對比 batch=[32 當前 ∪ 32 replay],當前 32 全來自當下 5 類(同類正對多)、replay 32 散在多達 100 類(每類 <0.5 樣本、舊類湊不出正對)→ SupCon 只在收緊**當前任務**簇、沒分離舊類,卻又與 CE/DER++ 競爭容量 → retention 與 plasticity 雙降。**乾淨結論**:被否證的不是 SupCon 概念,而是「在稀疏 replay batch 上直接做」;瓶頸比 P12 更深一層——不只特徵不可分,而是**沒有足夠 per-old-class 訊號去把特徵變可分**(同 §16 P6「per-class 集中>全域覆蓋」與 P4/P9 的真實樣本密度牆)。修正方向:class-balanced 對比抽樣 / prototype memory bank(proto-contrastive)解耦 batch 稀疏,或承認 §18——全域可分性主要靠廣泛預訓、從零會動 backbone 在此資料量級建不出。結果檔 `results_p13_derpp_supcon{0,0.5,1.0}_resnet18.json`。
 
+**(AB) P13b：原型記憶庫解掉 batch 稀疏——傷害變小(診斷正確)但仍不增益,瓶頸是表徵不是對比訊號**（§28）。承 P13,加一個**持久 per-class 原型記憶庫(ProtoBank)**:current+replay 特徵 EMA 更新原型、proto-contrastive 把每個特徵拉向自身類原型、推離所有已見類原型(每個舊類永遠有負例,即使 batch 無該類樣本)。**DER++、resnet18、class-IL、掃 proto ∈ {0,0.1,0.5,1.0}**:NCM 0.237→0.233→0.221→0.207。對照 P13 SupCon 同劑量 NCM 0.237→0.209→0.194——**原型庫確實把傷害變小(0.194→0.207),證明 P13「正對稀疏」診斷正確**;但**仍無任何劑量淨增益**,沒有把 NCM 推過 0.237 基準。**乾淨結論**:修好正對稀疏是必要不充分——proto-contrastive 已直接優化 NCM 可分性,但從零、每次只見 5-way 的會動 backbone,表徵容量就是不足以被 auxiliary 目標推到全域 100-way 可分(還要和 CE/DER++ 搶容量→淨值微負)。**P12(讀出)+P13(batch 對比)+P13b(原型對比)三方向全撞同一上限 ~0.235**;最強指向的剩餘槓桿是**表徵起點/容量**——§18 frozen ImageNet NCM 0.530 vs 從零 0.237 的 2× 差距,是廣泛預訓建的可分特徵,不是讀出或對比目標補得了的。**P13c(pretrained init + 會動 fine-tune)從可選升為最高優先。** 結果檔 `results_p13b_derpp_proto{0,0.1,0.5,1.0}_resnet18.json`。
+
 ---
 
 ## 1. 目的
@@ -1248,7 +1250,43 @@ SupCon 概念沒被否證,被否證的是「在稀疏 replay batch 上直接做�
 
 ---
 
-## 28. 結論
+## 28. 原型記憶庫解掉 batch 稀疏:傷害變小但仍不增益——瓶頸是表徵不是對比訊號（P13b）
+
+**為什麼**：P13 診斷 cross-buffer SupCon 失敗於「稀疏 replay batch 裡舊類湊不出同類正對」。P13b 直接解這個病灶:維護一個**持久的 per-class 原型記憶庫(ProtoBank)**,用 current+replay 特徵 EMA 更新(原型在會動特徵空間裡保持新鮮、對抗 drift),proto-contrastive loss 把每個特徵**拉向自身類原型、推離所有已見類原型**(= 直接訓練 NCM 可分性,且每個舊類永遠有原型當負例,即使 batch 裡沒有該類樣本)。原型 stop-grad,梯度只流經當前特徵。這是「補足 per-old-class 訊號」後對 P13 的乾淨再測。
+
+**做法**：`run_backbone_transfer.py` 加 `ProtoBank` 與 `--proto-weight`/`--proto-temp`/`--proto-momentum`;continual 用跨 task 持久原型庫,fresh 用每任務新庫(對齊目標、公平比較)。DER++、resnet18、class-IL、20 tasks、2 seeds,掃 proto ∈ {0, 0.1, 0.5, 1.0}。
+
+### 28.1 結果：傷害比 SupCon 小（診斷正確），但仍無任何劑量增益
+
+| proto-weight | 線性 | NCM | cosine | BiC | mean_forgetting |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **0（基準）** | 0.168 | **0.237** | 0.150 | 0.216 | 0.450 |
+| 0.1 | 0.163 | 0.233 | 0.147 | 0.212 | 0.460 |
+| 0.5 | 0.159 | 0.221 | 0.146 | 0.212 | 0.473 |
+| 1.0 | 0.151 | 0.207 | 0.134 | 0.204 | 0.481 |
+
+對照 P13 SupCon 的 NCM（0/0.5/1.0）：**0.237 → 0.209 → 0.194**;P13b proto 的 NCM：**0.237 → 0.221 → 0.207**。
+
+- **原型庫確實把傷害變小**(weight=1.0 時 NCM 0.194→0.207、weight=0.5 時 0.209→0.221)——**P13 的診斷正確**:稀疏 batch 的「湊不出正對」是真實失敗模式,補上持久原型後對比訊號不再退化成「只收緊當前任務」。
+- **但仍無任何劑量淨增益**:沒有一個 proto-weight 把 NCM 推過 0.237 基準,且越大越(輕微)往下。三軸(retention/forgetting/讀出)都沒被改善。
+
+### 28.2 解讀：兩條訓練目標攻法都失敗 → 槓桿是表徵起點/容量,不是對比機制
+
+P13b 把問題切得很乾淨。**修好正對稀疏是必要不充分**:解掉 P13 點名的病灶,只是讓對比 auxiliary 從「有害」變「中性偏輕微有害」,**並沒有變成增益**。原因:proto-contrastive 已經直接在優化 NCM 可分性(用所有舊類原型當負例),但**從零、每次只見 5-way 的會動 backbone,其表徵容量/訓練訊號就是不足以被一個 auxiliary 目標推到全域 100-way 可分**;這個 auxiliary 還要和 CE/DER++ 搶容量 → 淨值微負。
+
+至此 **P13 + P13b 兩條獨立的「改訓練目標」攻法(batch SupCon、prototype proto-contrastive)都無法抬升 class-IL**。結合 P12(讀出已封頂)——三個方向(讀出校準、batch 對比、原型對比)全部撞到同一上限 ~0.235。**最強烈指向的剩餘槓桿是表徵的起點/容量本身**:§18 的 frozen ImageNet 特徵 NCM 已 **0.530**,而本處從零會動 backbone 卡在 0.237。這個 2× 差距不是讀出、不是對比目標能補的,是**廣泛預訓所建的可分特徵**與**從零 CIFAR-100 串流特徵**的本質差距。
+
+### 28.3 P13b 對方向的定位
+
+把「全域可分表徵」這道牆收斂到一句:**在這個資料量級,全域跨任務可分性主要由「表徵的起點(預訓)/容量」決定,不是事後讀出、也不是外加對比目標能逼出來的。** 下一步 **P13c（pretrained init + 會動 fine-tune）** 從可選升為**最高優先**:它直接測「廣泛預訓起步 + continual fine-tune」能否同時拿到 task-IL 累積與 class-IL 全域可分,量化「從零 vs 預訓」對 task-free 部署的貢獻——這是 P11–P13b 反覆指向的真正主因。
+
+**乾淨結論**：原型記憶庫驗證了 P13 的診斷(解掉正對稀疏→傷害變小),但證明那只是必要不充分;auxiliary 對比目標(batch 或 prototype)都抬不動 class-IL,瓶頸是表徵起點/容量 → 主攻 pretrained init（P13c）。
+
+**結果檔**：`results_p13b_derpp_proto{0,0.1,0.5,1.0}_resnet18.json`（分支 `taskfree-accumulation`）。
+
+---
+
+## 29. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -1282,6 +1320,7 @@ SupCon 概念沒被否證,被否證的是「在稀疏 replay batch 上直接做�
 30. **拔掉 task-id：「持續變強」天花板低很多,但表徵累積與工具箱排序都還在（§25，P11，誠實硬牆量化）**。P8b–P9b 的累積全用 task-IL 探針（給 task id）量;P11 改用 class-IL（無 task id、100 類 argmax）。**最強的 DER++ 從 task-IL 0.641 崩到 class-IL 0.177(線性)/0.245(NCM)**(相對掉 ~62–72%),Replay 0.564→0.107/0.170,Naive 0.214→0.031/0.062。但:(1) class-IL 下**排序完全保留**(DER++>Replay>Naive)——抗遺忘骨幹必要但不充分、非無效;(2) **NCM 在會動 backbone 上首次驗證可部分救回**(穩定 ~1.4–2× 線性頭),§11/§18 原型修法遷移成立但只補一半(0.245≪0.641);(3) **表徵累積本身活著**——class-IL all-seen 探針 Δ 對 replay/derpp 保持正且 early→late 增長(derpp +0.243),continual 面對 5k 真競爭者仍贏 fresh。**乾淨結論**:「持續變強」是真的,但**相當部分由 task-id 撐住**;部署崩壞主因不是表徵不累積,而是 **100-way 的 task-free 讀出/校準**(線性頭 recency bias、NCM 只部分修)。下一道 well-posed 的牆＝**會動表徵上比 NCM 更好的 task-free 讀出**。這量化了策略檢討:方向(stability×plasticity→累積)沒錯,但「可持續學習」要從「給 task-id 的 task-IL」推進到「無 task-id 的 class-IL 部署」,那裡仍有大缺口。
 31. **更好的 task-free 讀出有上限,class-IL 缺口是表徵問題不是讀出問題（§26，P12，修正 P11 歸因）**。P11 把 class-IL 崩壞歸因於讀出;P12 在同一批會動 backbone 上加 **cosine head** 與 **BiC** 兩個 post-hoc 讀出檢驗。class-IL final(同模型只換讀出):DER++ 線性 0.172 / NCM 0.235 / cosine 0.154 / BiC 0.216。**BiC 修了一部分偏置(+~25% 相對)但封頂在 NCM 之下;cosine 反而有害(magnitude-bias 假設在會動 from-scratch backbone 不成立);沒有讀出接近 task-IL 0.641。** NCM 已是最乾淨讀出(最終特徵空間重算新鮮原型),它只有 0.235 → **會動 backbone 的特徵本身就分不開 100 類,是全域跨任務可分性不足,讀出補不了。** task-IL「持續變強」只優化每個 task 內的 5-way 區辨、沒建出全域可分特徵(對照 §18 frozen ImageNet NCM 0.530)。**修正方向:下一道牆從「更好的讀出」移正成「更好的特徵」**——跨 buffer supervised-contrastive / 全域 logit-adjusted 訓練 / 廣泛預訓 init,才是把 task-free 部署推近 task-IL 的槓桿。
 32. **直攻全域可分表徵的 cross-buffer SupCon 反而有害,病灶是 buffer 每類稀疏（§27，P13，負面結果）**。承 P12「改訓練目標」,在會動 backbone 上加 supervised-contrastive(SupCon)跨 [當前∪replay] 優化全域可分性。DER++、class-IL 掃 supcon ∈ {0,0.5,1.0}:**三軸單調惡化**(NCM 0.237→0.194、forgetting 0.455→0.480、累積 Δ +0.234→+0.204)。診斷:對比 batch 裡 replay 32 散在多達 100 類、舊類湊不出同類正對,SupCon 只收緊當前任務簇、又與 CE/DER++ 搶容量 → retention 與 plasticity 雙降。**被否證的不是 SupCon 概念,而是「在稀疏 replay batch 上直接做」。** 瓶頸比 P12 更深:不只特徵不可分,而是**沒有足夠 per-old-class 訊號把它變可分**——這與 §16(P6)、P4/P9 撞到的是同一道**真實樣本/每類密度**的硬牆。修正:class-balanced 對比抽樣 / prototype memory bank 解耦 batch 稀疏,或承認全域可分性主要靠廣泛預訓(§18)。
+33. **原型記憶庫解掉 batch 稀疏:傷害變小但仍不增益,瓶頸是表徵不是對比訊號（§28，P13b）**。承 P13,加持久 per-class 原型庫(ProtoBank,current+replay EMA 更新),proto-contrastive 把特徵拉向自身類原型、推離所有已見類原型(舊類永遠有負例)。DER++、class-IL 掃 proto ∈ {0,0.1,0.5,1.0}:NCM 0.237→0.233→0.221→0.207。對照 P13 SupCon 同劑量 0.237→0.209→0.194——**原型庫把傷害變小(證明 P13「正對稀疏」診斷正確),但仍無任何劑量把 NCM 推過基準**。修好正對稀疏是必要不充分:proto-contrastive 已直接優化 NCM 可分性,但從零、每次只見 5-way 的會動 backbone 容量就是不足以被 auxiliary 目標推到全域可分。**P12(讀出)+P13(batch 對比)+P13b(原型對比)三方向全撞同一上限 ~0.235**;剩餘槓桿是表徵起點/容量(§18 frozen NCM 0.530 vs 從零 0.237 的 2× 差距)。**P13c(pretrained init)升為最高優先。**
 
 ---
 

@@ -47,12 +47,17 @@ forward-transfer / retention 指標。
    - 結果檔 `results_p13_derpp_supcon{0,0.5,1.0}_resnet18.json`、
      `results_p13a_derpp_supcon{003,01}_resnet18_seed0.json`。
 
-2. **P13b：全域 class-balanced / logit-adjusted CE**
-   - 針對 recency bias 在訓練時處理，而不是事後 BiC。
-   - 可用 class-balanced replay 或 logit adjustment 對已見類別近似均衡。
+2. **P13b：prototype memory bank / proto-contrastive（✅ 已做，診斷正確但仍負面，見 report §28）**
+   - 實作 `ProtoBank`（持久 per-class 原型，current+replay EMA 更新）+ `--proto-weight`。
+   - DER++、class-IL 掃 proto ∈ {0,0.1,0.5,1.0}：NCM 0.237→0.233→0.221→0.207。
+   - 對照 P13 SupCon 同劑量 NCM 0.237→0.209→0.194：**原型庫把傷害變小（證明 P13「正對稀疏」
+     診斷正確），但仍無任何劑量淨增益**。修好正對稀疏是必要不充分；auxiliary 對比目標抬不動
+     class-IL，瓶頸是表徵起點/容量 → 直接做 P13c。
+   - 結果檔 `results_p13b_derpp_proto{0,0.1,0.5,1.0}_resnet18.json`。
 
-3. **P13c：pretrained init + fine-tune**
-   - 對照 frozen ImageNet NCM 0.530 的上限訊號。
+3. **P13c：pretrained init + fine-tune（⬆ 升為最高優先）**
+   - P12/P13/P13b 三方向（讀出、batch 對比、原型對比）全撞 ~0.235 上限；§18 frozen ImageNet
+     NCM 0.530 vs 從零 0.237 的 2× 差距最強指向表徵起點/容量。
    - 問題是從廣泛預訓起步後，continual fine-tune 能否兼具 task-IL 累積與 class-IL
      全域可分性。
 
