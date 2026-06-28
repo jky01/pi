@@ -61,6 +61,31 @@
 - **模型編輯脆弱**：對事實有效,對程序性知識脆弱,多次編輯累積不穩定 + ripple effect。
 - 判斷「契合 schema 的快學 vs 違反 schema 的慢學」本身不簡單。
 
+## 7. PoC 結果（進行中）
+
+**Step 1（`llm_cl/probe_oneshot.py`）— reframe 被數字證實**：Qwen2.5-0.5B 在 16 條全新事實上,
+durable recall（不給 context）**0.00**、in-context one-shot **0.94**。模型本來就 one-shot 會,
+缺的純粹是持久化。
+
+**Step 2（`llm_cl/consolidate.py`）— self-replay 是引擎,naive 重複不行**：把 1 次曝光鞏固進
+LoRA（base 凍結),durable recall 用 **held-out 問句**測（不是背問句）,同時量通用能力侵蝕。
+
+| 方法 | epochs | durable recall | 通用能力（侵蝕） |
+| :-- | :--: | :--: | :--: |
+| naive（只訓陳述句,重複) | 10 / 30 / 60 | 0.50 / 0.50 / 0.50 | 0.75 / 0.83 / 0.83 |
+| **self-replay（8 驗證變體)** | 3 / 10 / 20 | 0.75 / 0.62 / **0.88** | **0.92 / 0.92 / 0.92** |
+
+- **naive 重複封頂在 durable 0.50**（10/30/60 epochs 都一樣)——再怎麼重複同一句,事實也只有
+  一半進得了「能用」的權重記憶,且**永久侵蝕通用能力 0.17–0.25**。
+- **self-replay 兩軸全勝**：durable 衝到 0.75–0.88,且通用能力只掉 0.08（侵蝕 ~1/3 於 naive)。
+  **1 次真實曝光 + 自我生成驗證變體,就把「看一次就durable記住、且少忘」工程化了**——正是大腦
+  海馬迴一次寫入 + 睡眠回放的機制。
+- **caveat**：變體是隨機生成,run-to-run 有變異（epochs=10 那次掉到 0.62）。下一步要 **快取變體 +
+  多 seed** 把曲線做乾淨,並掃 variants 數量。
+
+**機制驗證對應**：這直接證實了 §2 的機制 2（內部自我回放)與 4（驗證/接地防 confabulate);
+naive vs replay 的侵蝕差也再現了 §2 機制 3（在凍結 base 上小 delta、自然分布資料少侵蝕)。
+
 ## 6. 環境
 
 - `.venv/bin/python`：torch 2.12.1+cu130、transformers 5.12.1、peft 0.19.1、accelerate 1.14.0
