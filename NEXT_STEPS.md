@@ -1,5 +1,8 @@
 # NEXT_STEPS.md — 未完成工作與後續計畫（給下次運行參考）
 
+> **最高目標已轉向 LLM**：見 **`LLM_CONTINUAL_LEARNING.md`**。本檔的 CIFAR/pi backlog 是
+> proxy 階段的紀錄,結論已收斂成 LLM 方向的約束;新工作以 `LLM_CONTINUAL_LEARNING.md` 為準。
+
 這份檔案記錄「還沒做的工作項目 + 為什麼做 + 預計怎麼做」，讓下次運行（cold start）能直接接續，不必重新推導已有結論。完成一項就把它從 backlog 移到「已完成」並更新 `report.md`。
 
 ---

@@ -1,5 +1,8 @@
 # 當前研究方向備忘：P13 全域可分表徵
 
+> **最高目標已轉向 LLM**：見 **`LLM_CONTINUAL_LEARNING.md`**（腦啟發、樣本高效、可落地的
+> LLM 持續學習）。本檔以下的 CIFAR/P13 內容是 proxy 階段,已收斂出 LLM 方向的約束。
+
 這份檔案只保留目前可行的下一步。完整研究日誌以 `report.md` 為準，待辦與命令以
 `NEXT_STEPS.md` 為準。
 
