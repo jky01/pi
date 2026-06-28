@@ -262,6 +262,53 @@ def supervised_contrastive_loss(feats, y, temp=0.2):
     return -mean_log_prob_pos[valid].mean()
 
 
+class ProtoBank:
+    """P13b：持久的 per-class 原型記憶庫（proto-contrastive）。
+
+    P13 診斷:在稀疏 replay batch 上做 SupCon 失敗,因為舊類別在 batch 裡湊不出同類正對。
+    ProtoBank 把「每類的代表」從 batch 解耦到一個 EMA 更新的原型庫——任何看過的類別永遠
+    有一個原型,所以對比 loss 能把當前任務特徵推離**所有**舊類原型(全域可分),即使 batch
+    裡沒有該舊類樣本。原型用 current+replay 特徵持續更新 → 在會動特徵空間裡保持新鮮(對抗
+    representation drift)。proto loss＝把每個特徵拉向自身類原型、推離其他已見類原型(= 直接
+    訓練 NCM 可分性,而 NCM 正是 P11/P12 最好的讀出)。原型為 stop-grad,梯度只流經當前特徵。"""
+
+    def __init__(self, n_classes, momentum=0.9):
+        self.n_classes = n_classes
+        self.m = momentum
+        self.protos = None  # (n_classes, d)，lazy；stop-grad（非葉子 grad）
+        self.seen = None    # (n_classes,) bool
+
+    def update(self, feats, y):
+        feats = feats.detach()
+        if self.protos is None:
+            d = feats.shape[1]
+            self.protos = torch.zeros(self.n_classes, d, device=feats.device)
+            self.seen = torch.zeros(self.n_classes, dtype=torch.bool, device=feats.device)
+        for c in torch.unique(y):
+            ci = int(c)
+            cm = feats[y == c].mean(0)
+            if self.seen[ci]:
+                self.protos[ci] = self.m * self.protos[ci] + (1 - self.m) * cm
+            else:
+                self.protos[ci] = cm
+                self.seen[ci] = True
+
+    def loss(self, feats, y, temp=0.1):
+        if self.protos is None or int(self.seen.sum()) < 2:
+            return feats.sum() * 0.0
+        idx = self.seen.nonzero(as_tuple=True)[0]            # 已見類別欄
+        P = F.normalize(self.protos[idx], dim=1)             # (S, d) stop-grad
+        z = F.normalize(feats, dim=1)                        # (b, d)
+        logits = (z @ P.t()) / temp                          # (b, S) cosine
+        pos = torch.full((self.n_classes,), -1, dtype=torch.long, device=feats.device)
+        pos[idx] = torch.arange(idx.numel(), device=feats.device)
+        target = pos[y]
+        valid = target >= 0
+        if not bool(valid.any()):
+            return feats.sum() * 0.0
+        return F.cross_entropy(logits[valid], target[valid])
+
+
 class ReservoirBuffer:
     """跨 task 的 reservoir replay buffer（存原始 [0,1] 影像 + 全域標籤 + 可選 logits，
     後者供 DER++ logit 蒸餾用，於插入時記錄當下模型輸出）。"""
@@ -358,12 +405,16 @@ class LwFKD:
 def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
                 mode="naive", buffer=None, dark_alpha=0.5, reg=None,
                 eval_mode="taskil", n_seen=None, arch="smallcnn",
-                supcon_weight=0.0, supcon_temp=0.2):
+                supcon_weight=0.0, supcon_temp=0.2,
+                proto=None, proto_weight=0.0, proto_temp=0.1):
     """訓練一個 task 並記錄學習曲線。
     mode: naive（純當前 batch）/ replay（+ reservoir CE）/ derpp（replay CE + logit 蒸餾）。
-    eval_mode: taskil → task-k 受限 5-way（給 task id）；classil → 已看過類別 argmax（無 task id）。"""
+    eval_mode: taskil → task-k 受限 5-way（給 task id）；classil → 已看過類別 argmax（無 task id）。
+    proto: P13b ProtoBank（proto-contrastive，用 current+replay 特徵更新原型並對比）。"""
     probe = (lambda: acc_5way(model, Xt, yt, task_classes)) if eval_mode == "taskil" \
         else (lambda: acc_seen(model, Xt, yt, n_seen))
+    use_proto = proto is not None and proto_weight > 0
+    need_feats = supcon_weight > 0 or use_proto
     n = X.shape[0]
     curve, s = {}, 0
     if 0 in CHECKPOINTS:
@@ -380,27 +431,31 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
             if use_buf and buffer.size >= batch:
                 rx, ry, rz = buffer.sample(batch)
                 all_x = torch.cat([cur_x, normalize(rx)], 0)
-                if supcon_weight > 0:
+                all_y = torch.cat([yb, ry], 0)
+                if need_feats:
                     out, feats = forward_with_feat(model, all_x, arch)
                 else:
-                    out = model(all_x)
-                    feats = None
+                    out = model(all_x); feats = None
                 loss = F.cross_entropy(out[:ncur], yb) + F.cross_entropy(out[ncur:], ry)
                 if mode == "derpp" and rz is not None:
                     loss = loss + dark_alpha * F.mse_loss(out[ncur:], rz)
                 if supcon_weight > 0:
-                    all_y = torch.cat([yb, ry], 0)
                     loss = loss + supcon_weight * supervised_contrastive_loss(feats, all_y, supcon_temp)
+                if use_proto:
+                    proto.update(feats, all_y)  # update-first：當前類別永遠在庫
+                    loss = loss + proto_weight * proto.loss(feats, all_y, proto_temp)
                 cur_logits = out[:ncur].detach()
             else:
-                if supcon_weight > 0:
+                if need_feats:
                     out, feats = forward_with_feat(model, cur_x, arch)
                 else:
-                    out = model(cur_x)
-                    feats = None
+                    out = model(cur_x); feats = None
                 loss = F.cross_entropy(out, yb)
                 if supcon_weight > 0:
                     loss = loss + supcon_weight * supervised_contrastive_loss(feats, yb, supcon_temp)
+                if use_proto:
+                    proto.update(feats, yb)
+                    loss = loss + proto_weight * proto.loss(feats, yb, proto_temp)
                 cur_logits = out.detach()
             if reg is not None:
                 loss = loss + reg.extra_loss(model, cur_x, out, ncur)
@@ -421,7 +476,8 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
 def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
             lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
             device="cpu", arch="smallcnn", dark_alpha=0.5, lwf_lambda=1.0, lwf_temp=2.0,
-            eval_mode="taskil", supcon_weight=0.0, supcon_temp=0.2):
+            eval_mode="taskil", supcon_weight=0.0, supcon_temp=0.2,
+            proto_weight=0.0, proto_temp=0.1, proto_momentum=0.9):
     torch.manual_seed(seed)
     Xtr, ytr, Xte, yte = load_cifar100_raw()
     rng = np.random.RandomState(seed)
@@ -446,6 +502,8 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
 
     cont = make_model(arch, n_tasks * classes_per_task, width).to(device)
     cont_opt = torch.optim.SGD(cont.parameters(), lr=lr, momentum=0.9)
+    # P13b：continual 的原型庫跨 task 持久累積（這正是它補回舊類訊號的關鍵）。
+    cont_proto = ProtoBank(n_tasks * classes_per_task, proto_momentum) if proto_weight > 0 else None
 
     per_task = []
     test_sets = []  # 留到最後做 retention 評估（continual 終態 vs 剛學完）
@@ -460,16 +518,20 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         cont_curve = train_curve(cont, cont_opt, X, y, Xt, yt, tcls, epochs, batch, rng_c,
                                  mode=continual_mode, buffer=buffer, dark_alpha=dark_alpha,
                                  reg=reg, eval_mode=eval_mode, n_seen=n_seen, arch=arch,
-                                 supcon_weight=supcon_weight, supcon_temp=supcon_temp)
+                                 supcon_weight=supcon_weight, supcon_temp=supcon_temp,
+                                 proto=cont_proto, proto_weight=proto_weight, proto_temp=proto_temp)
         if reg is not None:
             reg.after_task(cont, k)
 
         fresh = make_model(arch, n_tasks * classes_per_task, width).to(device)
         fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
+        # fresh 只學 task k，給它一個本任務內的新原型庫（保持訓練目標一致、可公平比較）。
+        fresh_proto = ProtoBank(n_tasks * classes_per_task, proto_momentum) if proto_weight > 0 else None
         rng_f = np.random.RandomState(1000 + seed)
         fresh_curve = train_curve(fresh, fresh_opt, X, y, Xt, yt, tcls, epochs, batch, rng_f,
                                   mode="naive", eval_mode=eval_mode, n_seen=n_seen, arch=arch,
-                                  supcon_weight=supcon_weight, supcon_temp=supcon_temp)
+                                  supcon_weight=supcon_weight, supcon_temp=supcon_temp,
+                                  proto=fresh_proto, proto_weight=proto_weight, proto_temp=proto_temp)
 
         per_task.append(dict(task=k, continual=cont_curve, fresh=fresh_curve))
         print(f"  seed{seed} task{k:>2}: cont@40={cont_curve.get(40, float('nan')):.3f} "
@@ -703,6 +765,10 @@ def main():
                    help="P13: supervised contrastive loss weight on penultimate features")
     p.add_argument("--supcon-temp", type=float, default=0.2,
                    help="P13: supervised contrastive temperature")
+    p.add_argument("--proto-weight", type=float, default=0.0,
+                   help="P13b: proto-contrastive loss weight (persistent per-class prototype bank)")
+    p.add_argument("--proto-temp", type=float, default=0.1, help="P13b: proto-contrastive temperature")
+    p.add_argument("--proto-momentum", type=float, default=0.9, help="P13b: prototype EMA momentum")
     p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
     p.add_argument("--eval-mode", choices=["taskil", "classil"], default="taskil",
                    help="taskil: 給 task id 的受限 5-way；classil: 無 task id 的 task-free 評估")
@@ -731,7 +797,8 @@ def main():
                           arch=args.arch, dark_alpha=args.dark_alpha,
                           lwf_lambda=args.lwf_lambda, lwf_temp=args.lwf_temp,
                           eval_mode=args.eval_mode, supcon_weight=args.supcon_weight,
-                          supcon_temp=args.supcon_temp)
+                          supcon_temp=args.supcon_temp, proto_weight=args.proto_weight,
+                          proto_temp=args.proto_temp, proto_momentum=args.proto_momentum)
         all_seed.append(res["per_task"])
         retentions.append(res["retention"])
         print(f"seed {seed} done", flush=True)
@@ -776,6 +843,7 @@ def main():
         json.dump(dict(checkpoints=CHECKPOINTS, continual_mode=args.continual_mode,
                        arch=args.arch, dark_alpha=args.dark_alpha, eval_mode=args.eval_mode,
                        supcon_weight=args.supcon_weight, supcon_temp=args.supcon_temp,
+                       proto_weight=args.proto_weight, proto_temp=args.proto_temp,
                        retention=retentions,
                        per_seed=[[{"task": t["task"],
                                    "continual": {str(k): v for k, v in t["continual"].items()},
