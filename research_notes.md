@@ -38,12 +38,14 @@ forward-transfer / retention 指標。
 
 1. **P13a：supervised contrastive loss（✅ 已做，負面結果，見 report §27）**
    - 已掛 `--supcon-weight`/`--supcon-temp`，對 [current ∪ replay] penultimate features 算 SupCon。
-   - DER++、resnet18、class-IL、掃 supcon ∈ {0,0.5,1.0}：**三軸單調惡化**
-     （NCM 0.237→0.209→0.194、forgetting 0.455→0.480、累積探針 Δ +0.234→+0.204）。
+   - DER++、resnet18、class-IL：`supcon=0.03` 幾乎等於 baseline（seed0 NCM
+     0.236 vs 0.239），`0.1` 已下降（seed0 NCM 0.217），`0.5/1.0` 兩 seed 明顯更差
+     （NCM 0.237→0.209→0.194、forgetting 0.455→0.469/0.480）。
    - **病灶＝buffer 每類稀疏**：replay 32 散在多達 100 類、舊類湊不出同類正對，SupCon 只
      收緊當前任務簇、又與 CE/DER++ 搶容量。否證的是「在稀疏 replay batch 上直接做」，
      不是 SupCon 概念本身 → 改走 P13b 補足 per-old-class 正對。
-   - 結果檔 `results_p13_derpp_supcon{0,0.5,1.0}_resnet18.json`。
+   - 結果檔 `results_p13_derpp_supcon{0,0.5,1.0}_resnet18.json`、
+     `results_p13a_derpp_supcon{003,01}_resnet18_seed0.json`。
 
 2. **P13b：全域 class-balanced / logit-adjusted CE**
    - 針對 recency bias 在訓練時處理，而不是事後 BiC。
