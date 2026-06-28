@@ -92,12 +92,67 @@ def make_model(arch, n_classes, width):
 
 
 def acc_5way(model, Xt, yt, task_classes):
+    """Task-IL：給 task id，只在該 task 的 5 個類別欄位裡 argmax（需要推論時知道 task）。"""
     model.eval()
     with torch.no_grad():
         logits = model(normalize(Xt))
         cols = torch.tensor(task_classes, device=logits.device)
         sub = logits[:, cols]
         pred = cols[sub.argmax(1)]
+    model.train()
+    return (pred == yt).float().mean().item()
+
+
+def acc_seen(model, Xt, yt, n_seen):
+    """Class-IL（無 task id）：在「目前已看過的所有類別」0..n_seen-1 裡 argmax。
+    label 是全域 id，argmax 直接給全域類別。這是誠實的 task-free 評估——推論時不
+    被告知是哪個 task，必須把樣本指認到正確類別、且要壓過所有已學類別的干擾。"""
+    model.eval()
+    with torch.no_grad():
+        logits = model(normalize(Xt))[:, :n_seen]
+        pred = logits.argmax(1)
+    model.train()
+    return (pred == yt).float().mean().item()
+
+
+def penult_feat(model, x_norm, arch, chunk=256):
+    """抽 penultimate 特徵（分類頭的輸入）。用 forward hook 對 head/fc 取 input，
+    smallcnn 與 resnet18 通用。x_norm 須已 normalize。"""
+    cap = {}
+    layer = model.head if arch == "smallcnn" else model.fc
+    h = layer.register_forward_hook(lambda m, inp, out: cap.__setitem__("z", inp[0].detach()))
+    outs = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, x_norm.shape[0], chunk):
+            model(x_norm[i:i + chunk])
+            outs.append(cap["z"])
+    model.train()
+    h.remove()
+    return torch.cat(outs, 0)
+
+
+def build_ncm(model, arch, Xtr, ytr, tr_idx, device, per_class=100):
+    """在「最終 backbone」的特徵空間，用每類訓練 exemplar 的平均當原型（iCaRL/NCM）。
+    完全 task-free 的讀出：§11/§18 證明 class-IL 線性頭有 recency bias，原型讀出修掉它；
+    這裡首次在**會動的 backbone** 上測這個修法是否仍成立。"""
+    by_class = {}
+    for idx in tr_idx:
+        Xk = torch.from_numpy(Xtr[idx]).to(device)
+        yk = ytr[idx]
+        z = penult_feat(model, normalize(Xk), arch)
+        for c in np.unique(yk):
+            by_class.setdefault(int(c), []).append(z[yk == c][:per_class])
+    labels = sorted(by_class)
+    protos = torch.stack([torch.cat(by_class[c], 0).mean(0) for c in labels])
+    return protos, torch.tensor(labels, device=device)
+
+
+def ncm_acc(model, arch, protos, labels, Xt, yt):
+    model.eval()
+    with torch.no_grad():
+        z = penult_feat(model, normalize(Xt), arch)
+        pred = labels[torch.cdist(z, protos).argmin(1)]
     model.train()
     return (pred == yt).float().mean().item()
 
@@ -196,13 +251,17 @@ class LwFKD:
 
 
 def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
-                mode="naive", buffer=None, dark_alpha=0.5, reg=None):
-    """訓練一個 task 並記錄 task-k 受限 5-way acc 曲線。
-    mode: naive（純當前 batch）/ replay（+ reservoir CE）/ derpp（replay CE + logit 蒸餾）。"""
+                mode="naive", buffer=None, dark_alpha=0.5, reg=None,
+                eval_mode="taskil", n_seen=None):
+    """訓練一個 task 並記錄學習曲線。
+    mode: naive（純當前 batch）/ replay（+ reservoir CE）/ derpp（replay CE + logit 蒸餾）。
+    eval_mode: taskil → task-k 受限 5-way（給 task id）；classil → 已看過類別 argmax（無 task id）。"""
+    probe = (lambda: acc_5way(model, Xt, yt, task_classes)) if eval_mode == "taskil" \
+        else (lambda: acc_seen(model, Xt, yt, n_seen))
     n = X.shape[0]
     curve, s = {}, 0
     if 0 in CHECKPOINTS:
-        curve[0] = acc_5way(model, Xt, yt, task_classes)
+        curve[0] = probe()
     todo = [c for c in CHECKPOINTS if c > 0]
     use_buf = buffer is not None and mode in ("replay", "derpp")
     for ep in range(epochs):
@@ -230,18 +289,19 @@ def train_curve(model, opt, X, y, Xt, yt, task_classes, epochs, batch, rng,
                 buffer.add(xb_raw, yb, cur_logits if mode == "derpp" else None)
             s += 1
             if todo and s == todo[0]:
-                curve[s] = acc_5way(model, Xt, yt, task_classes)
+                curve[s] = probe()
                 todo.pop(0)
         if not todo:
             break
     if todo:
-        curve[s] = acc_5way(model, Xt, yt, task_classes)
+        curve[s] = probe()
     return curve
 
 
 def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
             lr, epochs, batch, width, continual_mode="naive", buffer_cap=2000,
-            device="cpu", arch="smallcnn", dark_alpha=0.5, lwf_lambda=1.0, lwf_temp=2.0):
+            device="cpu", arch="smallcnn", dark_alpha=0.5, lwf_lambda=1.0, lwf_temp=2.0,
+            eval_mode="taskil"):
     torch.manual_seed(seed)
     Xtr, ytr, Xte, yte = load_cifar100_raw()
     rng = np.random.RandomState(seed)
@@ -275,10 +335,11 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         tcls = task_classes[k]
         test_sets.append((Xt, yt, tcls))
 
+        n_seen = classes_per_task * (k + 1)  # class-IL：到目前為止看過的類別數
         rng_c = np.random.RandomState(1000 + seed)
         cont_curve = train_curve(cont, cont_opt, X, y, Xt, yt, tcls, epochs, batch, rng_c,
                                  mode=continual_mode, buffer=buffer, dark_alpha=dark_alpha,
-                                 reg=reg)
+                                 reg=reg, eval_mode=eval_mode, n_seen=n_seen)
         if reg is not None:
             reg.after_task(cont, k)
 
@@ -286,22 +347,35 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
         fresh_opt = torch.optim.SGD(fresh.parameters(), lr=lr, momentum=0.9)
         rng_f = np.random.RandomState(1000 + seed)
         fresh_curve = train_curve(fresh, fresh_opt, X, y, Xt, yt, tcls, epochs, batch, rng_f,
-                                  mode="naive")
+                                  mode="naive", eval_mode=eval_mode, n_seen=n_seen)
 
         per_task.append(dict(task=k, continual=cont_curve, fresh=fresh_curve))
         print(f"  seed{seed} task{k:>2}: cont@40={cont_curve.get(40, float('nan')):.3f} "
               f"fresh@40={fresh_curve.get(40, float('nan')):.3f}", flush=True)
 
-    # retention：用終態 continual 模型回評每個 task 的受限 5-way acc，對比剛學完時。
+    # retention：終態 continual 模型回評每個 task，對比剛學完時。
+    # taskil → 給 task id 的受限 5-way；classil → 無 task id，在全部 100 類裡 argmax。
     maxc = max(CHECKPOINTS)
+    n_all = n_tasks * classes_per_task
     diag = [at(per_task[j]["continual"], maxc) for j in range(n_tasks)]
-    final = [acc_5way(cont, Xt, yt, tcls) for (Xt, yt, tcls) in test_sets]
+    if eval_mode == "classil":
+        final = [acc_seen(cont, Xt, yt, n_all) for (Xt, yt, tcls) in test_sets]
+    else:
+        final = [acc_5way(cont, Xt, yt, tcls) for (Xt, yt, tcls) in test_sets]
     forgetting = [diag[j] - final[j] for j in range(n_tasks)]
     retention = dict(diag=diag, final=final,
                      mean_forgetting=float(np.mean(forgetting)),
                      mean_final=float(np.mean(final)))
-    print(f"  seed{seed} retention: mean_final={retention['mean_final']:.3f} "
-          f"mean_forgetting={retention['mean_forgetting']:.3f}", flush=True)
+    msg = (f"  seed{seed} retention: mean_final={retention['mean_final']:.3f} "
+           f"mean_forgetting={retention['mean_forgetting']:.3f}")
+    if eval_mode == "classil":
+        # NCM 原型讀出（task-free）：§11/§18 的 class-IL 修法，首次測在會動 backbone 上。
+        protos, labels = build_ncm(cont, arch, Xtr, ytr, tr_idx, device)
+        final_ncm = [ncm_acc(cont, arch, protos, labels, Xt, yt) for (Xt, yt, tcls) in test_sets]
+        retention["final_ncm"] = final_ncm
+        retention["mean_final_ncm"] = float(np.mean(final_ncm))
+        msg += f" | class-IL linear={retention['mean_final']:.3f} NCM={retention['mean_final_ncm']:.3f}"
+    print(msg, flush=True)
     return dict(per_task=per_task, retention=retention)
 
 
@@ -491,12 +565,17 @@ def main():
     p.add_argument("--lwf-temp", type=float, default=2.0, help="LwF softmax-KD temperature (lwf_kd)")
     p.add_argument("--lateral-dim", type=int, default=128, help="PNN lateral projection dim")
     p.add_argument("--arch", choices=["smallcnn", "resnet18"], default="smallcnn")
+    p.add_argument("--eval-mode", choices=["taskil", "classil"], default="taskil",
+                   help="taskil: 給 task id 的受限 5-way；classil: 無 task id 的 task-free 評估")
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
     p.add_argument("--output", default="results_backbone_transfer_cifar100.json")
     args = p.parse_args()
+    if args.continual_mode == "pnn" and args.eval_mode == "classil":
+        p.error("pnn 本質依賴 task-id 路由到對的 column，無法做 classil；task-free 實驗用 "
+                "naive/replay/derpp/lwf_kd。")
 
     device = pick_device(args.device)
-    print(f"device: {device}", flush=True)
+    print(f"device: {device} | eval_mode: {args.eval_mode}", flush=True)
 
     all_seed, retentions = [], []
     for seed in args.seeds:
@@ -511,14 +590,17 @@ def main():
                           args.lr, args.epochs, args.batch, args.width,
                           continual_mode=args.continual_mode, device=device,
                           arch=args.arch, dark_alpha=args.dark_alpha,
-                          lwf_lambda=args.lwf_lambda, lwf_temp=args.lwf_temp)
+                          lwf_lambda=args.lwf_lambda, lwf_temp=args.lwf_temp,
+                          eval_mode=args.eval_mode)
         all_seed.append(res["per_task"])
         retentions.append(res["retention"])
         print(f"seed {seed} done", flush=True)
 
-    print(f"\n=== P8b/P8c forward transfer with ADAPTING backbone (arch={args.arch}, "
-          f"continual={args.continual_mode}) ===")
-    print("task-k 5-way acc: continual (backbone adapts across tasks) vs fresh-from-scratch")
+    probe_desc = ("task-k 5-way acc (Task-IL, given task id)" if args.eval_mode == "taskil"
+                  else "all-seen-class acc (Class-IL, NO task id)")
+    print(f"\n=== forward transfer with ADAPTING backbone (arch={args.arch}, "
+          f"continual={args.continual_mode}, eval={args.eval_mode}) ===")
+    print(f"{probe_desc}: continual (backbone adapts across tasks) vs fresh-from-scratch")
     for step in [10, 20, 40, 80]:
         rows = summarize(all_seed, step)
         c = np.mean([r[1] for r in rows]); f = np.mean([r[2] for r in rows])
@@ -539,13 +621,16 @@ def main():
     # retention（穩定–可塑性甜蜜點的另一軸）：continual 終態 vs 剛學完
     mf = np.mean([r["mean_final"] for r in retentions])
     mfg = np.mean([r["mean_forgetting"] for r in retentions])
-    print(f"\n=== Retention (continual={args.continual_mode}): "
+    print(f"\n=== Retention (continual={args.continual_mode}, eval={args.eval_mode}): "
           f"mean_final {mf:.3f} | mean_forgetting {mfg:.3f} "
           f"(forward-transfer Δ@40 overall {np.mean([d for *_, d in rows]):+.3f}) ===")
+    if args.eval_mode == "classil":
+        ncm = np.mean([r["mean_final_ncm"] for r in retentions])
+        print(f"    class-IL final (NO task id): linear head {mf:.3f} | NCM prototype {ncm:.3f}")
 
     with open(args.output, "w") as fp:
         json.dump(dict(checkpoints=CHECKPOINTS, continual_mode=args.continual_mode,
-                       arch=args.arch, dark_alpha=args.dark_alpha,
+                       arch=args.arch, dark_alpha=args.dark_alpha, eval_mode=args.eval_mode,
                        retention=retentions,
                        per_seed=[[{"task": t["task"],
                                    "continual": {str(k): v for k, v in t["continual"].items()},
