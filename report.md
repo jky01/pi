@@ -74,6 +74,8 @@
 
 **(AB) P13b：原型記憶庫解掉 batch 稀疏——傷害變小(診斷正確)但仍不增益,瓶頸是表徵不是對比訊號**（§28）。承 P13,加一個**持久 per-class 原型記憶庫(ProtoBank)**:current+replay 特徵 EMA 更新原型、proto-contrastive 把每個特徵拉向自身類原型、推離所有已見類原型(每個舊類永遠有負例,即使 batch 無該類樣本)。**DER++、resnet18、class-IL、掃 proto ∈ {0,0.1,0.5,1.0}**:NCM 0.237→0.233→0.221→0.207。對照 P13 SupCon 同劑量 NCM 0.237→0.209→0.194——**原型庫確實把傷害變小(0.194→0.207),證明 P13「正對稀疏」診斷正確**;但**仍無任何劑量淨增益**,沒有把 NCM 推過 0.237 基準。**乾淨結論**:修好正對稀疏是必要不充分——proto-contrastive 已直接優化 NCM 可分性,但從零、每次只見 5-way 的會動 backbone,表徵容量就是不足以被 auxiliary 目標推到全域 100-way 可分(還要和 CE/DER++ 搶容量→淨值微負)。**P12(讀出)+P13(batch 對比)+P13b(原型對比)三方向全撞同一上限 ~0.235**;最強指向的剩餘槓桿是**表徵起點/容量**——§18 frozen ImageNet NCM 0.530 vs 從零 0.237 的 2× 差距,是廣泛預訓建的可分特徵,不是讀出或對比目標補得了的。**P13c(pretrained init + 會動 fine-tune)從可選升為最高優先。** 結果檔 `results_p13b_derpp_proto{0,0.1,0.5,1.0}_resnet18.json`。
 
+**(AC) P13c：廣泛預訓 init 幾乎把 class-IL 翻倍——表徵起點才是主槓桿(正面結果,lr-confound 已控)**（§29）。P12/P13/P13b 三方向全撞 ~0.235 上限、共同指向「表徵起點」。P13c 把 body 從從零換成 **ImageNet 預訓**(`--pretrained`,layer1-4 載 IMAGENET1K_V1、stem/fc 仍新),continual fine-tune。**關鍵控 confound**:預訓 lr=0.05 會被 fine-tune 打爛(NCM 0.090),lr=0.01 才行;所以**預訓與從零都用 lr0.01**。**結果(derpp、20t、100 類、2 seeds)**:從零 lr0.01 NCM **0.222**(≈ lr0.05 的 0.237,**降 lr 對從零無幫助→排除 lr 假象**);**預訓 lr0.01 NCM 0.440**(線性 0.140→0.362、BiC 0.202→0.440)——**同 lr 下預訓幾乎翻倍 class-IL,是整條弧線最大單一槓桿,直接證實 P11–P13b「瓶頸是表徵起點」的歸因**。**表徵級 stability–plasticity 階梯**:從零會動 0.237 → 預訓會動(fine-tune)0.440 → 預訓凍結(§18)0.530——**預訓 ≫ 從零,但 fine-tune < frozen**:會動帶來 task-IL 累積、卻**侵蝕**預訓給的全域可分性(這是 P8b–P9b 的 plasticity 在表徵層對 class-IL 收的稅)。累積型態也變:預訓把「學得快」front-load(early Δ +0.239),continual 累積只加 +0.058;從零靠累積扛全部(+0.010→+0.243)。**定位**:task-free 部署硬牆**下降但沒倒**(0.440<0.530<task-IL);問題交棒成更尖銳、與 LLM 終身學習接軌的形式——**如何在保留 plasticity 的同時不侵蝕預訓的全域可分性**(表徵級 stability–plasticity)。結果檔 `results_p13c_{fromscratch,pretrained}_lr01_resnet18.json`。
+
 ---
 
 ## 1. 目的
@@ -1286,7 +1288,44 @@ P13b 把問題切得很乾淨。**修好正對稀疏是必要不充分**:解掉 
 
 ---
 
-## 29. 結論
+## 29. 廣泛預訓 init 幾乎把 class-IL 翻倍：表徵起點才是主槓桿（P13c，正面結果）
+
+**為什麼**：P12(讀出)+P13(batch 對比)+P13b(原型對比)三方向全撞 ~0.235 上限,共同指向「表徵起點/容量」是主槓桿。P13c 直接測:把會動 ResNet18 的 body 從**從零**換成 **ImageNet 預訓**(layer1-4 載入 IMAGENET1K_V1,conv1 stem 與 fc 仍新初始化——架構與從零版完全相同,唯一差別是 body 權重),continual fine-tune,量 class-IL。
+
+**關鍵方法學:控制 lr confound**。smoke 發現預訓在 lr=0.05 下 class-IL **崩到 0.090**(fine-tune 把預訓特徵打爛),lr=0.01 則 5-task NCM 0.681。所以**預訓與從零都用 lr=0.01 跑**,先排除「是不是只是 lr 較低在幫忙」。DER++、resnet18、class-IL、20 tasks、2 seeds。
+
+### 29.1 結果：預訓幾乎翻倍 class-IL,且非 lr 假象
+
+| 設定（derpp, 20t, 100 類） | 線性 | NCM | cosine | BiC | forget | 累積探針 Δ@40 (early→late) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| 從零 lr0.05（P12/P13） | 0.172 | 0.237 | 0.154 | 0.216 | 0.455 | +0.234 |
+| 從零 lr0.01（lr 對照） | 0.140 | 0.222 | 0.129 | 0.202 | 0.517 | +0.139 (+0.010→+0.243) |
+| **預訓 lr0.01** | **0.362** | **0.440** | 0.346 | **0.440** | 0.456 | +0.239 (+0.239→+0.297) |
+| §18 frozen 預訓（NCM 讀出） | — | **0.530** | — | — | — | — |
+
+- **lr confound 排除**:從零 lr0.01 NCM **0.222** ≈ lr0.05 的 0.237(甚至略低)——**降 lr 對從零毫無幫助**。
+- **預訓幾乎翻倍**:同 lr 下,預訓 NCM **0.222 → 0.440**(+99% 相對)、線性 0.140→0.362、BiC 0.202→0.440。**這是整條弧線找到的最大單一槓桿,直接證實 P11–P13b 的歸因(瓶頸是表徵起點)。**
+
+### 29.2 解讀：表徵級的 stability–plasticity 階梯,與 fine-tune 的侵蝕代價
+
+把三種表徵起點排成一條階梯(class-IL NCM):
+
+**從零會動 0.237 → 預訓會動(fine-tune) 0.440 → 預訓凍結(§18) 0.530。**
+
+- **預訓 ≫ 從零**:廣泛預訓建出的全域可分特徵,是 class-IL 部署的主要決定因素——讀出校準(P12)、對比目標(P13/P13b)都只能在「給定表徵」內撿邊角,換掉表徵起點才一步翻倍。
+- **但 fine-tune < frozen(0.440 < 0.530)**:把預訓 backbone 拿來 continual fine-tune,**侵蝕了一部分全域可分性**(forget 仍高 0.456)。這正是 P8b–P9b 的 plasticity(會動→task-IL 累積)在**表徵層**對 §18 frozen 的全域可分性收的稅——**表徵級的 stability–plasticity tension**:會動才有 task-IL 累積,但會動就侵蝕預訓給的 class-IL 可分性。
+- **累積型態變了**:預訓的累積探針 Δ early 就高(+0.239),late 只多 +0.058;從零是 early +0.010→late +0.243(累積扛全部)。**預訓把「學得快」front-load 了**,continual 累積只在其上加一點;從零則靠 continual 累積補。
+- **lr 極敏感**:預訓 fine-tune 必須溫和(lr0.05→0.090 打爛、lr0.01→0.440),這本身是一個實務教訓(預訓特徵脆弱)。
+
+### 29.3 P13c 對方向的定位
+
+P13c 把 P11–P13b 的「會動 backbone class-IL 缺口」收斂成一個清楚答案:**主槓桿是表徵起點(預訓),不是讀出、不是 auxiliary 對比目標。** 廣泛預訓幾乎翻倍 class-IL(0.237→0.440),但仍 (i) 低於 frozen 預訓(0.530,fine-tune 侵蝕),(ii) 遠低於 task-IL——**task-free 部署的硬牆下降但沒倒**。這也把問題交棒到一個更尖銳、且與 LLM 終身學習直接接軌的形式:**如何在保留 plasticity(task-IL 累積)的同時,不侵蝕預訓給的全域可分性**(表徵級 stability–plasticity)——這比「再加一個 CL 機制」更接近真正的開放問題。
+
+**結果檔**：`results_p13c_{fromscratch,pretrained}_lr01_resnet18.json`（分支 `taskfree-accumulation`）。
+
+---
+
+## 30. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -1321,6 +1360,7 @@ P13b 把問題切得很乾淨。**修好正對稀疏是必要不充分**:解掉 
 31. **更好的 task-free 讀出有上限,class-IL 缺口是表徵問題不是讀出問題（§26，P12，修正 P11 歸因）**。P11 把 class-IL 崩壞歸因於讀出;P12 在同一批會動 backbone 上加 **cosine head** 與 **BiC** 兩個 post-hoc 讀出檢驗。class-IL final(同模型只換讀出):DER++ 線性 0.172 / NCM 0.235 / cosine 0.154 / BiC 0.216。**BiC 修了一部分偏置(+~25% 相對)但封頂在 NCM 之下;cosine 反而有害(magnitude-bias 假設在會動 from-scratch backbone 不成立);沒有讀出接近 task-IL 0.641。** NCM 已是最乾淨讀出(最終特徵空間重算新鮮原型),它只有 0.235 → **會動 backbone 的特徵本身就分不開 100 類,是全域跨任務可分性不足,讀出補不了。** task-IL「持續變強」只優化每個 task 內的 5-way 區辨、沒建出全域可分特徵(對照 §18 frozen ImageNet NCM 0.530)。**修正方向:下一道牆從「更好的讀出」移正成「更好的特徵」**——跨 buffer supervised-contrastive / 全域 logit-adjusted 訓練 / 廣泛預訓 init,才是把 task-free 部署推近 task-IL 的槓桿。
 32. **直攻全域可分表徵的 cross-buffer SupCon 反而有害,病灶是 buffer 每類稀疏（§27，P13，負面結果）**。承 P12「改訓練目標」,在會動 backbone 上加 supervised-contrastive(SupCon)跨 [當前∪replay] 優化全域可分性。DER++、class-IL 掃 supcon ∈ {0,0.5,1.0}:**三軸單調惡化**(NCM 0.237→0.194、forgetting 0.455→0.480、累積 Δ +0.234→+0.204)。診斷:對比 batch 裡 replay 32 散在多達 100 類、舊類湊不出同類正對,SupCon 只收緊當前任務簇、又與 CE/DER++ 搶容量 → retention 與 plasticity 雙降。**被否證的不是 SupCon 概念,而是「在稀疏 replay batch 上直接做」。** 瓶頸比 P12 更深:不只特徵不可分,而是**沒有足夠 per-old-class 訊號把它變可分**——這與 §16(P6)、P4/P9 撞到的是同一道**真實樣本/每類密度**的硬牆。修正:class-balanced 對比抽樣 / prototype memory bank 解耦 batch 稀疏,或承認全域可分性主要靠廣泛預訓(§18)。
 33. **原型記憶庫解掉 batch 稀疏:傷害變小但仍不增益,瓶頸是表徵不是對比訊號（§28，P13b）**。承 P13,加持久 per-class 原型庫(ProtoBank,current+replay EMA 更新),proto-contrastive 把特徵拉向自身類原型、推離所有已見類原型(舊類永遠有負例)。DER++、class-IL 掃 proto ∈ {0,0.1,0.5,1.0}:NCM 0.237→0.233→0.221→0.207。對照 P13 SupCon 同劑量 0.237→0.209→0.194——**原型庫把傷害變小(證明 P13「正對稀疏」診斷正確),但仍無任何劑量把 NCM 推過基準**。修好正對稀疏是必要不充分:proto-contrastive 已直接優化 NCM 可分性,但從零、每次只見 5-way 的會動 backbone 容量就是不足以被 auxiliary 目標推到全域可分。**P12(讀出)+P13(batch 對比)+P13b(原型對比)三方向全撞同一上限 ~0.235**;剩餘槓桿是表徵起點/容量(§18 frozen NCM 0.530 vs 從零 0.237 的 2× 差距)。**P13c(pretrained init)升為最高優先。**
+34. **廣泛預訓 init 幾乎把 class-IL 翻倍,表徵起點才是主槓桿（§29，P13c，正面結果）**。把 body 從從零換成 ImageNet 預訓、continual fine-tune。控 lr confound(預訓 lr0.05 被 fine-tune 打爛→NCM 0.090;故預訓與從零都用 lr0.01):從零 lr0.01 NCM **0.222**(≈lr0.05,降 lr 對從零無幫助)、**預訓 lr0.01 NCM 0.440**(線性 0.140→0.362)——**同 lr 下預訓近乎翻倍,是整條弧線最大單一槓桿,證實 P11–P13b 歸因**。表徵級 stability–plasticity 階梯:從零會動 0.237 → 預訓會動 0.440 → 預訓凍結(§18)0.530——**預訓≫從零,但 fine-tune<frozen**(會動帶來 task-IL 累積、卻侵蝕預訓的全域可分性)。task-free 部署硬牆下降但沒倒;真正的開放問題收斂成**「保留 plasticity 同時不侵蝕預訓全域可分性」**(表徵級 stability–plasticity),這與 LLM 終身學習直接接軌。
 
 ---
 

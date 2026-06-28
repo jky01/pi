@@ -87,8 +87,11 @@
 
 - **P13b —（承 P13）prototype memory bank（proto-contrastive）（已完成，§28，診斷正確但仍負面）**：實作 `ProtoBank`（持久 per-class 原型,current+replay EMA 更新)+ `--proto-weight`/`--proto-temp`/`--proto-momentum`。DER++、class-IL 掃 proto ∈ {0,0.1,0.5,1.0}:NCM 0.237→0.233→0.221→0.207。對照 P13 SupCon 同劑量 0.237→0.209→0.194——**原型庫把傷害變小(證明 P13「正對稀疏」診斷正確),但仍無任何劑量淨增益**。結論:修好正對稀疏是必要不充分,auxiliary 對比目標抬不動 class-IL,瓶頸是表徵起點/容量。結果檔 `results_p13b_derpp_proto{0,0.1,0.5,1.0}_resnet18.json`。
 
+- **P13c —（已完成，§29，正面結果）廣泛預訓 init + 會動 fine-tune**：`--pretrained`（layer1-4 載 IMAGENET1K_V1、stem/fc 新）。**控 lr confound**（預訓 lr0.05 被 fine-tune 打爛→NCM 0.090；故預訓與從零都用 lr0.01）。derpp、20t、100 類、2 seeds：從零 lr0.01 NCM **0.222**（≈lr0.05，降 lr 對從零無幫助）、**預訓 lr0.01 NCM 0.440**（線性 0.140→0.362、BiC 0.202→0.440）——**同 lr 下預訓近乎翻倍,是整條弧線最大單一槓桿**。表徵級 stability–plasticity 階梯：從零會動 0.237 → 預訓會動 0.440 → 預訓凍結(§18)0.530（fine-tune 侵蝕預訓的全域可分性）。結果檔 `results_p13c_{fromscratch,pretrained}_lr01_resnet18.json`。
+
 **下一個要做 / Todo**
-- **P13c —（最高優先）廣泛預訓 init + 會動 fine-tune**：P12(讀出)+P13(batch 對比)+P13b(原型對比)三方向全撞同一上限 ~0.235;§18 frozen ImageNet NCM 0.530 vs 從零 0.237 的 2× 差距,最強指向**表徵起點/容量**是真正槓桿。做法:`make_resnet18_cifar` 改用 `torchvision.models.resnet18(weights=IMAGENET1K_V1)` 起步(stem 仍 CIFAR-adapt、但載入預訓權重)、會動 fine-tune,跑 class-IL（linear/NCM/cosine/BiC）量「預訓 init 能否同時拿 task-IL 累積 + class-IL 全域可分」。對照從零 0.237。注意 32×32 輸入與 ImageNet stem 的相容(可能要保留 7×7 stem 或只載 layer1-4)。
+- **P14 —（承 P13c，最高優先）保留 plasticity 同時不侵蝕預訓全域可分性（表徵級 stability–plasticity）**：P13c 揭示真正的開放問題＝fine-tune(會動→task-IL 累積)會把預訓的 class-IL 可分性從 0.530 侵蝕到 0.440。候選:(a) **分層 lr / 凍結淺層**（低層保預訓通用特徵、只 fine-tune 高層）;(b) **預訓特徵蒸餾錨**（用凍結預訓 backbone 當 teacher 對特徵做距離正則,類似 LwF 但錨在預訓表徵而非舊任務 logits）;(c) **參數高效 fine-tune（LoRA/adapter）**只動少量參數、保住預訓 body。目標:把預訓 fine-tune 的 class-IL 從 0.440 往 frozen 0.530 甚至更高推,同時保住 task-IL 累積。這條直接對應 LLM 終身微調的核心張力。
+- **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應。機制已確立,優先序中等。
 - **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
 - **（L4 方向，遠程）task-free + 開放世界 + 漂移 + 新奇偵測/容量增長**：P3 已在 numpy 端證明 task 邊界幾乎可免費移除，但 P8 的 backbone 版尚未驗證 task-free；開放世界/漂移/自主長容量完全未碰，這才是「真正的持續學習」(L4) 與 LLM 終身學習接軌處。

@@ -55,10 +55,17 @@ forward-transfer / retention 指標。
      class-IL，瓶頸是表徵起點/容量 → 直接做 P13c。
    - 結果檔 `results_p13b_derpp_proto{0,0.1,0.5,1.0}_resnet18.json`。
 
-3. **P13c：pretrained init + fine-tune（⬆ 升為最高優先）**
-   - P12/P13/P13b 三方向（讀出、batch 對比、原型對比）全撞 ~0.235 上限；§18 frozen ImageNet
-     NCM 0.530 vs 從零 0.237 的 2× 差距最強指向表徵起點/容量。
-   - 問題是從廣泛預訓起步後，continual fine-tune 能否兼具 task-IL 累積與 class-IL
+3. **P13c：pretrained init + fine-tune（✅ 已做，正面結果，見 report §29）**
+   - `--pretrained`（layer1-4 載 IMAGENET1K_V1）。**控 lr confound**：預訓 lr0.05 被打爛
+     （NCM 0.090），lr0.01 才行；故預訓與從零都用 lr0.01。
+   - 從零 lr0.01 NCM **0.222**（≈lr0.05，降 lr 對從零無幫助）、預訓 lr0.01 NCM **0.440**
+     （線性 0.140→0.362、BiC 0.202→0.440）——**同 lr 下預訓近乎翻倍 = 整條弧線最大槓桿**。
+   - 表徵級 stability–plasticity 階梯：從零會動 0.237 → 預訓會動 0.440 → 預訓凍結(§18) 0.530。
+     fine-tune 帶來 task-IL 累積但侵蝕預訓的全域可分性 → 下一步 P14。
+   - 結果檔 `results_p13c_{fromscratch,pretrained}_lr01_resnet18.json`。
+
+4. **P14（下一步）：保 plasticity 同時不侵蝕預訓可分性** — 分層 lr/凍結淺層、預訓特徵蒸餾錨、
+   LoRA/adapter PEFT。把預訓 fine-tune 的 class-IL 從 0.440 往 frozen 0.530 推,同時保 task-IL 累積。
      全域可分性。
 
 ---
