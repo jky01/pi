@@ -115,6 +115,8 @@ def main():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--anchor", type=float, default=0.0, help="base-KD anchor weight (0 = off)")
     p.add_argument("--qa", type=int, default=0, help="# QA-format variants per fact (0 = off)")
+    p.add_argument("--rounds", type=int, default=1,
+                   help="# self-replay generation rounds to union (coverage; >1 beats single-prompt ceiling)")
     p.add_argument("--temp", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -133,12 +135,16 @@ def main():
     for fact, q, keys in NOVEL_FACTS:
         texts.append(fact)
         with peft_model.disable_adapter():
-            texts += self_replay(peft_model, tok, fact, keys, args.variants, args.device)
+            for _ in range(args.rounds):   # 多輪生成取聯集 → 突破單 prompt ~6/fact 的上限
+                texts += self_replay(peft_model, tok, fact, keys, args.variants, args.device)
             if args.qa > 0:
                 qa = qa_replay(peft_model, tok, fact, keys, args.qa, args.device)
                 qa_kept += len(qa); texts += qa
     if args.qa > 0:
         print(f"[qa] kept {qa_kept} QA variants", flush=True)
+    n_raw = len(texts)
+    texts = list(dict.fromkeys(t.strip() for t in texts))  # 去重（保序),確保是真覆蓋而非重複
+    print(f"[dedup] {n_raw} -> {len(texts)} unique training texts", flush=True)
 
     anchor_cache = cache_base_logits(peft_model, tok, GENERAL_POOL, args.device) if args.anchor > 0 else None
     train(peft_model, tok, texts, anchor_cache, args.epochs, args.lr, args.anchor, args.temp,
