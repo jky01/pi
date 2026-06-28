@@ -168,6 +168,15 @@ anchor=1.0 跨 epochs：20→durable 0.50 / **侵蝕 0.00**、30→0.56/0.08、6
   (CE 學新 × base-anchor 限侵蝕 × 足量自我回放提品質 × 凍結 base)。
 下一步:馴服 durable 變異(更多變體/聯集)→ 接回 step 4b 完整系統 → scale + 序列流。
 
+**馴服變異嘗試（負面）**：試了「更多變體」與「多輪聯集」想收窄 durable 變異——都沒收窄。
+- 24 變體單 prompt:0.5B 單次只吐 ~6 個驗證變體（109 texts),durable 0.62(撞上限,不升)。
+- rounds=4（22 distinct/fact,368 texts):3 seeds 0.62/0.75/0.94,**mean 0.77、侵蝕 ~0.03**——
+  mean 比 16 變體(0.73)略升、侵蝕更低,但**變異沒收窄(0.62–0.94)**。
+- **結論:durable 變異是 0.5B 權重鞏固的內在性質,不是覆蓋率問題;變體工程不是馴服它的槓桿。**
+  真正槓桿:(a) **scale 1.5B+**(更可靠的事實整合 → 更高更穩),或 (b) **系統層接受它**——
+  step 4b 的檢索安全網已對全部事實 recall=1.0(零遺忘),鞏固 durable 只是「額外把熱門編譯進權重」
+  的加分,其變異不傷已部署系統。erosion 軸已穩(anchor),durable 軸要嘛 scale、要嘛靠檢索兜底。
+
 ## 6. 環境
 
 - `.venv/bin/python`：torch 2.12.1+cu130、transformers 5.12.1、peft 0.19.1、accelerate 1.14.0
