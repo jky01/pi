@@ -81,8 +81,11 @@
 
 - **P11 — 無 task-id 部署（class-IL）下的累積（已完成，§25，分支 `taskfree-accumulation`）**：把 P8b–P9b 的 task-IL 探針換成 class-IL（無 task id，100 類 argmax）。`run_backbone_transfer.py` 加 `--eval-mode classil`（+ NCM 原型讀出 `build_ncm`/`ncm_acc`，用 head/fc 的 forward hook 抽特徵）。resnet18、20 tasks、2 seeds：**DER++ task-IL 0.641 → class-IL 線性 0.177 / NCM 0.245**、Replay 0.564→0.107/0.170、Naive 0.214→0.031/0.062。發現:(1) task-id 撐住大部分數字;(2) 排序保留(DER++>Replay>Naive),骨幹必要但不充分;(3) NCM 在會動 backbone 上首次驗證可部分救回(~1.4–2× 線性、但只補一半);(4) 表徵累積本身活著(class-IL all-seen 探針 Δ replay/derpp 仍正且增長)→**瓶頸是 task-free 讀出/校準,不是表徵不累積**。設計注意:continual-vs-fresh 速度 Δ 在 class-IL 有 confound(fresh 無真競爭者),公平累積-速度比較仍用 task-IL 5-way。結果檔 `results_taskfree_{naive,replay,derpp}_resnet18.json`。
 
+- **P12 —（承 P11）會動表徵上比 NCM 更好的 task-free 讀出（已完成，§26，部分負面/修正歸因）**：在同一批訓練好的會動 backbone 上加兩個 post-hoc 讀出——`cosine_acc`（L2-normalize 頭權重+特徵）與 `bic_fit`/`bic_acc`（per-task-group affine,class-balanced 校準集擬合）。resnet18、100 類、2 seeds:DER++ 線性 0.172 / NCM 0.235 / cosine 0.154 / BiC 0.216;Replay 0.132/0.210/0.091/0.179。**BiC 修一部分偏置(+~25% 相對)但封頂在 NCM 之下;cosine 有害;沒有讀出接近 task-IL 0.641。** 修正 P11 歸因:NCM 已是最乾淨讀出(最終特徵空間重算新鮮原型),0.235 代表**特徵本身分不開 100 類＝全域跨任務可分性不足**,讀出補不了。結果檔 `results_p12_{naive,replay,derpp}_resnet18.json`。
+
 **下一個要做 / Todo**
-- **P12 —（承 P11，最高槓桿）會動表徵上「比 NCM 更好的 task-free 讀出/校準」**：P11 證明 class-IL 部署崩壞主因是 100-way 無偏讀出。候選:logit bias-correction(BiC)、cosine-normalized / weight-aligned head、原型校準、feature-replay 保持原型在漂移特徵空間的新鮮度。目標:把 DER++ 的 class-IL 0.245(NCM) 往 task-IL 0.641 推。harness 已有 `--eval-mode classil` + NCM,加新讀出即可。
+- **P13 —（承 P12，最高槓桿）逼出全域跨任務可分的表徵**：P12 證明 class-IL 缺口是表徵問題不是讀出問題。槓桿在訓練目標,不在 logit-space 校正。候選:(a) 跨 buffer 的 **supervised-contrastive**（拉近同類、推遠跨 task 異類,直接優化全域可分性）;(b) **全域 logit-adjusted / class-balanced CE**(訓練時就對抗 recency);(c) 回到 §18 的**廣泛預訓 init**(frozen ImageNet NCM 已 0.530)再 fine-tune。目標:把 DER++ class-IL 從 ~0.235 往 task-IL 0.641 推。harness `--eval-mode classil` + 四種讀出已備好,改的是訓練端。
+- **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
 - **（L4 方向，遠程）task-free + 開放世界 + 漂移 + 新奇偵測/容量增長**：P3 已在 numpy 端證明 task 邊界幾乎可免費移除，但 P8 的 backbone 版尚未驗證 task-free；開放世界/漂移/自主長容量完全未碰，這才是「真正的持續學習」(L4) 與 LLM 終身學習接軌處。

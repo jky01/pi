@@ -157,6 +157,65 @@ def ncm_acc(model, arch, protos, labels, Xt, yt):
     return (pred == yt).float().mean().item()
 
 
+# ---------------------------------------------------------------------------
+# P12：會動 backbone 上比 NCM 更好的 task-free 讀出（attack class-IL 部署缺口）。
+# P11 證明 class-IL 崩壞主因是 100-way 無偏讀出（線性頭 recency/magnitude bias）。
+# 兩個 post-hoc 讀出（不重訓 backbone）：
+#  (cos) cosine head：把分類頭權重與特徵都 L2-normalize 再內積→移除「近期類別 ‖W_c‖
+#        較大」的 magnitude bias（= weight-alignment / cosine classifier）。
+#  (bic) Bias-Correction：對每個 task-group 擬合一組 affine (α_t, β_t) 校正 logits，
+#        在一個 class-balanced 校準集（每類等量 exemplar）上以 CE 擬合（Wu+2019 BiC 的
+#        post-hoc 變體：一次校正所有 task-group 的相互偏置，而非只校正最新 task）。
+# ---------------------------------------------------------------------------
+def head_of(model, arch):
+    return model.head if arch == "smallcnn" else model.fc
+
+
+def cosine_acc(model, arch, Xt, yt, n_seen):
+    model.eval()
+    with torch.no_grad():
+        W = head_of(model, arch).weight[:n_seen]
+        z = penult_feat(model, normalize(Xt), arch)
+        logits = F.normalize(z, dim=1) @ F.normalize(W, dim=1).t()
+        pred = logits.argmax(1)
+    model.train()
+    return (pred == yt).float().mean().item()
+
+
+def balanced_cal_set(Xtr, ytr, tr_idx, per_class, device):
+    """class-balanced 校準集：每個類別取固定數量的訓練 exemplar（跨所有 task，含早期
+    已被遺忘的類別 → 暴露 recency bias）。供 BiC 擬合校正用，與 test 集無重疊。"""
+    xs, ys = [], []
+    for idx in tr_idx:
+        yk = ytr[idx]
+        for c in np.unique(yk):
+            take = idx[yk == c][:per_class]
+            xs.append(Xtr[take]); ys.append(ytr[take])
+    X = torch.from_numpy(np.concatenate(xs)).to(device)
+    y = torch.from_numpy(np.concatenate(ys)).to(device)
+    return X, y
+
+
+def bic_fit(cal_logits, cal_y, group, n_groups, steps=400, lr=0.05):
+    a = torch.ones(n_groups, device=cal_logits.device, requires_grad=True)
+    b = torch.zeros(n_groups, device=cal_logits.device, requires_grad=True)
+    opt = torch.optim.Adam([a, b], lr=lr)
+    for _ in range(steps):
+        corr = cal_logits * a[group] + b[group]
+        loss = F.cross_entropy(corr, cal_y)
+        opt.zero_grad(); loss.backward(); opt.step()
+    return a.detach(), b.detach()
+
+
+def bic_acc(model, Xt, yt, n_seen, a, b, group):
+    model.eval()
+    with torch.no_grad():
+        logits = model(normalize(Xt))[:, :n_seen] * a[group] + b[group]
+        pred = logits.argmax(1)
+    model.train()
+    return (pred == yt).float().mean().item()
+
+
 class ReservoirBuffer:
     """跨 task 的 reservoir replay buffer（存原始 [0,1] 影像 + 全域標籤 + 可選 logits，
     後者供 DER++ logit 蒸餾用，於插入時記錄當下模型輸出）。"""
@@ -369,12 +428,26 @@ def run_one(seed, n_tasks, classes_per_task, train_per_class, test_per_class,
     msg = (f"  seed{seed} retention: mean_final={retention['mean_final']:.3f} "
            f"mean_forgetting={retention['mean_forgetting']:.3f}")
     if eval_mode == "classil":
-        # NCM 原型讀出（task-free）：§11/§18 的 class-IL 修法，首次測在會動 backbone 上。
+        # task-free 讀出（皆 post-hoc，不重訓 backbone）：NCM(§11/§18) + P12 的 cosine/BiC。
         protos, labels = build_ncm(cont, arch, Xtr, ytr, tr_idx, device)
         final_ncm = [ncm_acc(cont, arch, protos, labels, Xt, yt) for (Xt, yt, tcls) in test_sets]
+        final_cos = [cosine_acc(cont, arch, Xt, yt, n_all) for (Xt, yt, tcls) in test_sets]
+        # BiC：在 class-balanced 校準集上擬合 per-task-group affine 校正。
+        cal_X, cal_y = balanced_cal_set(Xtr, ytr, tr_idx, 20, device)
+        with torch.no_grad():
+            cal_logits = cont(normalize(cal_X))[:, :n_all]
+        group = torch.tensor([c // classes_per_task for c in range(n_all)], device=device)
+        a, b = bic_fit(cal_logits, cal_y, group, n_tasks)
+        final_bic = [bic_acc(cont, Xt, yt, n_all, a, b, group) for (Xt, yt, tcls) in test_sets]
         retention["final_ncm"] = final_ncm
         retention["mean_final_ncm"] = float(np.mean(final_ncm))
-        msg += f" | class-IL linear={retention['mean_final']:.3f} NCM={retention['mean_final_ncm']:.3f}"
+        retention["final_cos"] = final_cos
+        retention["mean_final_cos"] = float(np.mean(final_cos))
+        retention["final_bic"] = final_bic
+        retention["mean_final_bic"] = float(np.mean(final_bic))
+        msg += (f" | class-IL linear={retention['mean_final']:.3f} "
+                f"NCM={retention['mean_final_ncm']:.3f} cos={retention['mean_final_cos']:.3f} "
+                f"BiC={retention['mean_final_bic']:.3f}")
     print(msg, flush=True)
     return dict(per_task=per_task, retention=retention)
 
@@ -626,7 +699,10 @@ def main():
           f"(forward-transfer Δ@40 overall {np.mean([d for *_, d in rows]):+.3f}) ===")
     if args.eval_mode == "classil":
         ncm = np.mean([r["mean_final_ncm"] for r in retentions])
-        print(f"    class-IL final (NO task id): linear head {mf:.3f} | NCM prototype {ncm:.3f}")
+        cos = np.mean([r["mean_final_cos"] for r in retentions])
+        bic = np.mean([r["mean_final_bic"] for r in retentions])
+        print(f"    class-IL final (NO task id): linear {mf:.3f} | NCM {ncm:.3f} | "
+              f"cosine {cos:.3f} | BiC {bic:.3f}")
 
     with open(args.output, "w") as fp:
         json.dump(dict(checkpoints=CHECKPOINTS, continual_mode=args.continual_mode,

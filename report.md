@@ -68,6 +68,8 @@
 
 **(Y) P11：拔掉 task-id——「持續變強」在無 task-id 部署下天花板低很多,但表徵累積與工具箱排序都還在（誠實的硬牆量化）**（§25）。P8b–P9b 全用 **task-IL 探針**（推論時被告知 task id、只在該 task 5 類裡比）量「持續變強」。P11 把評估換成 **class-IL（無 task id、在已看過的所有類別裡 argmax）**——naive/replay/derpp 的模型本來就單頭 task-free,只有指標用到 task-id。**結果(resnet18、100 類、2 seeds、亂猜 0.01)**:拔掉 task-id 後最強的 **DER++ 從 task-IL 0.641 崩到 class-IL 線性頭 0.177 / NCM 0.245**（相對掉 ~62–72%）;Replay 0.564→0.107/0.170;Naive 0.214→0.031/0.062。**四個發現**:(1) **task-id 在撐著大部分數字**,P8b–P9b 的「持續變強」確有相當部分是 task-id-given 的測量;(2) **但排序完全保留**(class-IL 仍 DER++>Replay>Naive),抗遺忘骨幹**必要但不充分**、非無效;(3) **NCM 在會動 backbone 上首次驗證可部分救回**(穩定 ~1.4–2× 線性頭),§11/§18 的原型修法遷移成立、但**只補一半**(0.245≪0.641);(4) **表徵累積本身活著**——class-IL all-seen 探針 Δ 對 replay/derpp 保持正且 early→late 增長(derpp +0.243、+0.073→+0.410),continual 面對 5k 真競爭者仍贏 fresh,**部署崩壞主因是 100-way 的 task-free 讀出/校準,不是表徵不累積**。**定位**:把策略質疑量化成下一道 well-posed 的牆——**會動表徵上比 NCM 更好的 task-free 讀出/校準**(bias-correction / cosine head / 原型校準 / feature-replay)。方向(stability×plasticity→累積)沒錯,但要對得起「可持續學習」必須從「給 task-id」推進到「無 task-id 部署」,那裡還有大缺口。結果檔 `results_taskfree_{naive,replay,derpp}_resnet18.json`(分支 `taskfree-accumulation`)。
 
+**(Z) P12：更好的 task-free 讀出有上限——class-IL 缺口是表徵問題、不是讀出問題（修正 P11 歸因）**（§26）。P11 把 class-IL 崩壞歸因於 100-way 無偏讀出。P12 在同一批訓練好的會動 backbone 上加兩個 post-hoc 讀出測這假設:**cosine head**(L2-normalize 頭權重+特徵,移除 magnitude bias)與 **BiC**(per-task-group affine,在 class-balanced 校準集上校正 logits)。**結果(resnet18、100 類、2 seeds)**——class-IL final(同模型只換讀出):DER++ 線性 0.172 / **NCM 0.235** / cosine 0.154 / BiC 0.216;Replay 0.132 / **0.210** / 0.091 / 0.179。**三個發現**:(1) **BiC 修了一部分偏置**(replay/derpp +~0.045、約 +25% 相對),證明 task-group 間偏置真實可校正,**但封頂在 NCM 之下**;(2) **cosine 反而有害**(derpp 0.172→0.154)——frozen-feature 成立的 magnitude-bias 假設在會動 from-scratch backbone 上不成立,正規化掉 magnitude 反丟訊號;(3) **沒有任何讀出接近 task-IL 0.641**,天花板就在 NCM ~0.235。**修正後的乾淨結論**:NCM 已是「把讀出做到最乾淨」(最終特徵空間重算新鮮原型),它只有 0.235 代表**會動 backbone 的特徵本身就分不開 100 類**——這是**全域跨任務可分性不足**的表徵問題,不是讀出/校準能補的。task-IL「持續變強」優化的是每個 task 內的 5-way 區辨,沒建出全域 100-way 可分的特徵(對照 §18 frozen ImageNet NCM 0.530=廣泛預訓建出可分特徵)。**下一道牆從「更好的讀出」移正成「更好的特徵」**(跨 buffer supervised-contrastive / 全域 logit-adjusted 訓練 / 廣泛預訓 init)。結果檔 `results_p12_{naive,replay,derpp}_resnet18.json`。
+
 ---
 
 ## 1. 目的
@@ -1177,7 +1179,41 @@ P11 把策略問題量化成一個尖銳、well-posed 的下一道牆:**會動�
 
 ---
 
-## 26. 結論
+## 26. 更好的 task-free 讀出有上限：class-IL 缺口主因是表徵、不是讀出（P12）
+
+**為什麼**：P11 把 class-IL 部署崩壞**歸因於 100-way 無偏讀出**（線性頭 recency/magnitude bias），並猜 NCM 之外更好的讀出能把 DER++ 的 0.245 往 task-IL 0.641 推。P12 直接測這個假設：在**同一批已訓練好的會動 backbone** 上,加兩個 post-hoc 讀出（不重訓）——**cosine head**（把頭權重與特徵 L2-normalize 再內積,移除「近期類別 ‖W_c‖ 較大」的 magnitude bias）與 **BiC**（對每個 task-group 擬合 affine (α_t,β_t),在 class-balanced 校準集上以 CE 校正 logits;Wu+2019 的 post-hoc 變體）。
+
+**做法**：`run_backbone_transfer.py --eval-mode classil` 的 retention 區塊加 `cosine_acc` / `bic_fit`+`bic_acc`（校準集取自每類 20 個訓練 exemplar,與 test 無重疊）。同 P11:resnet18、100 類、2 seeds。
+
+### 26.1 結果：BiC 有幫助但封頂在 NCM 之下；cosine 反而有害
+
+class-IL（無 task id）final retention,四種讀出（同一訓練模型,只換讀出 → 此比較不受 GPU 訓練非決定性影響）：
+
+| 機制 | 線性頭 | NCM | cosine | BiC | (Task-IL 參照) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Naive | 0.031 | 0.067 | 0.032 | 0.025 | 0.214 |
+| Replay | 0.132 | **0.210** | 0.091 | 0.179 | 0.564 |
+| **DER++** | 0.172 | **0.235** | 0.154 | 0.216 | **0.641** |
+
+- **BiC 確實修了一部分 bias**:replay 0.132→0.179、derpp 0.172→0.216（約 +25% 相對),證明 task-group 間的偏置是真的、可校正。但**封頂在 NCM 之下**（0.216 < 0.235）。
+- **cosine head 反而有害**:replay 0.132→0.091、derpp 0.172→0.154。「近期類別權重範數較大」這個在 frozen-feature class-IL 成立的 magnitude-bias 假設,在**會動 from-scratch backbone 上不成立**——把 magnitude 正規化掉反而丟失有用訊號（被遺忘的舊類權重**方向**也已退化,cosine 救不回方向、又賠掉 magnitude）。負面結果。
+- **沒有任何 post-hoc 讀出接近 task-IL**:最好的 NCM 0.235 ≪ 0.641。讀出修法的天花板就在 ~0.235 附近。
+
+### 26.2 解讀：修正 P11 的歸因——瓶頸是「全域跨任務可分性」,讀出只能撿邊角
+
+P12 **部分推翻 P11 的歸因**。NCM 是用**最終特徵空間**裡的 exemplar 重算原型（原型是新鮮的、無 magnitude bias、無 stale），它已是「把讀出做到最乾淨」的代表;它只有 0.235,代表**現在這個會動 backbone 的特徵空間本身就無法把 100 類分開**——這不是讀出/校準能補的,是**表徵的全域跨任務可分性不足**。BiC/cosine 這些 logit-space 校正只能撿線性頭的偏置邊角(BiC +0.04)、甚至幫倒忙(cosine),無法製造特徵裡不存在的可分性。
+
+這和 P11 的發現(4)（表徵累積「活著」、class-IL 探針 Δ 仍正）並不矛盾,而是把它說精確:**task-IL「持續變強」優化的是「每個 task 內的 5-way 區辨」,它並沒有建出「全域 100-way 可分」的特徵。** 每個 task 局部學得好（探針正）,但跨 task 的類別在特徵空間互相重疊/漂移,所以任何讀出都分不好。對照 §18:frozen ImageNet 特徵 NCM 達 0.530,正是因為大規模預訓建出了**廣泛可分**的特徵;從零的 CIFAR 會動 backbone 沒有。
+
+### 26.3 P12 對方向的修正
+
+下一道牆從「更好的讀出」**移正成「更好的特徵」**:要讓 task-free 部署接近 task-IL,槓桿不在 logit-space 校準(BiC/cosine/NCM 已封頂 ~0.24),而在**讓訓練目標逼出全域跨任務可分的表徵**——例如跨 buffer 的 supervised-contrastive / 全域 logit-adjusted 訓練、或回到 §18 的廣泛預訓 init。**乾淨結論:class-IL 部署缺口是表徵問題,不是讀出問題;post-hoc 讀出修法有真實但有限的價值(BiC>線性、NCM 最佳、cosine 有害),天花板遠低於 task-IL。**
+
+**結果檔**：`results_p12_{naive,replay,derpp}_resnet18.json`（分支 `taskfree-accumulation`）。
+
+---
+
+## 27. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -1209,6 +1245,7 @@ P11 把策略問題量化成一個尖銳、well-posed 的下一道牆:**會動�
 28. **無 buffer 累積：函數蒸餾取代不了真實樣本（§23，P9，負面結果）**。P8b–P8d 的累積全靠 replay buffer；P9 用 **LwF**（=DER++ 的蒸餾項但不存樣本，對當前資料經凍結舊模型蒸餾舊類 logits）做乾淨 ablation。結果 buffer-free **完全失敗**：naive Δ@40≈0、**LwF 比 naive 更差（-0.089，λ=0.1/1.0 皆然）**，continual 卡在亂猜(~0.20)；型態是負向遷移**隨經驗惡化**（蒸餾錨點累積→逐步凍結 backbone），與 replay 的正向增長相反。**乾淨結論：DER++ 兩成分中，真正的引擎是 replay-CE on 真實樣本（同時保可塑性＋推正向遷移）；logit 蒸餾單獨用反而凍結。§20–§22 的「持續變強」引擎是 buffer 裡的真實樣本，蒸餾只是放大器。** caveat：用 DER 式 logit-MSE（為對齊 DER++），非經典 softmax-KD-溫度；但後者無產生正向遷移的機制、最好也只 ≈naive。定位：L3（會累積）達成但仍架在 replay buffer 拐杖上，buffer-free 累積是最明確的未解開放問題。
 29. **無 buffer 累積其實可達，且 P9 的 caveat 被自己推翻（§24，P9b，正面結果）**。P9 把 buffer-free 累積定位成硬牆，並猜測經典 softmax-KD「最好也只 ≈naive」。P9b 試兩條 P9 沒做的 buffer-free 路，**兩條都拿到正向且隨經驗增長的遷移**：(a) **參數隔離 PNN**（新任務讀舊任務凍結特徵）Δ@40 **+0.101**、**架構性零遺忘**、mean_final 0.501，代價是容量隨 task 線性成長 + 推論需 task-id 路由；(b) **softmax-KD + 溫度**（同 P9 設定，只把 logit-MSE 換成 soften-分布 KL）Δ@40 **+0.089**、early +0.010→late +0.159（**GROWS**）、mean_final **0.357 ≫ 亂猜 0.20 也 > naive 0.214**——**直接推翻 P9 的 caveat**：softmax-KD 不但不 ≈naive、還明顯正向且不凍結。**修正後的乾淨結論**：P9 的「蒸餾單獨用必凍結」是 **DER 式 logit-MSE 的特例**（各向同性鎖死所有 logit），不是蒸餾通則；換成 well-conditioned 的 softmax-KD（約束機率分布 + 溫度放軟）就保住可塑性、buffer-free 也能累積。**buffer-free 累積從硬牆降級為有路可走的牆**；真實樣本唯一仍不可取代之處，收斂成「buffer-free 同時拿到高絕對 retention + 後向遷移」——兩條 buffer-free 路的 Δ@40 與 mean_final 都仍低於 buffered replay(+0.180/0.564)/DER++(+0.268/0.641)，且只有 buffered 法做到負 forgetting（後向遷移）。
 30. **拔掉 task-id：「持續變強」天花板低很多,但表徵累積與工具箱排序都還在（§25，P11，誠實硬牆量化）**。P8b–P9b 的累積全用 task-IL 探針（給 task id）量;P11 改用 class-IL（無 task id、100 類 argmax）。**最強的 DER++ 從 task-IL 0.641 崩到 class-IL 0.177(線性)/0.245(NCM)**(相對掉 ~62–72%),Replay 0.564→0.107/0.170,Naive 0.214→0.031/0.062。但:(1) class-IL 下**排序完全保留**(DER++>Replay>Naive)——抗遺忘骨幹必要但不充分、非無效;(2) **NCM 在會動 backbone 上首次驗證可部分救回**(穩定 ~1.4–2× 線性頭),§11/§18 原型修法遷移成立但只補一半(0.245≪0.641);(3) **表徵累積本身活著**——class-IL all-seen 探針 Δ 對 replay/derpp 保持正且 early→late 增長(derpp +0.243),continual 面對 5k 真競爭者仍贏 fresh。**乾淨結論**:「持續變強」是真的,但**相當部分由 task-id 撐住**;部署崩壞主因不是表徵不累積,而是 **100-way 的 task-free 讀出/校準**(線性頭 recency bias、NCM 只部分修)。下一道 well-posed 的牆＝**會動表徵上比 NCM 更好的 task-free 讀出**。這量化了策略檢討:方向(stability×plasticity→累積)沒錯,但「可持續學習」要從「給 task-id 的 task-IL」推進到「無 task-id 的 class-IL 部署」,那裡仍有大缺口。
+31. **更好的 task-free 讀出有上限,class-IL 缺口是表徵問題不是讀出問題（§26，P12，修正 P11 歸因）**。P11 把 class-IL 崩壞歸因於讀出;P12 在同一批會動 backbone 上加 **cosine head** 與 **BiC** 兩個 post-hoc 讀出檢驗。class-IL final(同模型只換讀出):DER++ 線性 0.172 / NCM 0.235 / cosine 0.154 / BiC 0.216。**BiC 修了一部分偏置(+~25% 相對)但封頂在 NCM 之下;cosine 反而有害(magnitude-bias 假設在會動 from-scratch backbone 不成立);沒有讀出接近 task-IL 0.641。** NCM 已是最乾淨讀出(最終特徵空間重算新鮮原型),它只有 0.235 → **會動 backbone 的特徵本身就分不開 100 類,是全域跨任務可分性不足,讀出補不了。** task-IL「持續變強」只優化每個 task 內的 5-way 區辨、沒建出全域可分特徵(對照 §18 frozen ImageNet NCM 0.530)。**修正方向:下一道牆從「更好的讀出」移正成「更好的特徵」**——跨 buffer supervised-contrastive / 全域 logit-adjusted 訓練 / 廣泛預訓 init,才是把 task-free 部署推近 task-IL 的槓桿。
 
 ---
 
