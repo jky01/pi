@@ -79,7 +79,10 @@
 
 - **P9b — 無 buffer 累積的其他機制（已完成，§24，正面結果）**：P9 只證明「DER 式 logit-MSE 蒸餾(LwF)」不行；P9b 試另兩條 buffer-free 路，**兩條都成功**。實作在 `run_backbone_transfer.py`：(a) `--continual-mode pnn`（PNN 式參數隔離，smallcnn columns + lateral）→ Δ@40 **+0.101**、**mean_forgetting 0.000**、mean_final 0.501（介於 smallcnn naive −0.044 與 replay +0.174 之間；代價＝容量隨 task 線性成長 + 推論需 task-id 路由）；(b) `--continual-mode lwf_kd --lwf-temp 2.0`（經典 softmax-KD，resnet18）→ Δ@40 **+0.089**、early +0.010→late +0.159（GROWS）、mean_final **0.357**（≫亂猜 0.20、>naive 0.214，**不凍結**）——**推翻 P9 caveat**：「蒸餾必凍結」只是 DER 式 logit-MSE 的特例，softmax-KD 保住可塑性。兩條都仍低於 buffered replay/DER++（真實樣本仍獨佔「高絕對 retention + 後向遷移」）。結果檔 `results_p9b_{pnn_smallcnn,lwfkd_resnet18}.json`。(c) 生成式回放搬到會動 backbone 尚未做（最重、優先序低）。
 
+- **P11 — 無 task-id 部署（class-IL）下的累積（已完成，§25，分支 `taskfree-accumulation`）**：把 P8b–P9b 的 task-IL 探針換成 class-IL（無 task id，100 類 argmax）。`run_backbone_transfer.py` 加 `--eval-mode classil`（+ NCM 原型讀出 `build_ncm`/`ncm_acc`，用 head/fc 的 forward hook 抽特徵）。resnet18、20 tasks、2 seeds：**DER++ task-IL 0.641 → class-IL 線性 0.177 / NCM 0.245**、Replay 0.564→0.107/0.170、Naive 0.214→0.031/0.062。發現:(1) task-id 撐住大部分數字;(2) 排序保留(DER++>Replay>Naive),骨幹必要但不充分;(3) NCM 在會動 backbone 上首次驗證可部分救回(~1.4–2× 線性、但只補一半);(4) 表徵累積本身活著(class-IL all-seen 探針 Δ replay/derpp 仍正且增長)→**瓶頸是 task-free 讀出/校準,不是表徵不累積**。設計注意:continual-vs-fresh 速度 Δ 在 class-IL 有 confound(fresh 無真競爭者),公平累積-速度比較仍用 task-IL 5-way。結果檔 `results_taskfree_{naive,replay,derpp}_resnet18.json`。
+
 **下一個要做 / Todo**
+- **P12 —（承 P11，最高槓桿）會動表徵上「比 NCM 更好的 task-free 讀出/校準」**：P11 證明 class-IL 部署崩壞主因是 100-way 無偏讀出。候選:logit bias-correction(BiC)、cosine-normalized / weight-aligned head、原型校準、feature-replay 保持原型在漂移特徵空間的新鮮度。目標:把 DER++ 的 class-IL 0.245(NCM) 往 task-IL 0.641 推。harness 已有 `--eval-mode classil` + NCM,加新讀出即可。
 - **（可選）P9c — 把 PNN 放大到 resnet18 + 結合 softmax-KD**：如 P8b→P8c 量容量效應；或 PNN + softmax-KD 混合逼近 buffered 上界。機制已確立，優先序中等。
 - **（可選）P8e — α / buffer-size / lr 掃描與更長 stream**：刻畫甜蜜點邊界與正向遷移上限。機制已確立，優先序中等。
 - **（L4 方向，遠程）task-free + 開放世界 + 漂移 + 新奇偵測/容量增長**：P3 已在 numpy 端證明 task 邊界幾乎可免費移除，但 P8 的 backbone 版尚未驗證 task-free；開放世界/漂移/自主長容量完全未碰，這才是「真正的持續學習」(L4) 與 LLM 終身學習接軌處。

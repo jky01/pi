@@ -66,6 +66,8 @@
 
 **(X) P9b：無 buffer 累積其實可達——參數隔離與 softmax-KD 兩條路都拿到正向遷移（正面結果，修正 P9 悲觀定位）**（§24）。P9 只證明「DER 式 logit-MSE 蒸餾」buffer-free 會凍結；P9b 試另外兩條 buffer-free 路線，**兩條都成功**。**(a) 參數隔離（PNN 式）**：每 task 一個 column、新 column 橫向讀取前序凍結 column 的特徵（`--continual-mode pnn`，smallcnn、20 tasks、2 seeds）——**Δ@40 +0.101**（buffer-free！介於 smallcnn naive −0.044 與 buffered replay +0.174 之間）、**mean_forgetting 0.000（架構性零遺忘）**、mean_final 0.501，per-task 正向遷移隨 task 數累積放大（late tasks Δ 達 +0.17~+0.23）。代價：容量隨 task 線性成長 + 推論需 task-id 路由到對的 column。**(b) 經典 softmax-KD + 溫度**（`--continual-mode lwf_kd`，resnet18、對齊 P9 設定）——**直接推翻 P9 的 caveat**：softmax-KD **不凍結**（mean_final **0.357** ≫ 亂猜 0.20、且優於 naive 0.214），且**拿到正向且隨經驗增長的 buffer-free 遷移**（**Δ@40 +0.089**，early +0.010 → late +0.159，cumulative GROWS），對比 logit-MSE LwF 的 −0.089（凍結）。**乾淨結論修正**：P9 的「蒸餾單獨用必凍結」是 **DER 式 logit-MSE 的特例**，不是蒸餾通則——換成 well-conditioned 的 softmax-KD（soften 分布、有溫度）就既不凍結、又能 buffer-free 累積。**buffer-free 累積不是硬牆**：可由 (a) 容量擴張 或 (b) 軟函數蒸餾達成；兩者都仍低於 buffered replay/DER++（+0.180/+0.268、mean_final 0.564/0.641），真正不可取代的仍是真實樣本帶來的更高絕對 retention + 後向遷移。結果檔 `results_p9b_pnn_smallcnn.json`、`results_p9b_lwfkd_resnet18.json`。
 
+**(Y) P11：拔掉 task-id——「持續變強」在無 task-id 部署下天花板低很多,但表徵累積與工具箱排序都還在（誠實的硬牆量化）**（§25）。P8b–P9b 全用 **task-IL 探針**（推論時被告知 task id、只在該 task 5 類裡比）量「持續變強」。P11 把評估換成 **class-IL（無 task id、在已看過的所有類別裡 argmax）**——naive/replay/derpp 的模型本來就單頭 task-free,只有指標用到 task-id。**結果(resnet18、100 類、2 seeds、亂猜 0.01)**:拔掉 task-id 後最強的 **DER++ 從 task-IL 0.641 崩到 class-IL 線性頭 0.177 / NCM 0.245**（相對掉 ~62–72%）;Replay 0.564→0.107/0.170;Naive 0.214→0.031/0.062。**四個發現**:(1) **task-id 在撐著大部分數字**,P8b–P9b 的「持續變強」確有相當部分是 task-id-given 的測量;(2) **但排序完全保留**(class-IL 仍 DER++>Replay>Naive),抗遺忘骨幹**必要但不充分**、非無效;(3) **NCM 在會動 backbone 上首次驗證可部分救回**(穩定 ~1.4–2× 線性頭),§11/§18 的原型修法遷移成立、但**只補一半**(0.245≪0.641);(4) **表徵累積本身活著**——class-IL all-seen 探針 Δ 對 replay/derpp 保持正且 early→late 增長(derpp +0.243、+0.073→+0.410),continual 面對 5k 真競爭者仍贏 fresh,**部署崩壞主因是 100-way 的 task-free 讀出/校準,不是表徵不累積**。**定位**:把策略質疑量化成下一道 well-posed 的牆——**會動表徵上比 NCM 更好的 task-free 讀出/校準**(bias-correction / cosine head / 原型校準 / feature-replay)。方向(stability×plasticity→累積)沒錯,但要對得起「可持續學習」必須從「給 task-id」推進到「無 task-id 部署」,那裡還有大缺口。結果檔 `results_taskfree_{naive,replay,derpp}_resnet18.json`(分支 `taskfree-accumulation`)。
+
 ---
 
 ## 1. 目的
@@ -1137,7 +1139,45 @@ smallcnn ladder（PNN 的同架構對照，取自 P8b）：
 
 ---
 
-## 25. 結論
+## 25. 無 task-id 的部署：會動 backbone 的「持續變強」在 class-IL 下保住多少？（P11）
+
+**為什麼**：P8b–P9b 的「持續變強」（正向遷移 + retention）全部用 **task-IL 探針**量——推論時**被告知現在是哪個 task**，只在該 task 的 5 個類別欄位裡比。但真正的可持續/終身學習,部署時通常**不知道 task id**。所以要問:把 task-id 拔掉、改成 **class-IL（在「目前看過的所有類別」裡 argmax，無 task id）**,那套累積還剩多少?這是策略檢討（見對話）點名的最高槓桿缺口——「持續變強」是不是被 task-id 撐住的假象?
+
+**做法**：同 P8d 框架（resnet18、Split-CIFAR-100、20 tasks=100 類、2 seeds、CUDA），`run_backbone_transfer.py` 加 `--eval-mode classil`。關鍵體認:naive/replay/derpp 的模型**本來就是單頭、訓練時 task-free**,task-id 只出現在**評估指標**裡,所以拔 task-id＝把評估換成 class-IL。兩種 task-free 讀出:**線性頭**(§11/§18 證明有 recency bias)與 **NCM 原型**(在**最終會動 backbone** 的特徵空間算類均值——§11/§18 的修法,**首次在會動 backbone 上測**)。
+
+**設計修正(誠實)**:原想用 continual-vs-fresh 的學習速度 Δ 當 task-free 累積指標,但這在 class-IL 下**有 confound**——fresh(只學 task k)的舊類 logits 是隨機/微弱的、不構成競爭,continual 卻要壓過它**真的訓練過**的 5k 個舊類(真競爭者),所以 fresh 在 class-IL 反而占便宜。**公平的累積-速度比較本就該在同一子問題上比＝task-IL 5-way(P8b–d 已答:表徵會累積)。** 故 P11 的 headline 是被 task-id 真正遮住的那一軸:**部署 retention**。
+
+### 25.1 結果：拔掉 task-id，最強的法也從 0.64 崩到 0.18（NCM 救到 0.25）
+
+class-IL（無 task id）final retention，resnet18、100 類、2 seeds（亂猜=0.01）：
+
+| 機制 | class-IL 線性頭 | class-IL NCM | mean_forgetting | (Task-IL 參照, P8d) |
+| :--- | :---: | :---: | :---: | :---: |
+| Naive | 0.031 | 0.062 | 0.435 | 0.214 |
+| Replay | 0.107 | 0.170 | 0.444 | 0.564 |
+| **DER++** | **0.177** | **0.245** | 0.448 | **0.641** |
+
+附帶（class-IL all-seen continual-vs-fresh 探針 Δ@40，**有 confound、只看方向**）：naive −0.015、replay +0.113、**derpp +0.243**，且都 early→late GROWS（derpp +0.073→+0.410）。
+
+### 25.2 解讀：四個發現
+
+1. **task-id 在撐著大部分數字——這道牆是真的。** 拔掉 task-id,最強的 DER++ 從 task-IL 0.641 崩到 class-IL **0.177（線性）/ 0.245（NCM）**(相對掉 ~62–72%)。P8b–P9b 的「持續變強」**確實有相當部分是 task-id-given 的測量**;策略檢討的質疑成立。
+
+2. **但工具箱方向沒錯:排序完全保留、機制仍有用。** class-IL 下依然 **DER++ > Replay > Naive**(線性 0.177>0.107>0.031;NCM 0.245>0.170>0.062)。replay/DER++ 抗遺忘骨幹在 task-free 部署下**仍單調有用**,只是天花板低很多——它們是**必要但不充分**,不是無效。
+
+3. **NCM 在會動 backbone 上部分救得回來(首次驗證)。** NCM 對三個機制都穩定 ~1.4–2× 於線性頭(derpp 0.177→0.245、replay 0.107→0.170、naive 0.031→0.062)。§11/§18 的「無偏原型讀出修 class-IL recency bias」**確實遷移到會動 backbone**;但只是**部分修法**,**沒有**把缺口補到 task-IL(0.245 ≪ 0.641)。(注:§18 frozen ImageNet 特徵 NCM 達 0.530,本實驗從零會動 backbone 只 0.245——但這差距同時被「ImageNet 預訓 vs 從零」confound,不能純歸因於表徵漂移;留作開放假設。)
+
+4.  **表徵累積本身其實活著,瓶頸在 task-free 讀出。** class-IL all-seen 探針 Δ 對 replay/derpp **保持正且隨經驗增長**(derpp +0.243、early→late +0.073→+0.410):continual 即使面對 5k 個**真**競爭者、仍贏過只有隨機競爭者的 fresh——這(雖 magnitude confounded)是表徵真的更好的方向性證據。**所以部署崩壞主因不是表徵不會累積,而是 100 類的 task-free 讀出/校準**(線性頭 recency/magnitude bias;NCM 只部分修)。
+
+### 25.3 P11 對「離真正 CL 多遠」的定位
+
+P11 把策略問題量化成一個尖銳、well-posed 的下一道牆:**會動表徵上的 task-free 讀出/校準**。「持續變強」(P8b–d)是真的,但**在無 task-id 部署下天花板低很多**;表徵會累積、機制排序也對,卡住的是 100-way 的無偏讀出。NCM 是部分解,**比 NCM 更好的 task-free 讀出**(bias-correction / cosine-normalized head / 原型校準 / feature-replay 保持原型新鮮度)是最該打的下一步。這也回答了對話裡的策略質疑:**方向(stability×plasticity→累積)沒錯,但要對得起「可持續學習」,必須把成果從「給 task-id 的 task-IL」推進到「無 task-id 的 class-IL 部署」——目前那裡還有一道由讀出/校準撐起的大缺口。**
+
+**結果檔**：`results_taskfree_{naive,replay,derpp}_resnet18.json`（分支 `taskfree-accumulation`）。
+
+---
+
+## 26. 結論
 
 1.  **資料流設計**：pi 數位序列能為持續學習提供可重現、非重複的數據流，但「預測下一位」本質不可學，必須改用「窗口求和分桶 + 標籤隨機排列」。
 2.  **標籤衝突之解決**：在 80 個任務的超長標籤重映射下，必須採用多頭結構（Task-IL）方能打破單輸出頭帶來的數學矛盾，使 HippocampalReplayEWC、SurpriseReplayEWC、ReplayEWC、Experience Replay 與 EWC 的全域平均準確率顯著攀升至 50% 以上，其中 HippocampalReplayEWC 已提升到 86% 以上。
@@ -1168,6 +1208,7 @@ smallcnn ladder（PNN 的同架構對照，取自 P8b）：
 27. **穩定–可塑性甜蜜點：DER++ 同時放大正向遷移與 retention（§22，P8d）**。把會動 ResNet18 的維持機制從 plain Replay 換成 DER++（replay CE + logit 蒸餾，α=0.5），同一框架量兩軸。DER++ **兩個軸都更好、無 tradeoff**：正向遷移 Δ@40 **+0.268**（replay +0.180）、late +0.378（+0.292）；retention mean_final **0.641**（0.564）；兩者 mean_forgetting 皆為負＝**backward transfer**（舊任務後來變更好），DER++ 更明顯(-0.033)。logit 蒸餾不但沒拖慢新任務（無可塑性稅），反而把舊函數壓進更條件良好的共享表徵、讓新任務學更快。**§10 的「最佳抗遺忘法」在會動 backbone 上升級成「最佳累積學習法」。** 「持續變強」配方至此完整：表徵持續建構 × replay 保可塑性 × DER++ 函數蒸餾 × 隨容量放大，統一了 replay/§9/§10 三條主線。
 28. **無 buffer 累積：函數蒸餾取代不了真實樣本（§23，P9，負面結果）**。P8b–P8d 的累積全靠 replay buffer；P9 用 **LwF**（=DER++ 的蒸餾項但不存樣本，對當前資料經凍結舊模型蒸餾舊類 logits）做乾淨 ablation。結果 buffer-free **完全失敗**：naive Δ@40≈0、**LwF 比 naive 更差（-0.089，λ=0.1/1.0 皆然）**，continual 卡在亂猜(~0.20)；型態是負向遷移**隨經驗惡化**（蒸餾錨點累積→逐步凍結 backbone），與 replay 的正向增長相反。**乾淨結論：DER++ 兩成分中，真正的引擎是 replay-CE on 真實樣本（同時保可塑性＋推正向遷移）；logit 蒸餾單獨用反而凍結。§20–§22 的「持續變強」引擎是 buffer 裡的真實樣本，蒸餾只是放大器。** caveat：用 DER 式 logit-MSE（為對齊 DER++），非經典 softmax-KD-溫度；但後者無產生正向遷移的機制、最好也只 ≈naive。定位：L3（會累積）達成但仍架在 replay buffer 拐杖上，buffer-free 累積是最明確的未解開放問題。
 29. **無 buffer 累積其實可達，且 P9 的 caveat 被自己推翻（§24，P9b，正面結果）**。P9 把 buffer-free 累積定位成硬牆，並猜測經典 softmax-KD「最好也只 ≈naive」。P9b 試兩條 P9 沒做的 buffer-free 路，**兩條都拿到正向且隨經驗增長的遷移**：(a) **參數隔離 PNN**（新任務讀舊任務凍結特徵）Δ@40 **+0.101**、**架構性零遺忘**、mean_final 0.501，代價是容量隨 task 線性成長 + 推論需 task-id 路由；(b) **softmax-KD + 溫度**（同 P9 設定，只把 logit-MSE 換成 soften-分布 KL）Δ@40 **+0.089**、early +0.010→late +0.159（**GROWS**）、mean_final **0.357 ≫ 亂猜 0.20 也 > naive 0.214**——**直接推翻 P9 的 caveat**：softmax-KD 不但不 ≈naive、還明顯正向且不凍結。**修正後的乾淨結論**：P9 的「蒸餾單獨用必凍結」是 **DER 式 logit-MSE 的特例**（各向同性鎖死所有 logit），不是蒸餾通則；換成 well-conditioned 的 softmax-KD（約束機率分布 + 溫度放軟）就保住可塑性、buffer-free 也能累積。**buffer-free 累積從硬牆降級為有路可走的牆**；真實樣本唯一仍不可取代之處，收斂成「buffer-free 同時拿到高絕對 retention + 後向遷移」——兩條 buffer-free 路的 Δ@40 與 mean_final 都仍低於 buffered replay(+0.180/0.564)/DER++(+0.268/0.641)，且只有 buffered 法做到負 forgetting（後向遷移）。
+30. **拔掉 task-id：「持續變強」天花板低很多,但表徵累積與工具箱排序都還在（§25，P11，誠實硬牆量化）**。P8b–P9b 的累積全用 task-IL 探針（給 task id）量;P11 改用 class-IL（無 task id、100 類 argmax）。**最強的 DER++ 從 task-IL 0.641 崩到 class-IL 0.177(線性)/0.245(NCM)**(相對掉 ~62–72%),Replay 0.564→0.107/0.170,Naive 0.214→0.031/0.062。但:(1) class-IL 下**排序完全保留**(DER++>Replay>Naive)——抗遺忘骨幹必要但不充分、非無效;(2) **NCM 在會動 backbone 上首次驗證可部分救回**(穩定 ~1.4–2× 線性頭),§11/§18 原型修法遷移成立但只補一半(0.245≪0.641);(3) **表徵累積本身活著**——class-IL all-seen 探針 Δ 對 replay/derpp 保持正且 early→late 增長(derpp +0.243),continual 面對 5k 真競爭者仍贏 fresh。**乾淨結論**:「持續變強」是真的,但**相當部分由 task-id 撐住**;部署崩壞主因不是表徵不累積,而是 **100-way 的 task-free 讀出/校準**(線性頭 recency bias、NCM 只部分修)。下一道 well-posed 的牆＝**會動表徵上比 NCM 更好的 task-free 讀出**。這量化了策略檢討:方向(stability×plasticity→累積)沒錯,但「可持續學習」要從「給 task-id 的 task-IL」推進到「無 task-id 的 class-IL 部署」,那裡仍有大缺口。
 
 ---
 
